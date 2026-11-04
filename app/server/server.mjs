@@ -1000,7 +1000,7 @@ async function fetchPlanUsage() {
 // ---------------------------------------------------------------- self-update
 // Every push to main is built by GitHub Actions and published as a release carrying
 // DroidAgent-<version>.apk. This server (root, always running, app open or not) looks for a newer
-// one shortly after it starts and every few hours, and installs it on its own — the owner's
+// one shortly after it starts and every hour, and installs it on its own — the owner's
 // choice; settings.autoUpdate=false turns that into "report it". The order is deliberate:
 // download → match the digest GitHub published → `pm install` (Android refuses anything not
 // signed like the installed app) → only then sync the new launcher / chat app / runtime into the
@@ -1013,7 +1013,11 @@ const ASHELL = process.env.AGENT_ASHELL || '/usr/local/bin/ashell';
 // never touched by root; the launcher (Android side) reaches it at ${APP_DATA}/rootfs/<same path>.
 const UPDATE_DIR = '/var/lib/droidagent-update';
 const UPDATE_STATE_FILE = join(homedir(), '.claude', 'agent-update.json');
-const UPDATE_EVERY = 6 * 3600e3;
+const UPDATE_EVERY = 3600e3;
+// A small file the build publishes with every release: version, APK link, size, sha256, notes.
+// It is a plain download, not the REST API — anonymous API calls are capped at 60 an hour per IP,
+// and a VPN exit or a carrier NAT address shared with many others runs out of them.
+const UPDATE_CHANNEL = `https://github.com/${UPDATE_REPO}/releases/download/update-channel/latest.json`;
 const update = { checking: false, installing: false, lastCheck: 0, installed: null, latest: null, available: false, error: '' };
 
 function semverCmp(a, b) {
@@ -1090,6 +1094,14 @@ function fetchUrl(url, { headers = {}, file = null, timeout = 30000, redirects =
 // The newest DroidAgent-<x.y.z>.apk across the repository's releases (the update builds are
 // marked pre-release, so /releases/latest would not see them).
 async function latestRelease() {
+	try {
+		const j = JSON.parse((await fetchUrl(UPDATE_CHANNEL, { timeout: 20000 })).body);
+		if (/^\d+\.\d+\.\d+$/.test(j.version || '') && j.apk) {
+			return { version: j.version, url: j.apk, size: j.size, digest: j.sha256 ? `sha256:${j.sha256}` : null, notes: j.notes || '', tag: `v${j.version}` };
+		}
+	} catch (e) {
+		log('[update] update channel unavailable:', e?.message, '— asking the GitHub API');
+	}
 	const r = await fetchUrl(`https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=20`, { headers: { Accept: 'application/vnd.github+json' }, timeout: 20000 });
 	let best = null;
 	for (const rel of JSON.parse(r.body)) {
@@ -1201,7 +1213,10 @@ async function checkUpdate({ install = settings.autoUpdate !== false, now = fals
 			}
 		}
 	} catch (e) {
-		update.error = /HTTP 404/.test(String(e?.message)) ? `找不到 ${UPDATE_REPO} 的发布（仓库需要是公开的）` : `检查更新失败：${e?.message || e}`;
+		const msg = String(e?.message || e);
+		update.error = /HTTP 404/.test(msg) ? `找不到 ${UPDATE_REPO} 的发布（仓库需要是公开的）`
+			: /HTTP 403/.test(msg) ? 'GitHub 暂时限制了查询（同一网络请求太多），稍后会自动重试'
+				: `检查更新失败：${msg}`;
 		log('[update]', update.error);
 	} finally {
 		update.checking = false;

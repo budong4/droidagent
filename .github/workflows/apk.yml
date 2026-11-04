@@ -88,10 +88,29 @@ jobs:
           awk -v v="$VERSION" '$0 ~ "^## " { f = ($2 == v); next } f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "（CHANGELOG.md 里没有 $VERSION 的说明）" > notes.md
           printf '\n---\n已经装好 DroidAgent 的手机会自动更新；也可以下载 DroidAgent-%s.apk 直接安装（约 7 MB，不含 Linux 系统，第一次安装请用完整版），或在 Root 管理器里刷入 DroidAgent-update-%s.zip。\n' "$VERSION" "$VERSION" >> notes.md
+          # latest.json on the fixed "update-channel" release is what phones read to find this
+          # version (a plain download, so no GitHub API rate limit applies).
+          publish_channel() {
+            APK="dist/DroidAgent-$VERSION.apk"
+            python3 - "$VERSION" "$(stat -c %s "$APK")" "$(sha256sum "$APK" | cut -d' ' -f1)" "$GITHUB_REPOSITORY" > latest.json <<'PY'
+          import json, sys
+          v, size, sha, repo = sys.argv[1:5]
+          notes = open("notes.md", encoding="utf-8").read().split("\n---\n")[0].strip()
+          print(json.dumps({"version": v, "apk": f"https://github.com/{repo}/releases/download/v{v}/DroidAgent-{v}.apk",
+                            "size": int(size), "sha256": sha, "notes": notes}, ensure_ascii=False))
+          PY
+            if gh release view update-channel > /dev/null 2>&1; then
+              gh release upload update-channel latest.json --clobber
+            else
+              gh release create update-channel latest.json --target "$GITHUB_SHA" --prerelease \
+                --title "自动更新通道（请勿删除）" --notes "手机上的 DroidAgent 从这里的 latest.json 得知最新版本。"
+            fi
+          }
           if gh release view "$TAG" > /dev/null 2>&1; then
             if [ "$EVENT" = workflow_dispatch ]; then
               gh release upload "$TAG" dist/* --clobber
               gh release edit "$TAG" --notes-file notes.md
+              publish_channel
             else
               # Phones only install a higher version, so replacing this one's files would never
               # reach them — and would make two different builds share one version number.
@@ -99,4 +118,5 @@ jobs:
             fi
           else
             gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "DroidAgent $VERSION（更新包）" --notes-file notes.md --prerelease
+            publish_channel
           fi
