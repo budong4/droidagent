@@ -3,7 +3,8 @@
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-	<meta name="theme-color" content="#0f1115">
+	<meta name="theme-color" content="#F5F6F2">
+	<meta name="color-scheme" content="light dark">
 	<meta name="mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -11,7 +12,17 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=2">
+	<link rel="stylesheet" href="style.css?v=3">
+	<script>
+		// Theme before first paint (app.js keeps it in sync afterwards). Inside the app, the
+		// system's night mode comes from the host: WebView's prefers-color-scheme doesn't follow it.
+		(function () {
+			var t = 'auto', dark = false;
+			try { t = localStorage.getItem('theme') || 'auto'; } catch (e) { }
+			try { dark = t === 'dark' || (t !== 'light' && (window.AgentHost && AgentHost.isNight ? AgentHost.isNight() : matchMedia('(prefers-color-scheme: dark)').matches)); } catch (e) { }
+			document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+		})();
+	</script>
 </head>
 <body>
 	<div id="app">
@@ -192,8 +203,8 @@
 	<aside id="sidebar" class="sidebar hidden" aria-label="历史对话侧边栏">
 		<div class="sidebar-header">
 			<div class="sidebar-brand">
-				<div class="logo-mini"></div>
-				<span class="brand-title">历史对话</span>
+				<svg class="mark logo-mini" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>
+				<span class="brand-title">对话</span>
 			</div>
 			<button id="btn-sidebar-close" class="icon-btn" aria-label="关闭侧边栏">
 				<svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
@@ -418,6 +429,7 @@
 				<button class="entry-row" id="entry-usage"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span class="entry-txt">用量与额度<small>5 小时 / 每周窗口</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
 				<button class="entry-row" id="entry-sysprompt"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L18 10a2.8 2.8 0 10-4-4L4 16v4z"/><path d="M13 7l4 4"/></svg><span class="entry-txt">系统提示词<small>给助手的额外规则（AgentMD）</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
 				<button class="entry-row" id="entry-skills"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 14l9 5 9-5"/></svg><span class="entry-txt">Skills<small>安装、启用技能</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+				<button class="entry-row" id="entry-proxy"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg><span class="entry-txt">网络代理<small id="entry-proxy-sub">直连</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
 				<button class="entry-row" id="entry-mcp"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v6M15 3v6"/><path d="M7 9h10v3a5 5 0 01-5 5 5 5 0 01-5-5V9z"/><path d="M12 17v4"/></svg><span class="entry-txt">MCP 服务器<small>连接外部工具</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
 			</div>
 		</div>
@@ -507,28 +519,52 @@
 		</div>
 	</div>
 
-	<!-- Login Overlay -->
+	<!-- Login -->
 	<div id="login" class="login hidden">
 		<div class="login-card">
-			<div class="logo"></div>
+			<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>
 			<h2>登录 Claude 账号</h2>
-			<p class="muted">用你的 Claude 订阅账号登录（Pro / Max）。不需要 API key。</p>
+			<p class="lede">用你的 Claude 订阅（Pro 或 Max）登录，不需要 API Key。</p>
+
 			<div id="login-step1">
 				<button class="primary" id="login-start">开始登录</button>
+				<div id="login-wait" class="login-wait hidden"><span class="spin"></span>正在生成登录链接…</div>
 			</div>
-			<div id="login-step2" class="hidden">
-				<p class="muted">1. 打开下面的链接并登录授权：</p>
-				<a id="login-url" class="login-url" target="_blank" rel="noopener">打开登录页</a>
-				<button class="ghost small" id="login-copy">复制链接</button>
-				<p class="muted">2. 把页面给出的授权码粘贴到这里：</p>
-				<input id="login-code" type="text" inputmode="text" autocomplete="off" placeholder="粘贴授权码（或回调网址）">
-				<p class="muted" style="font-size:12px;margin:4px 0 10px;line-height:1.4;color:var(--faint);">提示：点击授权网页上的「Copy code」直接粘贴即可（包含 #），若复制了地址栏的回调网址也支持直接粘贴。</p>
-				<button class="primary" id="login-submit">完成登录</button>
-			</div>
+
+			<ol id="login-step2" class="login-steps hidden">
+				<li>
+					<span class="num">1</span><span class="what">在浏览器里授权</span>
+					<div class="body">
+						<p class="hint">用你的 Claude 账号登录，然后点「Authorize」。</p>
+						<div class="login-actions">
+							<a id="login-url" class="login-url" target="_blank" rel="noopener">打开登录页</a>
+							<button class="ghost small" id="login-copy">复制链接</button>
+						</div>
+					</div>
+				</li>
+				<li>
+					<span class="num">2</span><span class="what">粘贴授权码</span>
+					<div class="body">
+						<p class="hint">授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。</p>
+						<input id="login-code" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴授权码">
+						<button class="primary" id="login-submit">完成登录</button>
+					</div>
+				</li>
+			</ol>
+
 			<p id="login-msg" class="login-msg"></p>
+
+			<details class="login-net" id="login-net">
+				<summary>网络代理</summary>
+				<p>当前网络连不上 Claude 时，填写代理软件的本地 HTTP 端口，例如 http://127.0.0.1:7890。留空就是直连。</p>
+				<div class="net-row">
+					<input id="login-proxy" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="http://127.0.0.1:7890">
+					<button class="ghost" id="login-proxy-save">保存</button>
+				</div>
+			</details>
 		</div>
 	</div>
 
-	<script src="app.js?v=2"></script>
+	<script src="app.js?v=3"></script>
 </body>
 </html>

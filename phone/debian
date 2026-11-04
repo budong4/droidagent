@@ -3,6 +3,11 @@
 #
 #   debian install <rootfs.tar.xz> <overlay-dir>   extract rootfs + apply overlay (once)
 #   debian selfinstall [apk]                       unpack the rootfs carried inside the installed APK
+#   debian selfinstall - <xz|gz|tar>               same, reading the payload from stdin (the app pipes
+#                                                  it in itself so it can show real progress)
+#   debian sync <app.tar>                          update the installed launcher + chat app from the APK
+#   debian boot <app.tar>                          sync, then make sure the chat app is running
+#                                                  (restarted if its files changed) — run on every launch
 #   debian setup [VAR=value ...]                   provision packages/Claude Code inside (slow; EXTRA=1)
 #   debian start | stop | status                   mount / kill+unmount / show state
 #   debian shell ['command']                       login shell (or run one command) in the chroot
@@ -188,6 +193,11 @@ app_stop() {
 	pids=$(app_pids)
 	[ -z "$pids" ] && { log "app not running"; return 0; }
 	kill $pids
+	# Wait for it to really go, so a restart doesn't find the old process still holding the port.
+	n=0
+	while [ -n "$(app_pids)" ] && [ "$n" -lt 10 ]; do sleep 0.5; n=$((n + 1)); done
+	pids=$(app_pids)
+	[ -n "$pids" ] && kill -9 $pids 2>/dev/null
 	log "app stopped"
 }
 
@@ -250,20 +260,30 @@ do_install() {
 # so an interrupted install can never leave a half-written rootfs behind.
 do_selfinstall() {
 	apk=${1:-}
-	# Locate our own APK by the package name, which is the basename of the app dir.
-	if [ -z "$apk" ] && [ -n "$APK_DIR" ]; then
-		pkg=$("$B" basename "$APK_DIR")
-		apk=$(pm path "$pkg" 2>/dev/null | "$B" sed 's/^package://' | head -1)
+	if [ "$apk" = - ]; then
+		# The app streams the payload in on stdin and counts the bytes itself for the progress bar.
+		case ${2:-xz} in
+			xz) dflag=-J ;;
+			gz) dflag=-z ;;
+			tar) dflag= ;;
+			*) die "unsupported payload format: ${2:-}" ;;
+		esac
+	else
+		# Locate our own APK by the package name, which is the basename of the app dir.
+		if [ -z "$apk" ] && [ -n "$APK_DIR" ]; then
+			pkg=$("$B" basename "$APK_DIR")
+			apk=$(pm path "$pkg" 2>/dev/null | "$B" sed 's/^package://' | head -1)
+		fi
+		[ -f "$apk" ] || die "cannot locate the app's APK"
+		payload=$("$B" unzip -l "$apk" | "$B" awk '$NF ~ /^assets\/rootfs\.tar\./ { print $NF; exit }')
+		[ -n "$payload" ] || die "this APK carries no rootfs payload"
+		case $payload in
+			*.tar.xz) dflag=-J ;;
+			*.tar.gz) dflag=-z ;;
+			*.tar) dflag= ;;
+			*) die "unsupported payload format: $payload" ;;
+		esac
 	fi
-	[ -f "$apk" ] || die "cannot locate the app's APK"
-	payload=$("$B" unzip -l "$apk" | "$B" awk '$NF ~ /^assets\/rootfs\.tar\./ { print $NF; exit }')
-	[ -n "$payload" ] || die "this APK carries no rootfs payload"
-	case $payload in
-		*.tar.xz) dflag=-J ;;
-		*.tar.gz) dflag=-z ;;
-		*.tar) dflag= ;;
-		*) die "unsupported payload format: $payload" ;;
-	esac
 
 	if [ -x "$ROOT/usr/bin/bash" ]; then
 		log "rootfs already present at $ROOT; nothing to do"
@@ -274,7 +294,12 @@ do_selfinstall() {
 	rm -rf "$staging"
 	mkdir -p "$staging" || die "cannot create $staging"
 	log "unpacking the Linux system from the app (this takes a few minutes)"
-	if ! "$B" unzip -p "$apk" "$payload" | "$B" tar -x $dflag -C "$staging"; then
+	if [ "$apk" = - ]; then
+		"$B" tar -x $dflag -C "$staging"
+	else
+		"$B" unzip -p "$apk" "$payload" | "$B" tar -x $dflag -C "$staging"
+	fi
+	if [ $? -ne 0 ]; then
 		rm -rf "$staging"
 		die "unpack failed"
 	fi
@@ -297,11 +322,56 @@ do_selfinstall() {
 	log "installed at $ROOT"
 }
 
+# Bring what lives outside the APK up to date with it: the launcher copy in $HOME_DIR (used from a
+# terminal) and the chat app inside the chroot. The app bundle is server/ + web/ without
+# node_modules; node_modules stays as installed in the chroot (it needs network to change).
+# Prints "app: updated" when the app's files changed, "app: unchanged" otherwise.
+do_sync() {
+	bundle=${1:-}
+	mkdir -p "$HOME_DIR"
+	if ! "$B" cmp -s "$SELF" "$HOME_DIR/debian" 2>/dev/null; then
+		cp "$SELF" "$HOME_DIR/debian.new" && chmod 755 "$HOME_DIR/debian.new" &&
+			mv -f "$HOME_DIR/debian.new" "$HOME_DIR/debian" && log "launcher updated"
+	fi
+	if [ ! -f "$bundle" ]; then
+		echo "app: unchanged"
+		return 0
+	fi
+	[ -e "$ROOT/usr/bin/bash" ] || die "no rootfs at $ROOT"
+	sum=$("$B" sha256sum "$bundle" | "$B" awk '{ print $1 }')
+	stamp="$ROOT$APP_DIR/.bundle-sha256"
+	if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sum" ]; then
+		echo "app: unchanged"
+		return 0
+	fi
+	tmp="$ROOT$APP_DIR.sync"
+	rm -rf "$tmp"
+	mkdir -p "$tmp" || die "cannot create $tmp"
+	"$B" tar -xf "$bundle" -C "$tmp" || { rm -rf "$tmp"; die "cannot unpack the app bundle"; }
+	[ -f "$tmp/server/server.mjs" ] && [ -f "$tmp/web/index.html" ] || { rm -rf "$tmp"; die "app bundle looks incomplete"; }
+	mkdir -p "$ROOT$APP_DIR/server"
+	"$B" cp -R "$tmp/server/." "$ROOT$APP_DIR/server/" || { rm -rf "$tmp"; die "cannot update the app's server"; }
+	rm -rf "$ROOT$APP_DIR/web.old"
+	[ -d "$ROOT$APP_DIR/web" ] && mv "$ROOT$APP_DIR/web" "$ROOT$APP_DIR/web.old"
+	mv "$tmp/web" "$ROOT$APP_DIR/web" || { mv "$ROOT$APP_DIR/web.old" "$ROOT$APP_DIR/web"; rm -rf "$tmp"; die "cannot update the app's web files"; }
+	rm -rf "$ROOT$APP_DIR/web.old" "$tmp"
+	echo "$sum" > "$stamp"
+	sync
+	echo "app: updated"
+}
+
 cmd=${1:-status}
 [ $# -gt 0 ] && shift
 case $cmd in
 install) do_install "$@" ;;
 selfinstall) do_selfinstall "$@" ;;
+sync) do_sync "$@" ;;
+boot)
+	out=$(do_sync "$@") || exit 1
+	echo "$out"
+	case $out in *"app: updated"*) app_stop ;; esac
+	app_start
+	;;
 setup)
 	# chroot_run starts from an empty env, so settings like EXTRA=1 come in as arguments.
 	for a in "$@"; do
@@ -332,5 +402,5 @@ app)
 	;;
 appdeps) app_deps ;;
 retools) retools ;;
-*) die "unknown command '$cmd' (install|setup|start|stop|status|shell|app|appdeps|retools)" ;;
+*) die "unknown command '$cmd' (install|selfinstall|sync|boot|setup|start|stop|status|shell|app|appdeps|retools)" ;;
 esac

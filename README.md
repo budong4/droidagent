@@ -53,8 +53,24 @@ python build.py
 ```
 
 - 产物：`apk/DroidAgent.apk`（自签名调试版；`debug.keystore` 首次构建自动生成）。
-- 若 `apk/assets/rootfs.tar.xz` 存在，会被打进 APK，实现「装上 App 点一下就自动解包整个 Linux 系统」。不放也能构建，只是首次启动时需要你自己把 rootfs 推进去。
-- `build.py` 自己实现了 zip 对齐（部分新系统对 `resources.arsc` 的对齐校验更严）。某些设备若仍拒装 `targetSdk≥30`，把 `AndroidManifest.xml` 的 `targetSdkVersion` 降到 29 再构建。
+- `build.py` 会自动把这些打进 APK（都以不压缩方式存放）：
+  - `phone/debian` → `assets/debian`（启动器，始终用仓库里的最新版）；
+  - `app/`（server + web，不含 `node_modules`）→ `assets/agent-app.tar`。App 每次启动会把它同步进 chroot，**聊天界面和后端的修复只需更新 APK，不用重做 rootfs**；
+  - `apk/assets/setup/`（首次启动 / 启动中的进度页面）；
+  - `apk/assets/rootfs.tar.xz`（若存在）。
+- 某些设备若仍拒装 `targetSdk≥30`，把 `AndroidManifest.xml` 的 `targetSdkVersion` 降到 29 再构建（当前已是 29）。
+
+### 更新已经装好的手机
+
+手机上已经解压过 Linux 系统时，不带 rootfs 的小 APK（几百 KB）就能完成更新：把 `apk/assets/rootfs.tar.xz` 移走后构建，再覆盖安装。
+
+```bash
+adb install -r apk/DroidAgent.apk
+```
+
+- 必须用**同一个 `debug.keystore`** 签名，否则会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。不要为此卸载 App——卸载会连同 `/data/user_de/0/com.droidagent.app/rootfs` 一起删掉。
+- 打开 App 后它会自动同步新版启动器和聊天程序，并重启后台服务。
+- 不带 rootfs 的 APK 不能用来初始化一台新手机，发布给别人时请用完整版。
 
 ## 构建 rootfs 快照
 
@@ -81,15 +97,24 @@ debian retools                               装逆向分析工具链
 ## 安装与首次使用
 
 1. 把 `DroidAgent.apk` 安装到手机（需允许「安装未知来源」）。
-2. 打开 App——它会**自己申请 root**（弹出你 Root 管理器的授权窗口，点允许）。若被拒或没 root，界面会给出明确提示让你重试。
-3. 首次会把内置的 Linux 系统**自动解包**到应用目录，然后启动后端、加载聊天界面。
+2. 打开 App，它会直接开始准备，不需要再点按钮：
+   1. **获取 Root 权限**：弹出 Root 管理器的授权窗口时点允许。被拒或没有 root，会说明原因并提供「重试」。
+   2. **解压 Linux 系统**（只在第一次）：从安装包本身解压，不联网下载。界面显示百分比、已处理大小和剩余时间，期间屏幕保持常亮。
+   3. **启动助手服务**：服务就绪后自动进入聊天界面。
+3. 以后每次打开：服务在运行就直接进入；不在运行（比如重启过手机）就自动重新启动。
 4. 用你的 **Claude 订阅账号**在 App 里登录（走 OAuth，不需要 API key）。
+
+### 登录失败怎么办
+
+- 登录失败时界面会显示 `claude` 实际报的错。完整输出在 chroot 里的 `~/.claude/agent-login.log`。
+- 后台会依次尝试全局安装的 `claude` 和 Agent SDK 自带的 `claude`：前者缺失、损坏或版本太旧时，会自动换后者。
+- 授权码提交后提示连不上服务器：在登录页底部的「网络代理」（或 设置 → 网络代理）填写代理软件的本地端口，例如 `http://127.0.0.1:7890`。
 
 > 开机自启：把 `optional/99-debian-agent.sh` 放到 `/data/adb/service.d/` 即可（KernelSU/Magisk 的 service.d）。
 
 ## 配置
 
-- **代理**（访问 Anthropic API）：编辑 chroot 里的 `/etc/agent/proxy.env`。
+- **代理**（访问 Anthropic API）：App 里 设置 → 网络代理（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录和对话都会使用）。
 - **系统提示词 / Skills / MCP**：在 App 的设置里管理，下一条消息生效。
 - **个人数据开关**：默认关闭；打开后读联系人/短信/相册等仍会逐次弹确认。
 - **悬浮窗**：任务跳到别的应用时自动浮出进度，回到对话自动收起（可在设置里总开关）。
@@ -98,7 +123,8 @@ debian retools                               装逆向分析工具链
 
 | 路径 | 内容 |
 |---|---|
-| `apk/` | 原生 APK（`build.py` 纯脚本构建，不依赖 Gradle）、源码、资源 |
+| `apk/` | 原生 APK（`build.py` 纯脚本构建，不依赖 Gradle）、源码、资源；`apk/assets/setup/` 是首次启动的进度页面 |
+| `brand/` | 图标源文件（`icon.svg`）和重新生成 PNG 图标的脚本 |
 | `app/server/` | Node 后端 `server.mjs`（Agent SDK + HTTP/SSE）、OAuth 登录 pty |
 | `app/web/` | PWA 前端（聊天界面、悬浮窗面板） |
 | `phone/debian` | 安卓侧启动器脚本（挂载 / chroot / 管理后端） |

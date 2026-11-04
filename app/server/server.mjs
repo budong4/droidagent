@@ -802,13 +802,103 @@ async function installSkill(src) {
 	}
 }
 
+// ---------------------------------------------------------------- network proxy
+// The chroot shares Android's network, so where Anthropic is unreachable directly, login (token
+// exchange) and every chat turn need a proxy — typically a proxy app's local port such as
+// http://127.0.0.1:7890. It lives in /etc/agent/proxy.env (also read by login shells), and is
+// applied to this process's env so every claude it spawns from now on inherits it.
+const PROXY_FILE = process.env.AGENT_PROXY_FILE || '/etc/agent/proxy.env';
+const PROXY_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
+const NO_PROXY = 'localhost,127.0.0.1,::1,mirrors.tuna.tsinghua.edu.cn';
+function readProxySetting() {
+	try {
+		const m = readFileSync(PROXY_FILE, 'utf8').match(/^\s*PROXY=["']?([^"'\s#]*)/m);
+		return m ? m[1] : '';
+	} catch { return ''; }
+}
+function applyProxy(url) {
+	if (url) {
+		for (const k of PROXY_VARS) process.env[k] = url;
+		process.env.NO_PROXY = process.env.no_proxy = NO_PROXY;
+	} else {
+		for (const k of [...PROXY_VARS, 'NO_PROXY', 'no_proxy']) delete process.env[k];
+	}
+}
+function validProxy(url) {
+	return url === '' || /^https?:\/\/[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?\/?$/.test(url);
+}
+async function saveProxySetting(url) {
+	let text = '';
+	try { text = readFileSync(PROXY_FILE, 'utf8'); } catch { /* first time */ }
+	const line = url ? `PROXY=${url}` : '#PROXY=http://127.0.0.1:7890';
+	if (/^\s*#?\s*PROXY=.*$/m.test(text)) text = text.replace(/^\s*#?\s*PROXY=.*$/m, line);
+	else text = (text ? text.replace(/\n?$/, '\n') : '') + line + '\n';
+	await mkdir(dirname(PROXY_FILE), { recursive: true });
+	await writeFile(PROXY_FILE, text, 'utf8');
+	applyProxy(url);
+}
+applyProxy(readProxySetting());
+
+// ---------------------------------------------------------------- claude CLI
+// `auth login / status / logout` need a Claude Code binary. Prefer the global `claude` (the one a
+// terminal in the chroot uses); fall back to the native binary bundled with the Agent SDK, which
+// is always there because chat itself runs on it. A candidate only counts if `--version` works —
+// a stale symlink or a binary that can't start on this phone is skipped, not used.
+const SDK_CLI_PKGS = {
+	arm64: ['claude-agent-sdk-linux-arm64', 'claude-agent-sdk-linux-arm64-musl'],
+	x64: ['claude-agent-sdk-linux-x64', 'claude-agent-sdk-linux-x64-musl'],
+};
+function cliCandidates() {
+	const out = [];
+	for (const dir of String(process.env.PATH || '').split(':')) if (dir) out.push(join(dir, 'claude'));
+	out.push(join(homedir(), '.local', 'bin', 'claude'));
+	for (const pkg of SDK_CLI_PKGS[process.arch] || []) out.push(join(HERE, 'node_modules', '@anthropic-ai', pkg, 'claude'));
+	return [...new Set(out)].filter((p) => existsSync(p));
+}
+function probeCli(p) {
+	return new Promise((resolve) => {
+		execFile(p, ['--version'], { timeout: 30000, env: { ...process.env, ANTHROPIC_API_KEY: '' } },
+			(err, stdout) => resolve(err ? null : String(stdout).trim().split('\n')[0]));
+	});
+}
+let cliCache = null;
+// Every working binary, best first. Cached once one works; re-probed while none does.
+async function workingClis() {
+	if (cliCache?.length) return cliCache;
+	const ok = [];
+	for (const p of cliCandidates()) {
+		const v = await probeCli(p);
+		if (v) ok.push({ path: p, version: v });
+		else log('[cli] not usable:', p);
+	}
+	if (ok.length) log('[cli] using', ok.map((c) => `${c.path} (${c.version})`).join(', '));
+	cliCache = ok;
+	return ok;
+}
+async function claudeBin() { return (await workingClis())[0]?.path || 'claude'; }
+
 // ---------------------------------------------------------------- login (pty)
 let login = null;
-function startLogin() {
-	if (login) { try { login.kill('SIGKILL'); } catch { /* */ } }
-	const child = spawn('python3', [join(HERE, 'login_pty.py')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+let loginRequest = 0;
+async function startLogin() {
+	cancelLogin();
+	const request = ++loginRequest;
+	const clis = await workingClis();
+	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
+	// Even with nothing that passed --version, still let the script try the raw candidates: its
+	// error output is what tells the user (and us) why claude can't start.
+	const paths = clis.length ? clis.map((c) => c.path) : cliCandidates();
+	const child = spawn('python3', [join(HERE, 'login_pty.py'), ...paths], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
 	login = child;
 	let buf = '';
+	let done = false;
+	const finish = (ok, message) => {
+		if (done || child.cancelled) return;
+		done = true;
+		broadcast({ type: 'login_done', ok, message });
+		if (login === child) login = null;
+		if (ok) isLoggedIn().then((li) => broadcast({ type: 'auth', loggedIn: li }));
+	};
 	child.stdout.on('data', (d) => {
 		buf += d.toString();
 		let i;
@@ -823,13 +913,24 @@ function startLogin() {
 				log('[login-pty] unexpected TOKEN line from auth login, ignoring');
 			} else if (line.startsWith('DONE ')) {
 				const ok = line.slice(5).startsWith('ok');
-				broadcast({ type: 'login_done', ok, message: ok ? '' : line.slice(5) });
-				login = null;
+				finish(ok, ok ? '' : line.slice(5).replace(/^fail\s*/, ''));
 			}
 		}
 	});
-	child.stderr.on('data', (d) => log('[login-err]', String(d).trim().slice(0, 200)));
-	child.on('exit', (c, s) => { log('[login-exit]', c, s); if (login === child) { login = null; } });
+	child.stderr.on('data', (d) => log('[login-err]', String(d).trim().slice(0, 300)));
+	child.on('error', (e) => { log('[login-spawn]', e?.message); finish(false, `无法运行登录脚本（python3）：${e?.message || e}`); });
+	// 'close', not 'exit': stdout may still hold the DONE line when the process itself has exited.
+	child.on('close', (c, s) => {
+		log('[login-exit]', c, s);
+		finish(false, `登录进程意外退出（${s || c}）`);
+	});
+}
+// Replacing or cancelling a login on purpose must not surface as "login failed" in the UI.
+function cancelLogin() {
+	if (!login) return;
+	login.cancelled = true;
+	try { login.kill('SIGKILL'); } catch { /* */ }
+	login = null;
 }
 function sendLoginCode(code) {
 	if (login && login.stdin.writable) { login.stdin.write(String(code).trim() + '\n'); return true; }
@@ -839,8 +940,9 @@ function sendLoginCode(code) {
 // The full `claude auth status` object — email, org, subscription type, auth method, etc.
 // Null if the command fails or doesn't return valid JSON (treated as "not logged in").
 async function getAuthStatus() {
+	const bin = await claudeBin();
 	return await new Promise((resolve) => {
-		const c = spawn('claude', ['auth', 'status'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+		const c = spawn(bin, ['auth', 'status'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
 		let out = '';
 		const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(null); }, 15000);
 		c.stdout.on('data', (d) => { out += d; });
@@ -1355,14 +1457,24 @@ const server = createServer(async (req, res) => {
 		}
 
 		// Login flow
-		if (req.method === 'POST' && path === '/api/login/start') { startLogin(); return json(res, { ok: true }); }
+		if (req.method === 'POST' && path === '/api/login/start') { startLogin().catch((e) => log('[login]', e?.message)); return json(res, { ok: true }); }
 		if (req.method === 'POST' && path === '/api/login/code') {
 			const { code } = await body(req);
 			const ok = sendLoginCode(code);
 			log('[login-code-received]', ok ? 'sent to pty' : 'login session expired', (code || '').slice(0, 15) + '...');
 			return json(res, { ok, error: ok ? '' : '登录会话已超时失效，请重新点击「开始登录」' });
 		}
-		if (req.method === 'POST' && path === '/api/login/cancel') { try { login?.kill('SIGKILL'); } catch { /* */ } login = null; return json(res, { ok: true }); }
+		if (req.method === 'POST' && path === '/api/login/cancel') { cancelLogin(); return json(res, { ok: true }); }
+
+		// ---- Network proxy ----
+		if (path === '/api/proxy' && req.method === 'GET') return json(res, { ok: true, proxy: readProxySetting() });
+		if (path === '/api/proxy' && req.method === 'POST') {
+			const proxy = String((await body(req)).proxy || '').trim();
+			if (!validProxy(proxy)) return json(res, { ok: false, error: '格式应为 http://主机:端口，例如 http://127.0.0.1:7890' }, 400);
+			await saveProxySetting(proxy);
+			log('[proxy]', proxy || '(none)');
+			return json(res, { ok: true, proxy });
+		}
 
 		// ---- Account (everything `claude auth status` knows) ----
 		if (path === '/api/account' && req.method === 'GET') {
@@ -1371,8 +1483,9 @@ const server = createServer(async (req, res) => {
 			return json(res, { ok: true, account: s });
 		}
 		if (path === '/api/account/logout' && req.method === 'POST') {
+			const bin = await claudeBin();
 			await new Promise((resolve) => {
-				const c = spawn('claude', ['auth', 'logout'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+				const c = spawn(bin, ['auth', 'logout'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
 				const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(); }, 15000);
 				c.on('exit', () => { clearTimeout(t); resolve(); });
 				c.on('error', () => { clearTimeout(t); resolve(); });

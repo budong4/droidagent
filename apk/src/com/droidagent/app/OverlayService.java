@@ -62,9 +62,9 @@ public class OverlayService extends Service {
     /** Set while the service is alive, so the activity can nudge it on lifecycle changes. */
     public static OverlayService instance;
 
-    static final int COLOR_IDLE = 0xFF6B6B6B;
-    static final int COLOR_RUN = 0xFF6FBF8B;
-    static final int COLOR_WAIT = 0xFFD9A441;
+    static final int COLOR_IDLE = 0xFF4E5F57;
+    static final int COLOR_RUN = 0xFF5FD3A6;
+    static final int COLOR_WAIT = 0xFFE2B33C;
 
     WindowManager wm;
     FrameLayout bubble;
@@ -174,7 +174,7 @@ public class OverlayService extends Service {
         Notification n = new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("助手悬浮窗")
                 .setContentText("任务跑到别的应用时会自动浮出进度")
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_mark)
                 .setContentIntent(openPi)
                 .addAction(new Notification.Action.Builder(null, "关闭悬浮窗", stopPi).build())
                 .setOngoing(true)
@@ -193,13 +193,13 @@ public class OverlayService extends Service {
         bubble = new FrameLayout(this);
         bubbleBg = new GradientDrawable();
         bubbleBg.setShape(GradientDrawable.OVAL);
-        bubbleBg.setColor(0xF21A1A1A);
+        bubbleBg.setColor(0xF20F3B2D);
         bubbleBg.setStroke(dp(2), COLOR_IDLE);
         bubble.setBackground(bubbleBg);
 
         bubbleIcon = new ImageView(this);
-        bubbleIcon.setImageResource(R.drawable.ic_mascot);
-        bubble.addView(bubbleIcon, new FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER));
+        bubbleIcon.setImageResource(R.drawable.ic_bubble_mark);
+        bubble.addView(bubbleIcon, new FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER));
 
         bubbleParams = new WindowManager.LayoutParams(
                 bubbleSize, bubbleSize,
@@ -283,9 +283,9 @@ public class OverlayService extends Service {
         panelWeb.setWebViewClient(new PanelWebViewClient(this));
 
         GradientDrawable frame = new GradientDrawable();
-        frame.setColor(0xFA1A1A1A);
+        frame.setColor(0xFA111A16);
         frame.setCornerRadius(dp(16));
-        frame.setStroke(dp(1), 0xFF2E2E2E);
+        frame.setStroke(dp(1), 0xFF26332D);
 
         FrameLayout wrap = new FrameLayout(this);
         wrap.setBackground(frame);
