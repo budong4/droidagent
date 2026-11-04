@@ -27,6 +27,7 @@ const SETTINGS = {
 	web: true,
 	thinking: true,
 	personalData: false,
+	autoUpdate: true,
 };
 
 let curSession = null;
@@ -1013,7 +1014,7 @@ $('#t-fastmode').onchange = (e) => {
 /* ---------------- SSE ---------------- */
 let es;
 function connect() {
-	es = new EventSource('/api/events');
+	es = new EventSource('/api/events?main=1'); // main=1: the chat page, not the bubble's panel
 	es.onopen = () => { statusEl.className = 'status on'; statusText.textContent = '就绪'; };
 	es.onerror = () => { statusEl.className = 'status off'; statusText.textContent = '已断开'; };
 	es.onmessage = (e) => {
@@ -1029,6 +1030,7 @@ function connect() {
 					curSession = m.activeSession;
 					renderTranscript(curSession);
 				}
+				showUpdateNotice(m.lastUpdate); // after the redraw, which would wipe it
 				fetchSessions();
 				loadSlashCommands();
 				break;
@@ -1095,6 +1097,7 @@ function connect() {
 			case 'login_url': loginUrl(m.url, m.mode); break;
 			case 'login_need_code': break;
 			case 'login_status': loginStatus(m); break;
+			case 'update_status': renderUpdate(m.update); break;
 			case 'login_done': loginDone(m.ok, m.message); break;
 		}
 	};
@@ -1222,6 +1225,7 @@ function applySettings(s) {
 	$('#t-web').checked = SETTINGS.web;
 	$('#t-thinking').checked = SETTINGS.thinking;
 	$('#t-personal').checked = !!SETTINGS.personalData;
+	$('#t-autoupdate').checked = SETTINGS.autoUpdate !== false;
 }
 function pushSettings(patch) {
 	Object.assign(SETTINGS, patch);
@@ -1235,10 +1239,55 @@ $('#t-screen').onchange = (e) => pushSettings({ screen: e.target.checked });
 $('#t-web').onchange = (e) => pushSettings({ web: e.target.checked });
 $('#t-thinking').onchange = (e) => pushSettings({ thinking: e.target.checked });
 $('#t-personal').onchange = (e) => pushSettings({ personalData: e.target.checked });
+$('#t-autoupdate').onchange = (e) => pushSettings({ autoUpdate: e.target.checked });
+
+/* ---------------- self-update ---------------- */
+function fmtAgo(ts) {
+	if (!ts) return '';
+	const m = Math.round((Date.now() - ts) / 60000);
+	return m < 1 ? '刚刚' : m < 60 ? `${m} 分钟前` : `${Math.round(m / 60)} 小时前`;
+}
+function renderUpdate(u) {
+	if (!u) return;
+	const line = $('#update-line');
+	line.firstChild.textContent = u.current ? `当前版本 ${u.current}` : '当前版本';
+	let sub;
+	if (u.installing) sub = `正在安装 ${u.latest}，App 会自动关闭再打开`;
+	else if (u.checking) sub = '正在检查…';
+	else if (u.error) sub = u.error;
+	else if (u.available) sub = u.autoUpdate ? `发现 ${u.latest}，等当前对话结束后自动安装` : `发现新版本 ${u.latest}`;
+	else if (u.lastCheck) sub = `已是最新（${fmtAgo(u.lastCheck)}检查）`;
+	else sub = '还没检查过';
+	$('#update-sub').textContent = sub;
+	$('#btn-check-update').textContent = u.available && !u.installing ? '立即更新' : '检查更新';
+	$('#btn-check-update').disabled = !!(u.checking || u.installing);
+	if (u.installing) sysline(`正在安装 DroidAgent ${u.latest}，完成后 App 会自动重新打开`);
+}
+async function loadUpdate() {
+	const r = await fetch('/api/update').then((x) => x.json()).catch(() => null);
+	if (r && r.ok) renderUpdate(r.update);
+}
+$('#btn-check-update').onclick = async () => {
+	$('#btn-check-update').disabled = true;
+	$('#update-sub').textContent = '正在检查…';
+	const r = await api('/api/update/check', { install: true });
+	if (r.update) renderUpdate(r.update);
+	else $('#update-sub').textContent = r.error || '检查失败';
+};
+// After an update, say once what changed.
+function showUpdateNotice(u) {
+	if (!u || !u.to || Date.now() - (u.at || 0) > 3 * 86400e3) return;
+	let seen = '';
+	try { seen = localStorage.getItem('seenUpdate') || ''; } catch { /* */ }
+	if (seen === u.to) return;
+	try { localStorage.setItem('seenUpdate', u.to); } catch { /* */ }
+	const notes = String(u.notes || '').split('\n').map((l) => l.trim().replace(/^[-*]\s*/, '')).filter((l) => l && !/^#|^---/.test(l)).slice(0, 6).join('；');
+	sysline(`DroidAgent 已更新到 ${u.to}${notes ? '：' + notes : ''}`);
+}
 
 function openSheet() { $('#sheet').classList.remove('hidden'); $('#sheet-backdrop').classList.remove('hidden'); }
 function closeSheet() { $('#sheet').classList.add('hidden'); $('#sheet-backdrop').classList.add('hidden'); }
-$('#btn-settings').onclick = () => { openSheet(); syncOverlayToggle(); setTheme(currentTheme()); };
+$('#btn-settings').onclick = () => { openSheet(); syncOverlayToggle(); setTheme(currentTheme()); loadUpdate(); };
 $('#theme-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) setTheme(b.dataset.v); };
 $('#sheet-close').onclick = closeSheet;
 $('#sheet-backdrop').onclick = closeSheet;

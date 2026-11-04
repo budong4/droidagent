@@ -652,3 +652,5 @@ input, textarea { font: inherit; }
 	*, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
 .modal-card code { background: var(--surface2); padding: .1em .4em; border-radius: 6px; font: .9em var(--mono); }
+#btn-check-update { flex: 0 0 auto; margin: 0; }
+#update-sub { overflow-wrap: anywhere; }

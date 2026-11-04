@@ -12,7 +12,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=6">
+	<link rel="stylesheet" href="style.css?v=7">
 	<script>
 		// Theme before first paint (app.js keeps it in sync afterwards). Inside the app, the
 		// system's night mode comes from the host: WebView's prefers-color-scheme doesn't follow it.
@@ -414,6 +414,14 @@
 		</div>
 
 		<div class="field">
+			<label>更新</label>
+			<div class="toggles">
+				<div class="toggle"><span>自动更新<small>发现新版本时自动下载并安装，不用你操作</small></span><label class="sw"><input type="checkbox" id="t-autoupdate"><i></i></label></div>
+				<div class="toggle"><span id="update-line">当前版本<small id="update-sub">正在读取…</small></span><button class="ghost small" id="btn-check-update">检查更新</button></div>
+			</div>
+		</div>
+
+		<div class="field">
 			<label>外观</label>
 			<div class="seg" id="theme-seg">
 				<button data-v="auto" class="sel">跟随系统</button>
@@ -566,6 +574,6 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=6"></script>
+	<script src="app.js?v=7"></script>
 </body>
 </html>

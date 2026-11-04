@@ -76,6 +76,8 @@ adb install -r apk/DroidAgent.apk
 
 `.github/workflows/apk.yml` 在每次推送到 `main` 时构建更新版 APK（不含 Linux 系统，约 7 MB）和 Root 管理器更新包，并以版本号发布到 Releases（`v<版本>`，标为预发布）。之后手机上的更新方式就是：打开 Releases，下载最新的 `DroidAgent-<版本>.apk` 直接安装，App 启动时会自动同步聊天程序和运行时。
 
+**自动更新**：手机上的后台服务（root，常驻）启动 2 分钟后和之后每 6 小时检查一次 Releases，发现更高版本就下载 APK、核对 GitHub 公布的 sha256、用 `pm install` 静默安装（安卓会拒绝签名不同的包），再把新的启动器、聊天程序和运行时同步进 Linux 环境并重启服务；装的时候 App 若开着，会自动重新打开。正在进行的对话不会被打断，会等它结束再装。设置 → 更新 里可以关掉自动安装（改为只提示）或手动检查。需要仓库是公开的（手机不带 GitHub 凭据）。发布新版本时，同时修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode` 并在 `CHANGELOG.md` 加一节；版本号没变的推送不会覆盖已发布的包。
+
 一次性设置：安卓只接受同一签名的更新，所以 CI 必须用当初签名手机上那个 APK 的密钥。在构建过那个 APK 的电脑上，把 `apk/debug.keystore` 转成 base64，存为仓库的 Actions Secret `ANDROID_KEYSTORE_BASE64`（仓库 Settings → Secrets and variables → Actions）。Windows PowerShell：
 
 ```bash

@@ -6,8 +6,8 @@ import { connect as tlsConnect } from 'node:tls';
 import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
-import { readFileSync, existsSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, existsSync, createReadStream, createWriteStream } from 'node:fs';
+import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -44,6 +44,7 @@ const settings = {
 	web: true,                // allow WebSearch / WebFetch
 	thinking: true,           // show thinking blocks
 	personalData: false,      // allow reading personal data (contacts/SMS/call log/photos…) — default OFF
+	autoUpdate: true,         // install new releases by itself (off: only report them)
 };
 
 // Config files for the Eta-parity features.
@@ -996,6 +997,227 @@ async function fetchPlanUsage() {
 	};
 }
 
+// ---------------------------------------------------------------- self-update
+// Every push to main is built by GitHub Actions and published as a release carrying
+// DroidAgent-<version>.apk. This server (root, always running, app open or not) looks for a newer
+// one shortly after it starts and every few hours, and installs it on its own — the owner's
+// choice; settings.autoUpdate=false turns that into "report it". The order is deliberate:
+// download → match the digest GitHub published → `pm install` (Android refuses anything not
+// signed like the installed app) → only then sync the new launcher / chat app / runtime into the
+// chroot and restart, so a failed install never leaves new server code on an old APK.
+const UPDATE_REPO = process.env.DROIDAGENT_UPDATE_REPO || 'budong4/droidagent';
+const APP_PKG = 'com.droidagent.app';
+const APP_DATA = `/data/user_de/0/${APP_PKG}`;
+const ASHELL = process.env.AGENT_ASHELL || '/usr/local/bin/ashell';
+// Extracted from the new APK for the sync. Inside the chroot, so the app's own private files are
+// never touched by root; the launcher (Android side) reaches it at ${APP_DATA}/rootfs/<same path>.
+const UPDATE_DIR = '/var/lib/droidagent-update';
+const UPDATE_STATE_FILE = join(homedir(), '.claude', 'agent-update.json');
+const UPDATE_EVERY = 6 * 3600e3;
+const update = { checking: false, installing: false, lastCheck: 0, installed: null, latest: null, available: false, error: '' };
+
+function semverCmp(a, b) {
+	const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+	const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+	for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+	return 0;
+}
+// Run something in the real Android environment (see /usr/local/bin/ashell).
+function ashell(args, { input = null, timeout = 120000 } = {}) {
+	return new Promise((resolve) => {
+		const c = spawn(ASHELL, args, { stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+		let out = '';
+		let err = '';
+		const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } }, timeout);
+		c.stdout.on('data', (d) => { out += d; });
+		c.stderr.on('data', (d) => { err += d; });
+		c.on('error', (e) => { clearTimeout(t); resolve({ code: 127, out, err: String(e?.message || e) }); });
+		c.on('close', (code) => { clearTimeout(t); resolve({ code, out, err }); });
+		if (input) { input.on('error', () => {}); c.stdin.on('error', () => {}); input.pipe(c.stdin); }
+	});
+}
+async function installedVersion() {
+	const r = await ashell(['-c', `dumpsys package ${APP_PKG} | grep -m1 versionName`], { timeout: 30000 });
+	return r.out.match(/versionName=([0-9][0-9.]*)/)?.[1] || null;
+}
+// GET over HTTPS following redirects, directly or through the configured proxy. Resolves the
+// body as text, or streams it into `file`.
+function fetchUrl(url, { headers = {}, file = null, timeout = 30000, redirects = 5 } = {}) {
+	const proxy = readProxySetting() || null;
+	return new Promise((resolve, reject) => {
+		const u = new URL(url);
+		const go = (socket) => {
+			const req = httpsRequest({
+				host: u.hostname, port: Number(u.port) || 443, path: u.pathname + u.search, method: 'GET', timeout, agent: false,
+				headers: { host: u.hostname, 'User-Agent': 'DroidAgent-updater', ...headers },
+				...(socket ? { createConnection: () => socket } : {}),
+			}, (res) => {
+				if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+					res.resume();
+					return fetchUrl(new URL(res.headers.location, url).href, { file, timeout, redirects: redirects - 1 }).then(resolve, reject);
+				}
+				if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
+				if (file) {
+					const ws = createWriteStream(file);
+					res.on('error', reject);
+					ws.on('error', reject);
+					ws.on('finish', () => resolve({ status: 200 }));
+					return res.pipe(ws);
+				}
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => { body += d; });
+				res.on('end', () => resolve({ status: 200, body }));
+			});
+			req.on('timeout', () => req.destroy(new Error('超时')));
+			req.on('error', reject);
+			req.end();
+		};
+		if (!proxy) return go(null);
+		let pu;
+		try { pu = new URL(proxy); } catch { return reject(new Error('代理地址无效')); }
+		const target = `${u.hostname}:${Number(u.port) || 443}`;
+		const c = httpRequest({ host: pu.hostname, port: Number(pu.port) || 80, method: 'CONNECT', path: target, headers: { host: target }, timeout });
+		c.on('connect', (res, sock) => {
+			if (res.statusCode !== 200) { sock.destroy(); return reject(new Error(`代理拒绝（${res.statusCode}）`)); }
+			go(tlsConnect({ socket: sock, servername: u.hostname }));
+		});
+		c.on('timeout', () => c.destroy(new Error('超时')));
+		c.on('error', reject);
+		c.end();
+	});
+}
+// The newest DroidAgent-<x.y.z>.apk across the repository's releases (the update builds are
+// marked pre-release, so /releases/latest would not see them).
+async function latestRelease() {
+	const r = await fetchUrl(`https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=20`, { headers: { Accept: 'application/vnd.github+json' }, timeout: 20000 });
+	let best = null;
+	for (const rel of JSON.parse(r.body)) {
+		if (rel.draft) continue;
+		for (const a of rel.assets || []) {
+			const m = /^DroidAgent-(\d+\.\d+\.\d+)\.apk$/.exec(a.name || '');
+			if (m && (!best || semverCmp(m[1], best.version) > 0)) {
+				best = { version: m[1], url: a.browser_download_url, size: a.size, digest: a.digest || null, notes: rel.body || '', tag: rel.tag_name };
+			}
+		}
+	}
+	return best;
+}
+function sha256File(path) {
+	return new Promise((resolve, reject) => {
+		const h = createHash('sha256');
+		createReadStream(path).on('data', (d) => h.update(d)).on('error', reject).on('end', () => resolve(h.digest('hex')));
+	});
+}
+function extractApkAssets(apk, dir) {
+	const py = [
+		'import os, shutil, sys, zipfile',
+		'apk, out = sys.argv[1], sys.argv[2]',
+		'os.makedirs(out, exist_ok=True)',
+		'with zipfile.ZipFile(apk) as z:',
+		'    names = set(z.namelist())',
+		"    for n in ('debian', 'agent-app.tar', 'legacy-runtime.tar.xz'):",
+		"        if 'assets/' + n in names:",
+		"            tmp = os.path.join(out, n + '.new')",
+		"            with z.open('assets/' + n) as src, open(tmp, 'wb') as dst:",
+		'                shutil.copyfileobj(src, dst)',
+		'            os.replace(tmp, os.path.join(out, n))',
+	].join('\n');
+	return new Promise((resolve, reject) => {
+		execFile('python3', ['-c', py, apk, dir], { timeout: 120000 }, (err, _o, e) => (err ? reject(new Error(`解开新版本失败：${String(e || err.message).trim().slice(-160)}`)) : resolve()));
+	});
+}
+function lastUpdateInfo() {
+	try { return JSON.parse(readFileSync(UPDATE_STATE_FILE, 'utf8')); } catch { return null; }
+}
+function updateInfo() {
+	return {
+		current: update.installed, latest: update.latest?.version || null, available: update.available,
+		autoUpdate: settings.autoUpdate !== false, checking: update.checking, installing: update.installing,
+		lastCheck: update.lastCheck, error: update.error, lastUpdate: lastUpdateInfo(), repo: UPDATE_REPO,
+	};
+}
+function mainClientOpen() {
+	for (const res of clients) if (res.isMain) return true;
+	return false;
+}
+
+async function installUpdate(rel) {
+	update.installing = true;
+	update.error = '';
+	broadcast({ type: 'update_status', update: updateInfo() });
+	const apk = `/tmp/DroidAgent-${rel.version}.apk`;
+	try {
+		log('[update] downloading', rel.version);
+		await fetchUrl(rel.url, { file: apk, timeout: 60000 });
+		const size = (await stat(apk)).size;
+		if (rel.size && size !== rel.size) throw new Error(`下载不完整（${size}/${rel.size} 字节）`);
+		if (rel.digest?.startsWith('sha256:') && (await sha256File(apk)) !== rel.digest.slice(7)) throw new Error('下载的文件校验值不符');
+		await extractApkAssets(apk, UPDATE_DIR);
+		// Streamed through stdin, the way `adb install` does it: system_server reads a pipe, so
+		// where the file sits and how it is labelled doesn't matter.
+		const r = await ashell(['pm', 'install', '-r', '-S', String(size)], { input: createReadStream(apk), timeout: 300000 });
+		if (!/Success/.test(r.out)) throw new Error(`安装失败：${(r.out + ' ' + r.err).trim().slice(-200) || `退出码 ${r.code}`}`);
+		await writeFile(UPDATE_STATE_FILE, JSON.stringify({ from: update.installed, to: rel.version, at: Date.now(), notes: String(rel.notes).slice(0, 3000) }));
+		log('[update] installed', rel.version, '— syncing and restarting');
+		update.installed = rel.version;
+		update.available = false;
+		broadcast({ type: 'update_status', update: { ...updateInfo(), restarting: true } });
+		// Installing replaced the app, which closes it; bring it back if it was on screen. The
+		// launcher then stops this server and starts the new one, so it runs detached.
+		const files = `${APP_DATA}/rootfs${UPDATE_DIR}`;
+		let script = `env AGENT_APK_DIR=${APP_DATA} sh ${files}/debian boot ${files}/agent-app.tar ${files}/legacy-runtime.tar.xz > /data/local/tmp/droidagent-update.log 2>&1`;
+		if (mainClientOpen()) script += `; am start -n ${APP_PKG}/.MainActivity > /dev/null 2>&1`;
+		const child = spawn(ASHELL, ['-c', script], { detached: true, stdio: 'ignore' });
+		child.unref();
+	} catch (e) {
+		update.error = String(e?.message || e);
+		log('[update] failed:', update.error);
+	} finally {
+		update.installing = false;
+		rm(apk, { force: true }).catch(() => {});
+		broadcast({ type: 'update_status', update: updateInfo() });
+	}
+}
+// Returns true when it should look again soon (an update is waiting for a quiet moment).
+async function checkUpdate({ install = settings.autoUpdate !== false, now = false } = {}) {
+	if (update.checking || update.installing) return false;
+	update.checking = true;
+	update.error = '';
+	let retrySoon = false;
+	try {
+		update.installed = await installedVersion();
+		update.latest = await latestRelease();
+		update.lastCheck = Date.now();
+		update.available = !!(update.latest && update.installed && semverCmp(update.latest.version, update.installed) > 0);
+		if (update.available) log('[update] available', update.installed, '->', update.latest.version);
+		if (update.available && install) {
+			if (!now && [...runtimes.values()].some((rt) => rt.running)) {
+				log('[update] waiting: a conversation is running');
+				retrySoon = true;
+			} else {
+				update.checking = false;
+				await installUpdate(update.latest);
+			}
+		}
+	} catch (e) {
+		update.error = /HTTP 404/.test(String(e?.message)) ? `找不到 ${UPDATE_REPO} 的发布（仓库需要是公开的）` : `检查更新失败：${e?.message || e}`;
+		log('[update]', update.error);
+	} finally {
+		update.checking = false;
+		broadcast({ type: 'update_status', update: updateInfo() });
+	}
+	return retrySoon;
+}
+let updateTimer = null;
+function scheduleUpdateCheck(ms) {
+	clearTimeout(updateTimer);
+	updateTimer = setTimeout(async () => {
+		const soon = await checkUpdate().catch(() => false);
+		scheduleUpdateCheck(soon ? 10 * 60e3 : UPDATE_EVERY);
+	}, ms);
+}
+
 // ---------------------------------------------------------------- Claude Code runtime
 // Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
 // inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
@@ -1282,8 +1504,9 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/events') {
 			res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
 			res.write(': connected\n\n');
+			res.isMain = url.searchParams.get('main') === '1'; // the chat page (vs. the bubble's panel)
 			clients.add(res);
-			res.write(`data: ${JSON.stringify({ type: 'hello', settings, activeSessionId, activeSession: activeSessionId ? sessionCache.get(activeSessionId) : null })}\n\n`);
+			res.write(`data: ${JSON.stringify({ type: 'hello', settings, activeSessionId, activeSession: activeSessionId ? sessionCache.get(activeSessionId) : null, lastUpdate: lastUpdateInfo() })}\n\n`);
 			isLoggedIn().then((li) => { try { res.write(`data: ${JSON.stringify({ type: 'auth', loggedIn: li })}\n\n`); } catch { /* */ } });
 			const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch { /* */ } }, 20000);
 			req.on('close', () => { clearInterval(ka); clients.delete(res); });
@@ -1720,6 +1943,14 @@ const server = createServer(async (req, res) => {
 		}
 		if (req.method === 'POST' && path === '/api/login/cancel') { cancelLogin(); return json(res, { ok: true }); }
 
+		// ---- Self-update ----
+		if (path === '/api/update' && req.method === 'GET') return json(res, { ok: true, update: updateInfo() });
+		if (path === '/api/update/check' && req.method === 'POST') {
+			const { install } = await body(req);
+			await checkUpdate({ install: !!install, now: true });
+			return json(res, { ok: !update.error, update: updateInfo(), error: update.error });
+		}
+
 		// ---- Which program runs Claude Code here (diagnostics) ----
 		if (path === '/api/runtime' && req.method === 'GET') {
 			const r = await claudeRuntime();
@@ -1773,4 +2004,5 @@ await initSessions();
 server.listen(PORT, HOST, () => {
 	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
 	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks
+	if (!process.env.DROIDAGENT_NO_UPDATE) scheduleUpdateCheck(2 * 60e3); // let startup settle first
 });

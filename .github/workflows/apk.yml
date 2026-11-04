@@ -81,11 +81,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.out.outputs.version }}
+          EVENT: ${{ github.event_name }}
         run: |
           TAG="v$VERSION"
-          NOTES="已经装好 DroidAgent 的手机：下载 DroidAgent-$VERSION.apk 直接安装即可更新（约 7 MB，不含 Linux 系统）。第一次安装请用完整版。也可以在 Root 管理器里刷入 DroidAgent-update-$VERSION.zip。"
+          # This version's section of CHANGELOG.md, shown on the release and in the app after updating.
+          awk -v v="$VERSION" '$0 ~ "^## " { f = ($2 == v); next } f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "（CHANGELOG.md 里没有 $VERSION 的说明）" > notes.md
+          printf '\n---\n已经装好 DroidAgent 的手机会自动更新；也可以下载 DroidAgent-%s.apk 直接安装（约 7 MB，不含 Linux 系统，第一次安装请用完整版），或在 Root 管理器里刷入 DroidAgent-update-%s.zip。\n' "$VERSION" "$VERSION" >> notes.md
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+            if [ "$EVENT" = workflow_dispatch ]; then
+              gh release upload "$TAG" dist/* --clobber
+              gh release edit "$TAG" --notes-file notes.md
+            else
+              # Phones only install a higher version, so replacing this one's files would never
+              # reach them — and would make two different builds share one version number.
+              echo "::warning::v$VERSION is already published; bump versionName/versionCode in apk/AndroidManifest.xml (and add a CHANGELOG.md section) to ship this push."
+            fi
           else
-            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "DroidAgent $VERSION（更新包）" --notes "$NOTES" --prerelease
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "DroidAgent $VERSION（更新包）" --notes-file notes.md --prerelease
           fi
