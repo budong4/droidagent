@@ -9,10 +9,10 @@ store; it doesn't print a separate long-lived token the way `setup-token` does, 
 handling below is kept as a harmless no-op fallback in case a future CLI version ever does.
 
 Usage: login_pty.py [claude-binary ...]
-    Each argument is a Claude Code binary to try, in order (the server passes the global
-    `claude` first and the one bundled with the Agent SDK after it). If one exits or stalls
-    without ever printing a sign-in link, the next one is tried. With no arguments, `claude`
-    is looked up on PATH.
+    What to run comes from CLAUDE_CLI_SPECS, a JSON list of {"label", "cmd", "env"} set by the
+    server — e.g. a native binary with JavaScriptCoreUseJIT=0, or ["node", ".../cli.js"]. Each
+    is tried in order; if one exits or stalls without ever printing a sign-in link, the next one
+    is. Without CLAUDE_CLI_SPECS, each argument is a binary to try; with neither, `claude` on PATH.
 
 Line protocol, this script's stdout -> Node server (one per line):
     URL <authorize-url>      link the user opens to sign in
@@ -25,6 +25,7 @@ Everything the CLI printed is also written to ~/.claude/agent-login.log, so a fa
 can be diagnosed afterwards instead of collapsing into a one-line message.
 """
 import fcntl
+import json
 import os
 import pty
 import re
@@ -142,18 +143,20 @@ def normalize_code(raw_code, state):
     return c
 
 
-def spawn(cli):
+def spawn(spec):
+    cmd = list(spec["cmd"])
     pid, fd = pty.fork()
     if pid == 0:
+        os.environ.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
         os.environ["TERM"] = "xterm-256color"
         os.environ["COLUMNS"] = "2000"
         os.environ["LINES"] = "40"
         os.environ.pop("ANTHROPIC_API_KEY", None)  # subscription only, never an API key
         try:
-            os.execvp(cli, [cli, "auth", "login", "--claudeai"])
+            os.execvp(cmd[0], cmd + ["auth", "login", "--claudeai"])
         except OSError as e:
             # Lands in the pty, so the parent can report it instead of "no link".
-            os.write(1, f"cannot run {cli}: {e.strerror or e}\r\n".encode())
+            os.write(1, f"cannot run {cmd[0]}: {e.strerror or e}\r\n".encode())
         os._exit(127)
 
     # Very wide pty window so URLs are never soft-wrapped at 80 cols.
@@ -167,8 +170,9 @@ def spawn(cli):
 class Attempt:
     """One run of `<cli> auth login`. Result: 'ok', 'fail' (with reason) or 'no_url'."""
 
-    def __init__(self, cli):
-        self.cli = cli
+    def __init__(self, spec):
+        self.spec = spec
+        self.cli = spec["cmd"][-1]
         self.raw = ""
         self.url_sent = False
         self.code_sent = False
@@ -177,7 +181,7 @@ class Attempt:
         self.reason = ""
 
     def run(self):
-        pid, fd = spawn(self.cli)
+        pid, fd = spawn(self.spec)
         stdin_fd = sys.stdin.fileno()
         stdin_open = True
         started = time.time()
@@ -269,6 +273,8 @@ class Attempt:
             elif status is not None and os.WIFSIGNALED(status):
                 code = f"被信号 {os.WTERMSIG(status)} 终止"
             what = tail_reason(self.raw)
+            if re.search(r"bun\.report|Bun has crashed|oh no: Bun", self.raw):
+                what = "运行时启动即崩溃（Bun）"
             if elapsed >= URL_DEADLINE - 1:
                 code = f"{URL_DEADLINE} 秒内没有给出登录链接"
             self.reason = "；".join(x for x in (what, code) if x) or "命令没有任何输出"
@@ -283,17 +289,21 @@ class Attempt:
         return "fail"
 
 
-def cli_label(cli):
-    return "SDK 内置 claude" if "claude-agent-sdk" in cli else cli
-
-
 def candidates():
-    found = [a for a in sys.argv[1:] if a]
-    if not found:
+    raw = os.environ.get("CLAUDE_CLI_SPECS")
+    if raw:
+        try:
+            specs = [s for s in json.loads(raw) if s.get("cmd")]
+            if specs:
+                return specs
+        except (ValueError, AttributeError):
+            pass
+    paths = [a for a in sys.argv[1:] if a]
+    if not paths:
         p = shutil.which("claude")
         if p:
-            found.append(p)
-    return found
+            paths.append(p)
+    return [{"label": "SDK 内置 claude" if "claude-agent-sdk" in p else p, "cmd": [p], "env": {}} for p in paths]
 
 
 def main():
@@ -304,10 +314,11 @@ def main():
         return
 
     reasons = []
-    for cli in clis:
-        a = Attempt(cli)
+    for spec in clis:
+        a = Attempt(spec)
         result = a.run()
-        log_transcript(cli, a.raw, result)
+        log_transcript(" ".join(spec["cmd"]) + "".join(f" [{k}={v}]" for k, v in (spec.get("env") or {}).items()),
+                       a.raw, result)
         if result == "ok":
             emit("DONE ok")
             return
@@ -315,7 +326,7 @@ def main():
             emit("DONE fail " + (a.reason or "登录未完成，请重试"))
             return
         # No link at all: this binary can't do it here; try the next one, if any.
-        reasons.append(f"{cli_label(cli)}：{a.reason}")
+        reasons.append(f"{spec.get('label') or spec['cmd'][-1]}：{a.reason}")
 
     emit("DONE fail 无法启动登录，claude 没有给出登录链接。" + " | ".join(reasons)[:400]
          + "（完整输出见 ~/.claude/agent-login.log）")

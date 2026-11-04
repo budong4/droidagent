@@ -5,7 +5,7 @@ import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -25,11 +25,6 @@ delete process.env.ANTHROPIC_API_KEY;
 const LEGACY_TOKEN_FILE = join(homedir(), '.claude', 'agent-oauth-token'); // from the old setup-token flow
 unlink(LEGACY_TOKEN_FILE).catch(() => {}); // narrower-scoped and unused now; fine if it was never there
 
-let sdk = null;
-async function loadSdk() {
-	if (!sdk) sdk = await import('@anthropic-ai/claude-agent-sdk');
-	return sdk;
-}
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -468,7 +463,10 @@ async function ensureRuntime(id) {
 	if (rt) return rt;
 	const sess = await getOrLoadSessionObj(id);
 	if (!sess) throw new Error('session not found: ' + id);
-	const { query } = await loadSdk();
+	const runtime = await claudeRuntime();
+	if (!runtime.chat) throw new Error(noRuntimeMessage(runtime));
+	const chatSpec = runtime.chat;
+	const { query } = await loadSdkFor(chatSpec);
 
 	const queue = [];
 	let wake = null;
@@ -513,7 +511,7 @@ async function ensureRuntime(id) {
 	const mcpServers = await loadMcpServers();
 	const queryOpts = {
 		cwd: CWD,
-		model: getSdkModel(settings.model),
+		model: modelFor(chatSpec, settings.model),
 		effort: settings.effort || 'xhigh',
 		fastMode: !!settings.fastMode,
 		permissionMode: 'default',
@@ -526,13 +524,14 @@ async function ensureRuntime(id) {
 	if (skillIds.length) queryOpts.skills = skillIds;
 	if (Object.keys(mcpServers).length) queryOpts.mcpServers = mcpServers;
 	if (sess.claudeSessionId) queryOpts.resume = sess.claudeSessionId;
+	Object.assign(queryOpts, queryRuntimeOptions(chatSpec));
 
 	const q = query({
 		prompt: input(),
 		options: queryOpts,
 	});
 
-	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now() };
+	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now(), chatSpec };
 	runtimes.set(id, rt);
 	consume(id, q, rt).catch((e) => {
 		log('session error', id, e?.message || e);
@@ -839,43 +838,117 @@ async function saveProxySetting(url) {
 }
 applyProxy(readProxySetting());
 
-// ---------------------------------------------------------------- claude CLI
-// `auth login / status / logout` need a Claude Code binary. Prefer the global `claude` (the one a
-// terminal in the chroot uses); fall back to the native binary bundled with the Agent SDK, which
-// is always there because chat itself runs on it. A candidate only counts if `--version` works —
-// a stale symlink or a binary that can't start on this phone is skipped, not used.
+// ---------------------------------------------------------------- Claude Code runtime
+// Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
+// inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
+// (SIGABRT in JSC::VM::tryCreate), before Claude Code itself runs. So nothing is assumed: each
+// option is started once with --version and the first that works is used, for chat and for
+// `claude auth …` alike:
+//   1. the native binaries as they are;
+//   2. the same with JavaScriptCoreUseJIT=0, which makes JavaScriptCore skip reserving JIT memory;
+//   3. Claude Code 2.1.112 on Node.js — the last release shipped as plain JavaScript — from Agent
+//      SDK 0.2.112 in server/legacy-sdk (installed by the update package). Node runs fine on
+//      these phones: this server is Node.
+const NO_JIT = { JavaScriptCoreUseJIT: '0' };
+const LEGACY_SDK = join(HERE, 'legacy-sdk', 'node_modules', '@anthropic-ai', 'claude-agent-sdk');
 const SDK_CLI_PKGS = {
 	arm64: ['claude-agent-sdk-linux-arm64', 'claude-agent-sdk-linux-arm64-musl'],
 	x64: ['claude-agent-sdk-linux-x64', 'claude-agent-sdk-linux-x64-musl'],
 };
-function cliCandidates() {
+// The legacy CLI's own aliases point at the models it knew in April 2026; ask for current ones by id.
+const LEGACY_MODEL_IDS = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5', fable: 'claude-fable-5-1' };
+
+function nativeCandidates() {
 	const out = [];
-	for (const dir of String(process.env.PATH || '').split(':')) if (dir) out.push(join(dir, 'claude'));
-	out.push(join(homedir(), '.local', 'bin', 'claude'));
-	for (const pkg of SDK_CLI_PKGS[process.arch] || []) out.push(join(HERE, 'node_modules', '@anthropic-ai', pkg, 'claude'));
-	return [...new Set(out)].filter((p) => existsSync(p));
+	const seen = new Set();
+	const add = (label, kind, path) => {
+		if (seen.has(path) || !existsSync(path)) return;
+		seen.add(path);
+		out.push({ label, kind, path });
+	};
+	for (const dir of String(process.env.PATH || '').split(':')) if (dir) add(`全局 claude（${join(dir, 'claude')}）`, 'global', join(dir, 'claude'));
+	add('全局 claude（~/.local/bin）', 'global', join(homedir(), '.local', 'bin', 'claude'));
+	for (const pkg of SDK_CLI_PKGS[process.arch] || []) add('SDK 内置 claude', 'sdk', join(HERE, 'node_modules', '@anthropic-ai', pkg, 'claude'));
+	return out;
 }
-function probeCli(p) {
+function legacySpec() {
+	const cli = join(LEGACY_SDK, 'cli.js');
+	return existsSync(cli) ? { label: 'Node 版 claude', kind: 'legacy', cmd: [process.execPath, cli], env: {} } : null;
+}
+function runClaude(spec, args, opts = {}) {
+	return spawn(spec.cmd[0], [...spec.cmd.slice(1), ...args], { ...opts, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } });
+}
+function probe(spec) {
 	return new Promise((resolve) => {
-		execFile(p, ['--version'], { timeout: 30000, env: { ...process.env, ANTHROPIC_API_KEY: '' } },
-			(err, stdout) => resolve(err ? null : String(stdout).trim().split('\n')[0]));
+		execFile(spec.cmd[0], [...spec.cmd.slice(1), '--version'], { timeout: 45000, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } },
+			(err, stdout, stderr) => {
+				const version = String(stdout || '').trim().split('\n')[0];
+				if (!err && /\d+\.\d+\.\d+/.test(version)) return resolve({ ok: true, version });
+				const why = err?.signal ? `被信号 ${err.signal} 终止` : err?.killed ? '超时' : (String(stderr || '').trim().split('\n').pop() || err?.message || '无输出');
+				resolve({ ok: false, error: /bun\.report|Bun has crashed/.test(String(stderr) + String(stdout)) ? `Bun 崩溃（${why}）` : why.slice(0, 160) });
+			});
 	});
 }
-let cliCache = null;
-// Every working binary, best first. Cached once one works; re-probed while none does.
-async function workingClis() {
-	if (cliCache?.length) return cliCache;
-	const ok = [];
-	for (const p of cliCandidates()) {
-		const v = await probeCli(p);
-		if (v) ok.push({ path: p, version: v });
-		else log('[cli] not usable:', p);
-	}
-	if (ok.length) log('[cli] using', ok.map((c) => `${c.path} (${c.version})`).join(', '));
-	cliCache = ok;
-	return ok;
+
+let runtimeCache = null;
+let runtimeProbe = null;
+async function claudeRuntime() {
+	if (runtimeCache) return runtimeCache;
+	if (runtimeProbe) return runtimeProbe;
+	runtimeProbe = (async () => {
+		const tried = [];
+		const working = [];
+		for (const c of nativeCandidates()) {
+			for (const env of [{}, NO_JIT]) {
+				const spec = { label: c.label + (env === NO_JIT ? ' + 关闭 JIT' : ''), kind: c.kind, cmd: [c.path], env };
+				const r = await probe(spec);
+				tried.push({ label: spec.label, ok: r.ok, detail: r.ok ? r.version : r.error });
+				if (r.ok) { working.push({ ...spec, version: r.version }); break; }
+			}
+		}
+		const legacy = legacySpec();
+		if (legacy) {
+			const r = await probe(legacy);
+			tried.push({ label: legacy.label, ok: r.ok, detail: r.ok ? r.version : r.error });
+			if (r.ok) working.push({ ...legacy, version: r.version });
+		}
+		const chatSpec = working.find((w) => w.kind === 'sdk') || working.find((w) => w.kind === 'legacy') || working.find((w) => w.kind === 'global') || null;
+		const result = {
+			chat: chatSpec,
+			// Log in with the same program chat uses; the credentials land in the same ~/.claude.
+			auth: chatSpec,
+			working,
+			tried,
+			allSpecs: [...nativeCandidates().map((c) => ({ label: c.label, kind: c.kind, cmd: [c.path], env: {} })), ...(legacy ? [legacy] : [])],
+		};
+		log('[runtime]', tried.map((t) => `${t.label}: ${t.ok ? t.detail : '✗ ' + t.detail}`).join(' | ') || 'no candidates');
+		log('[runtime] chat via', chatSpec ? `${chatSpec.label}（${chatSpec.version}）` : 'NOTHING');
+		if (chatSpec) runtimeCache = result; // with nothing working, look again next time
+		return result;
+	})();
+	try { return await runtimeProbe; } finally { runtimeProbe = null; }
 }
-async function claudeBin() { return (await workingClis())[0]?.path || 'claude'; }
+function noRuntimeMessage(rt) {
+	const lines = (rt?.tried || []).map((t) => `${t.label}：${t.detail}`).join('；');
+	return `这台手机上启动不了 Claude Code${lines ? '（' + lines + '）' : ''}。请刷入最新的 DroidAgent 更新包，它带有 Node 版运行时。`;
+}
+const sdkModules = {};
+async function loadSdkFor(spec) {
+	if (spec.kind === 'legacy') return (sdkModules.legacy ||= await import(pathToFileURL(join(LEGACY_SDK, 'sdk.mjs')).href));
+	return (sdkModules.current ||= await import('@anthropic-ai/claude-agent-sdk'));
+}
+function modelFor(spec, m) {
+	const alias = getSdkModel(m);
+	return spec?.kind === 'legacy' ? (LEGACY_MODEL_IDS[alias] || alias) : alias;
+}
+// How the SDK should start Claude Code for this runtime.
+function queryRuntimeOptions(spec) {
+	const o = {};
+	if (Object.keys(spec.env).length) o.env = { ...process.env, ...spec.env };
+	if (spec.kind === 'legacy') { o.pathToClaudeCodeExecutable = spec.cmd[1]; o.executable = 'node'; }
+	else o.pathToClaudeCodeExecutable = spec.cmd[0];
+	return o;
+}
 
 // ---------------------------------------------------------------- login (pty)
 let login = null;
@@ -883,12 +956,15 @@ let loginRequest = 0;
 async function startLogin() {
 	cancelLogin();
 	const request = ++loginRequest;
-	const clis = await workingClis();
+	const rt = await claudeRuntime();
 	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
-	// Even with nothing that passed --version, still let the script try the raw candidates: its
-	// error output is what tells the user (and us) why claude can't start.
-	const paths = clis.length ? clis.map((c) => c.path) : cliCandidates();
-	const child = spawn('python3', [join(HERE, 'login_pty.py'), ...paths], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+	// The program chat uses first, then anything else that starts. With nothing that passed
+	// --version, still let the script try every candidate: its output says why none can start.
+	const specs = rt.working.length ? [rt.auth, ...rt.working.filter((w) => w !== rt.auth)] : rt.allSpecs;
+	const child = spawn('python3', [join(HERE, 'login_pty.py')], {
+		stdio: ['pipe', 'pipe', 'pipe'],
+		env: { ...process.env, CLAUDE_CLI_SPECS: JSON.stringify(specs.map(({ label, cmd, env }) => ({ label, cmd, env }))) },
+	});
 	login = child;
 	let buf = '';
 	let done = false;
@@ -940,9 +1016,10 @@ function sendLoginCode(code) {
 // The full `claude auth status` object — email, org, subscription type, auth method, etc.
 // Null if the command fails or doesn't return valid JSON (treated as "not logged in").
 async function getAuthStatus() {
-	const bin = await claudeBin();
+	const spec = (await claudeRuntime()).auth;
+	if (!spec) return null;
 	return await new Promise((resolve) => {
-		const c = spawn(bin, ['auth', 'status'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+		const c = runClaude(spec, ['auth', 'status']);
 		let out = '';
 		const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(null); }, 15000);
 		c.stdout.on('data', (d) => { out += d; });
@@ -1294,7 +1371,7 @@ const server = createServer(async (req, res) => {
 			await persistSettings();
 			for (const rt of runtimes.values()) {
 				try { if (settings.mode === 'plan') rt.q.setPermissionMode?.('plan'); else rt.q.setPermissionMode?.('default'); } catch { /* */ }
-				try { rt.q.setModel?.(getSdkModel(settings.model)); } catch { /* */ }
+				try { rt.q.setModel?.(modelFor(rt.chatSpec, settings.model)); } catch { /* */ }
 			}
 			broadcast({ type: 'settings', settings });
 			return json(res, { ok: true, settings });
@@ -1466,6 +1543,12 @@ const server = createServer(async (req, res) => {
 		}
 		if (req.method === 'POST' && path === '/api/login/cancel') { cancelLogin(); return json(res, { ok: true }); }
 
+		// ---- Which program runs Claude Code here (diagnostics) ----
+		if (path === '/api/runtime' && req.method === 'GET') {
+			const r = await claudeRuntime();
+			return json(res, { ok: !!r.chat, chat: r.chat ? { label: r.chat.label, version: r.chat.version, env: r.chat.env } : null, tried: r.tried });
+		}
+
 		// ---- Network proxy ----
 		if (path === '/api/proxy' && req.method === 'GET') return json(res, { ok: true, proxy: readProxySetting() });
 		if (path === '/api/proxy' && req.method === 'POST') {
@@ -1483,9 +1566,9 @@ const server = createServer(async (req, res) => {
 			return json(res, { ok: true, account: s });
 		}
 		if (path === '/api/account/logout' && req.method === 'POST') {
-			const bin = await claudeBin();
-			await new Promise((resolve) => {
-				const c = spawn(bin, ['auth', 'logout'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+			const spec = (await claudeRuntime()).auth;
+			if (spec) await new Promise((resolve) => {
+				const c = runClaude(spec, ['auth', 'logout']);
 				const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(); }, 15000);
 				c.on('exit', () => { clearTimeout(t); resolve(); });
 				c.on('error', () => { clearTimeout(t); resolve(); });
@@ -1502,4 +1585,7 @@ const server = createServer(async (req, res) => {
 });
 
 await initSessions();
-server.listen(PORT, HOST, () => log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`));
+server.listen(PORT, HOST, () => {
+	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
+	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks
+});

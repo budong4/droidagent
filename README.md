@@ -62,7 +62,7 @@ python build.py
 
 ### 更新已经装好的手机
 
-手机上已经解压过 Linux 系统时，不带 rootfs 的小 APK（几百 KB）就能完成更新：把 `apk/assets/rootfs.tar.xz` 移走后构建，再覆盖安装。
+手机上已经解压过 Linux 系统时，不带 rootfs 的小 APK（约 7 MB）就能完成更新：把 `apk/assets/rootfs.tar.xz` 移走后构建，再覆盖安装。
 
 ```bash
 adb install -r apk/DroidAgent.apk
@@ -80,7 +80,7 @@ adb install -r apk/DroidAgent.apk
 python tools/build_update_zip.py
 ```
 
-把生成的 `DroidAgent-update.zip` 放到手机上，在 KernelSU / Magisk / APatch 的「模块 → 从本地安装」里选它。它会备份旧版、更新聊天程序和启动器、重启服务，重启手机后自动移除，不留模块。APK 本身的部分（图标、启动页）仍需要更新 APK。
+把生成的 `DroidAgent-update.zip` 放到手机上，在 KernelSU / Magisk / APatch 的「模块 → 从本地安装」里选它。它会备份旧版，更新聊天程序、Node 运行时和启动器，重启服务并显示 Claude Code 的运行方式；重启手机后自动移除，不留模块。APK 本身的部分（图标、启动页）仍需要更新 APK。构建需要 `npm`（用来打包 Node 运行时）。
 
 ## 构建 rootfs 快照
 
@@ -117,7 +117,7 @@ debian retools                               装逆向分析工具链
 ### 登录失败怎么办
 
 - 登录失败时界面会显示 `claude` 实际报的错。完整输出在 chroot 里的 `~/.claude/agent-login.log`。
-- 后台会依次尝试全局安装的 `claude` 和 Agent SDK 自带的 `claude`：前者缺失、损坏或版本太旧时，会自动换后者。
+- 新版 Claude Code 是用 Bun 编译的原生程序，在部分安卓内核上一启动就崩溃（`Bun has crashed`，信号 6）。后台启动时会逐个试：全局 `claude`、SDK 自带的 `claude`、以上两者关闭 JIT（`JavaScriptCoreUseJIT=0`），最后是跑在 Node.js 上的 Claude Code 2.1.112（最后一个纯 JavaScript 版本，随 APK 和更新包一起提供）。第一个能启动的同时用于登录和对话。日志 `/var/log/agent-app.log` 里的 `[runtime]` 行会写明试了哪些、用的是哪个。
 - 授权码提交后提示连不上服务器：在登录页底部的「网络代理」（或 设置 → 网络代理）填写代理软件的本地端口，例如 `http://127.0.0.1:7890`。
 
 > 开机自启：把 `optional/99-debian-agent.sh` 放到 `/data/adb/service.d/` 即可（KernelSU/Magisk 的 service.d）。

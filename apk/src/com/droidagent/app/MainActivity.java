@@ -324,7 +324,10 @@ public class MainActivity extends Activity {
             // 3. sync launcher + chat app from the APK, start the backend
             st.step("start", "active", "正在启动助手服务", "第一次启动需要十几秒。");
             String bundle = a.hasAsset("agent-app.tar") ? a.extractAsset("agent-app.tar", "agent-app.tar") : "";
-            Su.Result r = Su.run("sh '" + bootstrap + "' boot " + (bundle.isEmpty() ? "" : "'" + bundle + "'"), 150);
+            // Claude Code on Node.js, for phones where the native builds abort at startup.
+            String runtime = a.hasAsset("legacy-runtime.tar.xz")
+                    ? a.extractAsset("legacy-runtime.tar.xz", "legacy-runtime.tar.xz") : "";
+            Su.Result r = Su.run("sh '" + bootstrap + "' boot '" + bundle + "' '" + runtime + "'", 180);
             if (r.code != 0) {
                 st.fail("start", "助手服务没能启动", explain(r.tail), r.tail);
                 return;

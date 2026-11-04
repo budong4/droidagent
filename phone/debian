@@ -5,8 +5,9 @@
 #   debian selfinstall [apk]                       unpack the rootfs carried inside the installed APK
 #   debian selfinstall - <xz|gz|tar>               same, reading the payload from stdin (the app pipes
 #                                                  it in itself so it can show real progress)
-#   debian sync <app.tar>                          update the installed launcher + chat app from the APK
-#   debian boot <app.tar>                          sync, then make sure the chat app is running
+#   debian sync <app.tar> [runtime.tar.xz]         update the installed launcher, chat app and the
+#                                                  Node runtime for Claude Code from the APK
+#   debian boot <app.tar> [runtime.tar.xz]         sync, then make sure the chat app is running
 #                                                  (restarted if its files changed) — run on every launch
 #   debian setup [VAR=value ...]                   provision packages/Claude Code inside (slow; EXTRA=1)
 #   debian start | stop | status                   mount / kill+unmount / show state
@@ -323,41 +324,64 @@ do_selfinstall() {
 }
 
 # Bring what lives outside the APK up to date with it: the launcher copy in $HOME_DIR (used from a
-# terminal) and the chat app inside the chroot. The app bundle is server/ + web/ without
-# node_modules; node_modules stays as installed in the chroot (it needs network to change).
-# Prints "app: updated" when the app's files changed, "app: unchanged" otherwise.
+# terminal), the chat app inside the chroot, and the Node runtime for Claude Code. The app bundle
+# is server/ + web/ without node_modules; node_modules stays as installed in the chroot (it needs
+# network to change). The Node runtime (legacy-runtime.tar.xz) goes to server/legacy-sdk — see
+# "Claude Code runtime" in server.mjs for why it exists.
+# Prints "app: updated" when anything the server uses changed, "app: unchanged" otherwise.
 do_sync() {
 	bundle=${1:-}
+	legacy=${2:-}
+	changed=
 	mkdir -p "$HOME_DIR"
 	if ! "$B" cmp -s "$SELF" "$HOME_DIR/debian" 2>/dev/null; then
 		cp "$SELF" "$HOME_DIR/debian.new" && chmod 755 "$HOME_DIR/debian.new" &&
 			mv -f "$HOME_DIR/debian.new" "$HOME_DIR/debian" && log "launcher updated"
 	fi
-	if [ ! -f "$bundle" ]; then
-		echo "app: unchanged"
-		return 0
+	if [ -f "$bundle" ] || [ -f "$legacy" ]; then
+		[ -e "$ROOT/usr/bin/bash" ] || die "no rootfs at $ROOT"
 	fi
-	[ -e "$ROOT/usr/bin/bash" ] || die "no rootfs at $ROOT"
-	sum=$("$B" sha256sum "$bundle" | "$B" awk '{ print $1 }')
-	stamp="$ROOT$APP_DIR/.bundle-sha256"
-	if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sum" ]; then
-		echo "app: unchanged"
-		return 0
+
+	if [ -f "$bundle" ]; then
+		sum=$("$B" sha256sum "$bundle" | "$B" awk '{ print $1 }')
+		stamp="$ROOT$APP_DIR/.bundle-sha256"
+		if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$sum" ]; then
+			tmp="$ROOT$APP_DIR.sync"
+			rm -rf "$tmp"
+			mkdir -p "$tmp" || die "cannot create $tmp"
+			"$B" tar -xf "$bundle" -C "$tmp" || { rm -rf "$tmp"; die "cannot unpack the app bundle"; }
+			[ -f "$tmp/server/server.mjs" ] && [ -f "$tmp/web/index.html" ] || { rm -rf "$tmp"; die "app bundle looks incomplete"; }
+			mkdir -p "$ROOT$APP_DIR/server"
+			"$B" cp -R "$tmp/server/." "$ROOT$APP_DIR/server/" || { rm -rf "$tmp"; die "cannot update the app's server"; }
+			rm -rf "$ROOT$APP_DIR/web.old"
+			[ -d "$ROOT$APP_DIR/web" ] && mv "$ROOT$APP_DIR/web" "$ROOT$APP_DIR/web.old"
+			mv "$tmp/web" "$ROOT$APP_DIR/web" || { mv "$ROOT$APP_DIR/web.old" "$ROOT$APP_DIR/web"; rm -rf "$tmp"; die "cannot update the app's web files"; }
+			rm -rf "$ROOT$APP_DIR/web.old" "$tmp"
+			echo "$sum" > "$stamp"
+			changed=1
+		fi
 	fi
-	tmp="$ROOT$APP_DIR.sync"
-	rm -rf "$tmp"
-	mkdir -p "$tmp" || die "cannot create $tmp"
-	"$B" tar -xf "$bundle" -C "$tmp" || { rm -rf "$tmp"; die "cannot unpack the app bundle"; }
-	[ -f "$tmp/server/server.mjs" ] && [ -f "$tmp/web/index.html" ] || { rm -rf "$tmp"; die "app bundle looks incomplete"; }
-	mkdir -p "$ROOT$APP_DIR/server"
-	"$B" cp -R "$tmp/server/." "$ROOT$APP_DIR/server/" || { rm -rf "$tmp"; die "cannot update the app's server"; }
-	rm -rf "$ROOT$APP_DIR/web.old"
-	[ -d "$ROOT$APP_DIR/web" ] && mv "$ROOT$APP_DIR/web" "$ROOT$APP_DIR/web.old"
-	mv "$tmp/web" "$ROOT$APP_DIR/web" || { mv "$ROOT$APP_DIR/web.old" "$ROOT$APP_DIR/web"; rm -rf "$tmp"; die "cannot update the app's web files"; }
-	rm -rf "$ROOT$APP_DIR/web.old" "$tmp"
-	echo "$sum" > "$stamp"
+
+	if [ -f "$legacy" ]; then
+		dest="$ROOT$APP_DIR/server/legacy-sdk"
+		sum=$("$B" sha256sum "$legacy" | "$B" awk '{ print $1 }')
+		if [ ! -f "$dest/.bundle-sha256" ] || [ "$(cat "$dest/.bundle-sha256")" != "$sum" ]; then
+			rm -rf "$dest.new"
+			mkdir -p "$dest.new" || die "cannot create $dest.new"
+			"$B" tar -xJf "$legacy" -C "$dest.new" || { rm -rf "$dest.new"; die "cannot unpack the Node runtime"; }
+			[ -f "$dest.new/node_modules/@anthropic-ai/claude-agent-sdk/cli.js" ] || { rm -rf "$dest.new"; die "Node runtime looks incomplete"; }
+			echo "$sum" > "$dest.new/.bundle-sha256"
+			rm -rf "$dest.old"
+			[ -d "$dest" ] && mv "$dest" "$dest.old"
+			mv "$dest.new" "$dest" || { [ -d "$dest.old" ] && mv "$dest.old" "$dest"; die "cannot install the Node runtime"; }
+			rm -rf "$dest.old"
+			log "Node runtime for Claude Code installed"
+			changed=1
+		fi
+	fi
+
 	sync
-	echo "app: updated"
+	if [ -n "$changed" ]; then echo "app: updated"; else echo "app: unchanged"; fi
 }
 
 cmd=${1:-status}

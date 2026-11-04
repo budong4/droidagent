@@ -43,3 +43,47 @@ def write_lf(src, dst):
     with open(dst, "wb") as f:
         f.write(data)
     return dst
+
+
+# Agent SDK whose bundled Claude Code (2.1.112) is the last release shipped as plain JavaScript.
+# Newer ones are Bun-compiled native binaries, which abort at startup on some Android kernels;
+# this one runs on the Node.js already in the chroot. See "Claude Code runtime" in server.mjs.
+LEGACY_SDK_VERSION = "0.2.112"
+
+
+def build_legacy_runtime(out_path, arch="arm64"):
+    """npm-install that SDK, keep only the linux-<arch> native helpers, and pack node_modules/
+    as a tar.xz. Returns None when npm isn't available (the runtime is then simply not shipped)."""
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            json.dump({"name": "droidagent-legacy-runtime", "private": True,
+                       "dependencies": {"@anthropic-ai/claude-agent-sdk": LEGACY_SDK_VERSION}}, f)
+        subprocess.run([npm, "install", "--omit=optional", "--omit=dev", "--no-audit", "--no-fund",
+                        "--ignore-scripts", "--loglevel=error"], cwd=tmp, check=True)
+        vendor = os.path.join(tmp, "node_modules", "@anthropic-ai", "claude-agent-sdk", "vendor")
+        keep = f"{arch}-linux"
+        for sub in ("ripgrep", "audio-capture"):
+            d = os.path.join(vendor, sub)
+            if os.path.isdir(d):
+                for name in os.listdir(d):
+                    p = os.path.join(d, name)
+                    if os.path.isdir(p) and name != keep:
+                        shutil.rmtree(p)
+        # GNU format: deep node_modules paths need long names, and the phone's busybox tar
+        # already handles GNU long names (the rootfs payload uses them).
+        with tarfile.open(out_path, "w:xz", format=tarfile.GNU_FORMAT, preset=6) as tf:
+            def norm(ti):
+                ti.mtime = 0
+                ti.uid = ti.gid = 0
+                ti.uname = ti.gname = "root"
+                return ti
+            tf.add(os.path.join(tmp, "node_modules"), "node_modules", filter=norm)
+    return out_path

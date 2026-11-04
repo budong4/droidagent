@@ -142,7 +142,7 @@ def align_apk(src, dst, alignment=4):
     print(f"    resources.arsc stored and {alignment}-byte aligned")
 
 
-from app_bundle import REPO_DIR, build_app_bundle, write_lf
+from app_bundle import REPO_DIR, build_app_bundle, build_legacy_runtime, write_lf
 
 
 def stage_assets():
@@ -153,6 +153,18 @@ def stage_assets():
         sys.exit("[!] phone/debian (the launcher) is missing")
     stage.append((write_lf(launcher, os.path.join(BUILD_DIR, "debian")), "assets/debian"))
     stage.append((build_app_bundle(os.path.join(BUILD_DIR, "agent-app.tar")), "assets/agent-app.tar"))
+    # Claude Code on Node.js, for phones where the native (Bun) builds abort at startup.
+    print("[*] Packing the Node runtime for Claude Code (npm install)...")
+    try:
+        legacy = build_legacy_runtime(os.path.join(BUILD_DIR, "legacy-runtime.tar.xz"))
+    except Exception as e:  # noqa: BLE001
+        legacy = None
+        print(f"[!] Could not pack it ({e}).")
+    if legacy:
+        stage.append((legacy, "assets/legacy-runtime.tar.xz"))
+    else:
+        print("[!] npm not found or failed: the APK ships without the Node runtime. Phones whose")
+        print("    native claude crashes will need the update package (tools/build_update_zip.py).")
 
     assets_dir = os.path.join(PROJECT_DIR, "assets")
     if os.path.isdir(assets_dir):
@@ -161,7 +173,7 @@ def stage_assets():
             for name in sorted(files):
                 full = os.path.join(root, name)
                 arc = "assets/" + os.path.relpath(full, assets_dir).replace("\\", "/")
-                if arc in ("assets/debian", "assets/agent-app.tar"):
+                if arc in ("assets/debian", "assets/agent-app.tar", "assets/legacy-runtime.tar.xz"):
                     continue  # generated above; never let a stale copy win
                 stage.append((full, arc))
     return stage
@@ -251,6 +263,7 @@ def main():
     #      assets/debian          the launcher, always the current phone/debian
     #      assets/agent-app.tar   the chat app (server + web, no node_modules); synced into the
     #                             chroot on launch, so app fixes ship with the APK alone
+    #      assets/legacy-runtime.tar.xz  Claude Code on Node.js (see app_bundle.py)
     #      assets/setup/...       the first-run / startup page
     #      assets/rootfs.tar.*    the Linux payload, if present (see README)
     stage = stage_assets()
