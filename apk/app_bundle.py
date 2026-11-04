@@ -9,7 +9,8 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def build_app_bundle(out_path, repo_dir=REPO_DIR):
-    """Pack app/ (server + web) into a tar, leaving out node_modules and junk.
+    """Pack app/ (server + web) into a tar, leaving out node_modules and junk, plus the chroot's
+    helper tools (phone/overlay/usr/local/{bin,sbin}) as tools/bin and tools/sbin.
 
     Entries are sorted and their mtimes fixed, so an unchanged app gives a byte-identical tar and
     the launcher's checksum check skips the sync (and the server restart) on the phone.
@@ -24,13 +25,27 @@ def build_app_bundle(out_path, repo_dir=REPO_DIR):
                 continue
             full = os.path.join(root, name)
             entries.append((full, os.path.relpath(full, app_dir).replace("\\", "/")))
+    for sub in ("bin", "sbin"):
+        tools = os.path.join(repo_dir, "phone", "overlay", "usr", "local", sub)
+        if os.path.isdir(tools):
+            for name in sorted(os.listdir(tools)):
+                full = os.path.join(tools, name)
+                if os.path.isfile(full):
+                    entries.append((full, f"tools/{sub}/{name}"))
     with tarfile.open(out_path, "w", format=tarfile.USTAR_FORMAT) as tf:
         for full, arc in entries:
             ti = tf.gettarinfo(full, arc)
             ti.mtime = 0
             ti.uid = ti.gid = 0
             ti.uname = ti.gname = "root"
-            ti.mode = 0o755 if arc.endswith((".py", ".sh")) else 0o644
+            ti.mode = 0o755 if arc.endswith((".py", ".sh")) or arc.startswith("tools/") else 0o644
+            if arc.startswith("tools/"):
+                import io
+                with open(full, "rb") as f:
+                    data = f.read().replace(b"\r\n", b"\n")
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+                continue
             with open(full, "rb") as f:
                 tf.addfile(ti, f)
     return out_path

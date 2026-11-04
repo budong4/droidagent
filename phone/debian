@@ -114,6 +114,12 @@ mount_all() {
 	bind_in /sys rec
 	mkdir -p "$ROOT/dev/shm"
 	is_mnt "$ROOT/dev/shm" || "$B" mount -t tmpfs -o mode=1777 tmpfs "$ROOT/dev/shm"
+	# Android's /dev has no /dev/fd, /dev/stdin …, which bash needs for process substitution
+	# (<(...)) and many scripts use. Add the standard links where missing (never replacing
+	# anything); /dev is a tmpfs, so they go away on reboot and come back on the next start.
+	for l in fd:/proc/self/fd stdin:/proc/self/fd/0 stdout:/proc/self/fd/1 stderr:/proc/self/fd/2; do
+		[ -e "$ROOT/dev/${l%%:*}" ] || [ -L "$ROOT/dev/${l%%:*}" ] || ln -s "${l#*:}" "$ROOT/dev/${l%%:*}" 2>/dev/null
+	done
 	bind_in /data
 	bind_in /storage rec
 	for d in /system /vendor /product /system_ext /odm /apex /linkerconfig; do
@@ -324,9 +330,9 @@ do_selfinstall() {
 }
 
 # Bring what lives outside the APK up to date with it: the launcher copy in $HOME_DIR (used from a
-# terminal), the chat app inside the chroot, and the Node runtime for Claude Code. The app bundle
-# is server/ + web/ without node_modules; node_modules stays as installed in the chroot (it needs
-# network to change). The Node runtime (legacy-runtime.tar.xz) goes to server/legacy-sdk — see
+# terminal), the chat app inside the chroot, its helper tools, and the Node runtime for Claude
+# Code. The app bundle is server/ + web/ (without node_modules, which stays as installed in the
+# chroot — it needs network to change) + tools/bin, tools/sbin (→ /usr/local/bin, /usr/local/sbin). The Node runtime (legacy-runtime.tar.xz) goes to server/legacy-sdk — see
 # "Claude Code runtime" in server.mjs for why it exists.
 # Prints "app: updated" when anything the server uses changed, "app: unchanged" otherwise.
 do_sync() {
@@ -353,6 +359,15 @@ do_sync() {
 			[ -f "$tmp/server/server.mjs" ] && [ -f "$tmp/web/index.html" ] || { rm -rf "$tmp"; die "app bundle looks incomplete"; }
 			mkdir -p "$ROOT$APP_DIR/server"
 			"$B" cp -R "$tmp/server/." "$ROOT$APP_DIR/server/" || { rm -rf "$tmp"; die "cannot update the app's server"; }
+			# The chroot's own helper tools (ashell, droid, …) ride along so fixes to them ship too.
+			for d in bin sbin; do
+				[ -d "$tmp/tools/$d" ] || continue
+				mkdir -p "$ROOT/usr/local/$d"
+				for f in "$tmp/tools/$d"/*; do
+					[ -f "$f" ] || continue
+					cp -f "$f" "$ROOT/usr/local/$d/" && chmod 755 "$ROOT/usr/local/$d/${f##*/}"
+				done
+			done
 			rm -rf "$ROOT$APP_DIR/web.old"
 			[ -d "$ROOT$APP_DIR/web" ] && mv "$ROOT$APP_DIR/web" "$ROOT$APP_DIR/web.old"
 			mv "$tmp/web" "$ROOT$APP_DIR/web" || { mv "$ROOT$APP_DIR/web.old" "$ROOT$APP_DIR/web"; rm -rf "$tmp"; die "cannot update the app's web files"; }

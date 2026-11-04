@@ -9,9 +9,13 @@ set -euo pipefail
 
 ANDROID_PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:/data/adb/ksu/bin
 
+# Read the file directly: process substitution (< <(...)) needs /dev/fd, which Android's /dev
+# (bound into the chroot as-is) may not have.
 envs=()
 if [ -r /etc/android.env ]; then
-	mapfile -t envs < <(grep -E '^[A-Z_][A-Z0-9_]*=' /etc/android.env || true)
+	while IFS= read -r line || [ -n "$line" ]; do
+		[[ $line =~ ^[A-Z_][A-Z0-9_]*= ]] && envs+=("$line")
+	done < /etc/android.env
 fi
 
 # Keep the working directory when it is a path Android also has. Android's shell does the cd:
