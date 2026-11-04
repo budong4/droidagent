@@ -28,3 +28,6 @@ apk/final.png
 .DS_Store
 Thumbs.db
 *.swp
+
+# Root-manager update package (tools/build_update_zip.py)
+DroidAgent-update.zip

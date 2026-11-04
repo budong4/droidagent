@@ -142,36 +142,7 @@ def align_apk(src, dst, alignment=4):
     print(f"    resources.arsc stored and {alignment}-byte aligned")
 
 
-REPO_DIR = os.path.dirname(PROJECT_DIR)
-
-
-def build_app_bundle(out_path):
-    """Pack app/ (server + web) into a tar, leaving out node_modules and junk.
-
-    Entries are sorted and their mtimes fixed, so an unchanged app gives a byte-identical tar and
-    the launcher's checksum check skips the sync (and the server restart) on the phone.
-    """
-    import tarfile
-    app_dir = os.path.join(REPO_DIR, "app")
-    skip_dirs = {"node_modules", "__pycache__", ".git"}
-    entries = []
-    for root, dirs, files in os.walk(app_dir):
-        dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
-        for name in sorted(files):
-            if name in (".DS_Store", "Thumbs.db") or name.endswith((".pyc", ".log")):
-                continue
-            full = os.path.join(root, name)
-            entries.append((full, os.path.relpath(full, app_dir).replace("\\", "/")))
-    with tarfile.open(out_path, "w", format=tarfile.USTAR_FORMAT) as tf:
-        for full, arc in entries:
-            ti = tf.gettarinfo(full, arc)
-            ti.mtime = 0
-            ti.uid = ti.gid = 0
-            ti.uname = ti.gname = "root"
-            ti.mode = 0o755 if arc.endswith((".py", ".sh")) else 0o644
-            with open(full, "rb") as f:
-                tf.addfile(ti, f)
-    return out_path
+from app_bundle import REPO_DIR, build_app_bundle, write_lf
 
 
 def stage_assets():
@@ -180,13 +151,7 @@ def stage_assets():
     launcher = os.path.join(REPO_DIR, "phone", "debian")
     if not os.path.isfile(launcher):
         sys.exit("[!] phone/debian (the launcher) is missing")
-    # Shell scripts must keep LF line endings even when checked out on Windows.
-    launcher_out = os.path.join(BUILD_DIR, "debian")
-    with open(launcher, "rb") as f:
-        data = f.read().replace(b"\r\n", b"\n")
-    with open(launcher_out, "wb") as f:
-        f.write(data)
-    stage.append((launcher_out, "assets/debian"))
+    stage.append((write_lf(launcher, os.path.join(BUILD_DIR, "debian")), "assets/debian"))
     stage.append((build_app_bundle(os.path.join(BUILD_DIR, "agent-app.tar")), "assets/agent-app.tar"))
 
     assets_dir = os.path.join(PROJECT_DIR, "assets")

@@ -72,6 +72,16 @@ adb install -r apk/DroidAgent.apk
 - 打开 App 后它会自动同步新版启动器和聊天程序，并重启后台服务。
 - 不带 rootfs 的 APK 不能用来初始化一台新手机，发布给别人时请用完整版。
 
+### 不用电脑，在手机上直接更新
+
+聊天程序（后端 + 界面）在已解压的 Linux 系统里，可以用 Root 管理器刷一个更新包来更新，不用重装 APK，也不会丢数据：
+
+```bash
+python tools/build_update_zip.py
+```
+
+把生成的 `DroidAgent-update.zip` 放到手机上，在 KernelSU / Magisk / APatch 的「模块 → 从本地安装」里选它。它会备份旧版、更新聊天程序和启动器、重启服务，重启手机后自动移除，不留模块。APK 本身的部分（图标、启动页）仍需要更新 APK。
+
 ## 构建 rootfs 快照
 
 APK 里打包的 `apk/assets/rootfs.tar.xz` 是一份已经装好依赖的 Debian。两种做法：
@@ -130,6 +140,7 @@ debian retools                               装逆向分析工具链
 | `phone/debian` | 安卓侧启动器脚本（挂载 / chroot / 管理后端） |
 | `phone/overlay/` | 叠加进 rootfs 的内容：工具（ashell/droid/pdata/clip）、agent 的 `CLAUDE.md`、设备档案模板 |
 | `optional/` | 开机自启脚本 |
+| `tools/` | 手机端更新包（Root 管理器刷入）的源文件和构建脚本 |
 
 ## ⚠️ 安全警告
 
