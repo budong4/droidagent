@@ -1280,6 +1280,11 @@ async function loadAccount() {
 	html += accountRow('登录方式', AUTH_METHOD_LABEL[a.authMethod] || a.authMethod);
 	html += accountRow('服务提供方', API_PROVIDER_LABEL[a.apiProvider] || a.apiProvider);
 	html += accountRow('组织 ID', a.orgId);
+	if (Array.isArray(a.scopes)) {
+		const full = ['user:profile', 'user:inference', 'user:sessions:claude_code', 'user:mcp_servers', 'user:file_upload', 'user:plugins'];
+		const missing = full.filter((x) => !a.scopes.includes(x));
+		html += accountRow('授权范围', missing.length ? `缺少 ${missing.join('、')}（重新登录可补全）` : `完整（${a.scopes.length} 项）`);
+	}
 	html += accountRow('使用数据采集', a.analyticsDisabled ? '已关闭' : '已开启');
 	html += accountRow('配置目录', a.configDirectory);
 	html += accountRow('项目目录', a.projectsDirectory);

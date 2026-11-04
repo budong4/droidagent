@@ -3,6 +3,7 @@
 import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
+import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
@@ -932,6 +933,69 @@ async function ensureNetwork(report) {
 	return { ok: false, proxy: current, summary: c.summary };
 }
 
+// ---------------------------------------------------------------- plan usage
+// The claude.ai usage endpoint that Claude Code's own /usage reads, called directly with the
+// stored login. That way usage works on either runtime (Agent SDK 0.2.112, behind the Node
+// runtime, has no usage call) and before any conversation has started.
+const CREDENTIALS_FILE = join(homedir(), '.claude', '.credentials.json');
+function readOauth() {
+	try { return JSON.parse(readFileSync(CREDENTIALS_FILE, 'utf8')).claudeAiOauth || null; } catch { return null; }
+}
+// GET over HTTPS, directly or through the configured HTTP proxy (CONNECT tunnel).
+function httpsGet(host, path, headers, proxy, timeout = 12000) {
+	return new Promise((resolve, reject) => {
+		const go = (socket) => {
+			// agent: false — a one-off connection, not one kept alive in the global pool.
+			const req = httpsRequest({ host, path, method: 'GET', headers: { host, ...headers }, timeout, agent: false, ...(socket ? { createConnection: () => socket } : {}) }, (res) => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => { body += d; });
+				res.on('end', () => resolve({ status: res.statusCode, body }));
+			});
+			req.on('timeout', () => req.destroy(new Error('超时')));
+			req.on('error', reject);
+			req.end();
+		};
+		if (!proxy) return go(null);
+		let u;
+		try { u = new URL(proxy); } catch { return reject(new Error('代理地址无效')); }
+		const c = httpRequest({ host: u.hostname, port: Number(u.port) || 80, method: 'CONNECT', path: `${host}:443`, headers: { host: `${host}:443` }, timeout });
+		c.on('connect', (res, sock) => {
+			if (res.statusCode !== 200) { sock.destroy(); return reject(new Error(`代理拒绝（${res.statusCode}）`)); }
+			go(tlsConnect({ socket: sock, servername: host }));
+		});
+		c.on('timeout', () => c.destroy(new Error('超时')));
+		c.on('error', reject);
+		c.end();
+	});
+}
+async function fetchPlanUsage() {
+	const o = readOauth();
+	if (!o?.accessToken) return { ok: false, error: '还没有登录 Claude 账号' };
+	if (o.expiresAt && o.expiresAt < Date.now()) return { ok: false, error: '登录凭据已过期。发一条消息（claude 会自动刷新），再回来看用量' };
+	const version = String(runtimeCache?.chat?.version || '').match(/\d+\.\d+\.\d+/)?.[0] || '2.1.112';
+	const r = await httpsGet('api.anthropic.com', '/api/oauth/usage', {
+		Authorization: `Bearer ${o.accessToken}`,
+		'anthropic-beta': 'oauth-2025-04-20',
+		'Content-Type': 'application/json',
+		'User-Agent': `claude-code/${version}`,
+	}, readProxySetting() || null);
+	if (r.status === 401) return { ok: false, error: '登录凭据已失效。发一条消息让 claude 刷新，或者重新登录' };
+	if (r.status === 403) return { ok: false, error: '这个登录没有读取用量的权限（缺少 user:profile），请重新登录' };
+	if (r.status !== 200) return { ok: false, error: `用量接口返回 ${r.status}` };
+	const d = JSON.parse(r.body);
+	const pick = (k) => d[k] ?? null;
+	return {
+		ok: true,
+		rate_limits_available: true,
+		rate_limits: {
+			five_hour: pick('five_hour'), seven_day: pick('seven_day'), seven_day_opus: pick('seven_day_opus'),
+			seven_day_sonnet: pick('seven_day_sonnet'), seven_day_oauth_apps: pick('seven_day_oauth_apps'), extra_usage: pick('extra_usage'),
+		},
+		subscription_type: o.subscriptionType ?? null,
+	};
+}
+
 // ---------------------------------------------------------------- Claude Code runtime
 // Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
 // inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
@@ -1615,18 +1679,21 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/usage' && req.method === 'GET') {
 			const fresh = url.searchParams.get('fresh') === '1';
 			if (!fresh && usageCache.data && Date.now() - usageCache.t < 60000) return json(res, { ok: true, ...usageCache.data });
+			let plan;
+			try { plan = await fetchPlanUsage(); } catch (e) { plan = { ok: false, error: `读取用量失败：${e?.message || e}` }; }
+			// The SDK's own call (newer SDKs only) adds this conversation's cost, and stands in for
+			// the direct call if that failed.
 			const rt = anyRuntime();
-			if (!rt) return json(res, { ok: false, error: '还没有进行中的对话，先发一条消息后再查看用量' });
-			try {
-				const fn = rt.q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
-				if (typeof fn !== 'function') return json(res, { ok: false, error: '当前 SDK 不支持用量查询' });
-				const u = await fn.call(rt.q, { skipBehaviors: true });
-				const data = { rate_limits_available: u.rate_limits_available, rate_limits: u.rate_limits || null, cost: u.total_cost_usd ?? u.cost ?? null };
-				usageCache = { t: Date.now(), data };
-				return json(res, { ok: true, ...data });
-			} catch (e) {
-				return json(res, { ok: false, error: e?.message || '查询失败' }, 500);
-			}
+			const fn = rt?.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+			let sdkUsage = null;
+			if (typeof fn === 'function') { try { sdkUsage = await fn.call(rt.q, { skipBehaviors: true }); } catch { /* */ } }
+			const cost = sdkUsage?.session?.total_cost_usd ?? sdkUsage?.total_cost_usd ?? null;
+			let data;
+			if (plan.ok) data = { rate_limits_available: true, rate_limits: plan.rate_limits, subscription_type: plan.subscription_type, cost };
+			else if (sdkUsage) data = { rate_limits_available: sdkUsage.rate_limits_available, rate_limits: sdkUsage.rate_limits || null, cost };
+			else return json(res, { ok: false, error: plan.error });
+			usageCache = { t: Date.now(), data };
+			return json(res, { ok: true, ...data });
 		}
 
 		// Legacy new chat endpoint
@@ -1679,7 +1746,9 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/account' && req.method === 'GET') {
 			const s = await getAuthStatus();
 			if (!s?.loggedIn) return json(res, { ok: false, error: '未登录' });
-			return json(res, { ok: true, account: s });
+			// What this login is allowed to do, straight from the stored credentials.
+			const o = readOauth();
+			return json(res, { ok: true, account: { ...s, scopes: o?.scopes || null, subscriptionType: s.subscriptionType ?? o?.subscriptionType ?? null } });
 		}
 		if (path === '/api/account/logout' && req.method === 'POST') {
 			const spec = (await claudeRuntime()).auth;

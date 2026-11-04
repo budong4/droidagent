@@ -173,6 +173,24 @@ printf '%s\\n' "$1" >> "$DROIDAGENT_AUTH_URL_FILE"
 """
 
 
+# What the newest Claude Code asks for at login. Older builds ask for less (2.1.112 has no
+# user:plugins), so the link is widened to this set: the login is then as capable as one made by
+# the newest CLI, whichever build runs here. Scopes are only ever added, never dropped.
+FULL_SCOPES = ["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code",
+               "user:mcp_servers", "user:file_upload", "user:plugins"]
+
+
+def widen_scopes(url):
+    parts = urllib.parse.urlsplit(url)
+    query = []
+    for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        if k == "scope":
+            have = v.split()
+            v = " ".join(have + [sc for sc in FULL_SCOPES if sc not in have])
+        query.append((k, v))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
 def make_browser_helper(workdir):
     path = os.path.join(workdir, "open-url")
     with open(path, "w") as f:
@@ -347,6 +365,7 @@ class Attempt:
             self._send_url("manual", self.manual_url)
 
     def _send_url(self, mode, url):
+        url = widen_scopes(url)
         m_state = re.search(r"[?&]state=([A-Za-z0-9_-]+)", url)
         if m_state:
             self.state = m_state.group(1)
