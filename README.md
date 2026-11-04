@@ -4,6 +4,14 @@
 
 > 名字叫 DroidAgent 而不是绑定某个模型，是为了以后能接入别的模型。当前后端基于 `@anthropic-ai/claude-agent-sdk`。
 
+## 下载安装
+
+最新自包含安装包（APK 内置整套装好依赖的 Debian，装上点一下自动解包，首次使用不需要联网装环境）：
+
+- **[Releases](../../releases/latest)** → 下载 `DroidAgent.apk`（约 1.3 GB）
+
+需要：已 Root 的 arm64 手机（KernelSU / Magisk / APatch）+ 你自己的 Claude 订阅账号。装好打开 App，它会自己申请 root。想自己从源码构建见下文。
+
 ---
 
 ## 这是什么
