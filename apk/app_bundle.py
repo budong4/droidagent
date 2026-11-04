@@ -84,6 +84,12 @@ def build_legacy_runtime(out_path, arch="arm64"):
                 ti.mtime = 0
                 ti.uid = ti.gid = 0
                 ti.uname = ti.gname = "root"
+                # Windows has no exec bit: give it back to directories and to the native helpers
+                # (ripgrep, audio capture) explicitly, or Claude Code's search tool can't run them.
+                if ti.isdir() or "/vendor/ripgrep/" in ti.name or "/vendor/audio-capture/" in ti.name:
+                    ti.mode = 0o755
+                else:
+                    ti.mode = 0o755 if ti.mode & 0o111 else 0o644
                 return ti
             tf.add(os.path.join(tmp, "node_modules"), "node_modules", filter=norm)
     return out_path

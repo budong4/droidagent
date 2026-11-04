@@ -288,6 +288,10 @@ def main():
 
     # 8. Create debug keystore if needed
     if not os.path.exists(keystore):
+        print("[!] apk/debug.keystore not found: generating a NEW signing key.")
+        print("    An APK signed with it cannot be installed over a DroidAgent that was built with")
+        print("    your old key (INSTALL_FAILED_UPDATE_INCOMPATIBLE) — stop here and restore the old")
+        print("    apk/debug.keystore if you are updating an existing install.")
         run_cmd([
             KEYTOOL, "-genkeypair", "-v",
             "-keystore", keystore,

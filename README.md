@@ -72,6 +72,16 @@ adb install -r apk/DroidAgent.apk
 - 打开 App 后它会自动同步新版启动器和聊天程序，并重启后台服务。
 - 不带 rootfs 的 APK 不能用来初始化一台新手机，发布给别人时请用完整版。
 
+### 自动构建与发布（GitHub Actions）
+
+`.github/workflows/apk.yml` 在每次推送到 `main` 时构建更新版 APK（不含 Linux 系统，约 7 MB）和 Root 管理器更新包，并以版本号发布到 Releases（`v<版本>`，标为预发布）。之后手机上的更新方式就是：打开 Releases，下载最新的 `DroidAgent-<版本>.apk` 直接安装，App 启动时会自动同步聊天程序和运行时。
+
+一次性设置：安卓只接受同一签名的更新，所以 CI 必须用当初签名手机上那个 APK 的密钥。在构建过那个 APK 的电脑上，把 `apk/debug.keystore` 转成 base64，存为仓库的 Actions Secret `ANDROID_KEYSTORE_BASE64`（仓库 Settings → Secrets and variables → Actions）。Windows PowerShell：
+
+```bash
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("apk\debug.keystore")) | Set-Clipboard
+```
+
 ### 不用电脑，在手机上直接更新
 
 聊天程序（后端 + 界面）在已解压的 Linux 系统里，可以用 Root 管理器刷一个更新包来更新，不用重装 APK，也不会丢数据：
@@ -146,6 +156,7 @@ debian retools                               装逆向分析工具链
 | `phone/overlay/` | 叠加进 rootfs 的内容：工具（ashell/droid/pdata/clip）、agent 的 `CLAUDE.md`、设备档案模板 |
 | `optional/` | 开机自启脚本 |
 | `tools/` | 手机端更新包（Root 管理器刷入）的源文件和构建脚本 |
+| `.github/workflows/` | 自动构建并发布更新版 APK |
 
 ## ⚠️ 安全警告
 
