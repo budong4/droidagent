@@ -1,66 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- One WebView for everything: the local setup page while the backend is being brought up,
+     then the chat app it serves. The window background matches both pages' backgrounds. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#0f1115">
+    android:background="@color/windowBackground">
 
     <WebView
         android:id="@+id/webview"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
-
-    <LinearLayout
-        android:id="@+id/error_layout"
-        android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:gravity="center"
-        android:orientation="vertical"
-        android:padding="24dp"
-        android:visibility="gone">
-
-        <ImageView
-            android:layout_width="72dp"
-            android:layout_height="72dp"
-            android:src="@mipmap/ic_launcher" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="DroidAgent未连接"
-            android:textColor="#ffffff"
-            android:textSize="20sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/error_text"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:gravity="center"
-            android:text="后台服务可能尚未启动（http://127.0.0.1:8787）"
-            android:textColor="#888888"
-            android:textSize="14sp" />
-
-        <Button
-            android:id="@+id/btn_start_service"
-            android:layout_width="200dp"
-            android:layout_height="48dp"
-            android:layout_marginTop="24dp"
-            android:background="#6ea8fe"
-            android:text="一键启动后台服务"
-            android:textColor="#0b1220"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <Button
-            android:id="@+id/btn_retry"
-            android:layout_width="200dp"
-            android:layout_height="48dp"
-            android:layout_marginTop="12dp"
-            android:background="#222838"
-            android:text="刷新重试"
-            android:textColor="#ffffff"
-            android:textSize="15sp" />
-    </LinearLayout>
+        android:background="@color/windowBackground" />
 </FrameLayout>

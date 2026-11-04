@@ -142,6 +142,43 @@ def align_apk(src, dst, alignment=4):
     print(f"    resources.arsc stored and {alignment}-byte aligned")
 
 
+from app_bundle import REPO_DIR, build_app_bundle, build_legacy_runtime, write_lf
+
+
+def stage_assets():
+    """(source path, archive name) for every asset that goes into the APK."""
+    stage = []
+    launcher = os.path.join(REPO_DIR, "phone", "debian")
+    if not os.path.isfile(launcher):
+        sys.exit("[!] phone/debian (the launcher) is missing")
+    stage.append((write_lf(launcher, os.path.join(BUILD_DIR, "debian")), "assets/debian"))
+    stage.append((build_app_bundle(os.path.join(BUILD_DIR, "agent-app.tar")), "assets/agent-app.tar"))
+    # Claude Code on Node.js, for phones where the native (Bun) builds abort at startup.
+    print("[*] Packing the Node runtime for Claude Code (npm install)...")
+    try:
+        legacy = build_legacy_runtime(os.path.join(BUILD_DIR, "legacy-runtime.tar.xz"))
+    except Exception as e:  # noqa: BLE001
+        legacy = None
+        print(f"[!] Could not pack it ({e}).")
+    if legacy:
+        stage.append((legacy, "assets/legacy-runtime.tar.xz"))
+    else:
+        print("[!] npm not found or failed: the APK ships without the Node runtime. Phones whose")
+        print("    native claude crashes will need the update package (tools/build_update_zip.py).")
+
+    assets_dir = os.path.join(PROJECT_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        for root, dirs, files in os.walk(assets_dir):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                arc = "assets/" + os.path.relpath(full, assets_dir).replace("\\", "/")
+                if arc in ("assets/debian", "assets/agent-app.tar", "assets/legacy-runtime.tar.xz"):
+                    continue  # generated above; never let a stale copy win
+                stage.append((full, arc))
+    return stage
+
+
 def run_cmd(args, desc):
     print(f"[*] {desc}...")
     res = subprocess.run(args, capture_output=True, text=True, cwd=PROJECT_DIR)
@@ -221,18 +258,23 @@ def main():
         *class_files
     ], "Generating DEX bytecode with d8")
 
-    # 6. Add assets (the Linux payload and the launcher) uncompressed, so the launcher can
-    #    stream them straight out of the APK with busybox unzip instead of going through Java.
-    assets_dir = os.path.join(PROJECT_DIR, "assets")
-    if os.path.isdir(assets_dir):
-        with zipfile.ZipFile(base_apk, "a", zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for root, _, files in os.walk(assets_dir):
-                for name in sorted(files):
-                    full = os.path.join(root, name)
-                    arc = "assets/" + os.path.relpath(full, assets_dir).replace("\\", "/")
-                    mb = os.path.getsize(full) / (1024 * 1024)
-                    print(f"[*] Adding {arc} ({mb:.1f} MB, stored)...")
-                    zf.write(full, arc, compress_type=zipfile.ZIP_STORED)
+    # 6. Add assets uncompressed: STORED entries can be streamed straight out of the APK (the
+    #    multi-GB Linux payload is read through AssetManager.openFd, which requires it).
+    #      assets/debian          the launcher, always the current phone/debian
+    #      assets/agent-app.tar   the chat app (server + web, no node_modules); synced into the
+    #                             chroot on launch, so app fixes ship with the APK alone
+    #      assets/legacy-runtime.tar.xz  Claude Code on Node.js (see app_bundle.py)
+    #      assets/setup/...       the first-run / startup page
+    #      assets/rootfs.tar.*    the Linux payload, if present (see README)
+    stage = stage_assets()
+    with zipfile.ZipFile(base_apk, "a", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for full, arc in stage:
+            mb = os.path.getsize(full) / (1024 * 1024)
+            print(f"[*] Adding {arc} ({mb:.1f} MB, stored)...")
+            zf.write(full, arc, compress_type=zipfile.ZIP_STORED)
+    if not any(arc.startswith("assets/rootfs.tar") for _, arc in stage):
+        print("[!] No apk/assets/rootfs.tar.* found: this APK can update an existing install,")
+        print("    but cannot set up a phone that has never had DroidAgent.")
 
     # 7. Add classes.dex into base.apk
     print("[*] Packaging classes.dex into APK...")
@@ -246,6 +288,10 @@ def main():
 
     # 8. Create debug keystore if needed
     if not os.path.exists(keystore):
+        print("[!] apk/debug.keystore not found: generating a NEW signing key.")
+        print("    An APK signed with it cannot be installed over a DroidAgent that was built with")
+        print("    your old key (INSTALL_FAILED_UPDATE_INCOMPATIBLE) — stop here and restore the old")
+        print("    apk/debug.keystore if you are updating an existing install.")
         run_cmd([
             KEYTOOL, "-genkeypair", "-v",
             "-keystore", keystore,

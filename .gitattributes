@@ -1,0 +1,9 @@
+# Scripts run on Android/Linux: keep LF even when checked out on Windows.
+phone/debian text eol=lf
+phone/overlay/** text eol=lf
+optional/*.sh text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.mjs text eol=lf
+*.png binary
+*.apk binary

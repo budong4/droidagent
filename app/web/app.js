@@ -79,13 +79,17 @@ function atBottom() { return thread.scrollHeight - thread.scrollTop - thread.cli
 function scroll(force) { if (force || atBottom()) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; }); }
 /* ---------------- theme (auto / light / dark) ---------------- */
 // Display preference, so it lives on the device rather than in the shared server settings.
+// "auto" follows the system. Inside the app the host reports night mode: WebView's own
+// prefers-color-scheme doesn't track the system reliably on every Android version.
+function systemDark() {
+	try { if (window.AgentHost && typeof window.AgentHost.isNight === 'function') return !!window.AgentHost.isNight(); } catch { /* bridge gone */ }
+	return matchMedia('(prefers-color-scheme: dark)').matches;
+}
 function applyTheme(t) {
-	document.documentElement.setAttribute('data-theme', t || 'auto');
+	const dark = t === 'dark' || (t !== 'light' && systemDark());
+	document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
 	const meta = document.querySelector('meta[name="theme-color"]');
-	if (meta) {
-		const dark = t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
-		meta.setAttribute('content', dark ? '#121212' : '#faf9f7');
-	}
+	if (meta) meta.setAttribute('content', dark ? '#0D1411' : '#F5F6F2');
 }
 function currentTheme() {
 	try { return localStorage.getItem('theme') || 'auto'; } catch { return 'auto'; }
@@ -131,7 +135,14 @@ const ICON_PATHS = {
 	list: '<path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
 	spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18"/>',
 	dot: '<circle cx="12" cy="12" r="3"/>',
+	battery: '<rect x="2.5" y="7" width="17" height="10" rx="2.5"/><path d="M22 11v2M6 10.5v3M9.5 10.5v3"/>',
+	disk: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+	restart: '<path d="M4 12a8 8 0 108-8 8.4 8.4 0 00-5.8 2.4L4 8.5"/><path d="M4 4v4.5h4.5"/>',
+	chev: '<path d="M9 6l6 6-6 6"/>',
+	check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
 };
+// The app's mark: the root prompt "#" and a block cursor.
+const MARK_SVG = '<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>';
 const icon = (k, size = 17) =>
 	`<svg class="ic" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[k] || ICON_PATHS.dot}</svg>`;
 
@@ -154,8 +165,11 @@ const TOOL_ICON = (name, detail) => {
 function addTool(id, name, title, detail, replay) {
 	// Open while it runs so you can watch it; finishTool collapses it again once it succeeds.
 	// On history replay everything starts collapsed, otherwise old conversations are a wall of text.
-	const card = el('div', replay ? 'tool' : 'tool open');
-	card.innerHTML = `<div class="tool-head"><div class="tool-ic">${TOOL_ICON(name, detail || '')}</div><div class="tool-title"></div><div class="tool-state">运行中…</div><svg class="chev" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></div><div class="tool-body"><pre></pre></div>`;
+	// Shell commands get the root prompt in the gutter and are shown as the command itself.
+	const bash = name === 'Bash' && !/droid (shot|ui|top|tap|swipe|text|key|app)|screencap|uiautomator/.test(detail || '');
+	const card = el('div', (replay ? 'tool' : 'tool open') + (bash ? ' bash' : ''));
+	const gutter = bash ? '<span class="tool-prompt">#</span>' : TOOL_ICON(name, detail || '');
+	card.innerHTML = `<div class="tool-head"><div class="tool-ic">${gutter}</div><div class="tool-title"></div><div class="tool-state" title="运行中"><span class="spin"></span></div><svg class="chev" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></div><div class="tool-body"><pre></pre></div>`;
 	card.querySelector('.tool-title').textContent = title || name;
 	if (detail) card.querySelector('.tool-body pre').textContent = detail;
 	card.querySelector('.tool-head').onclick = () => card.classList.toggle('open');
@@ -163,7 +177,9 @@ function addTool(id, name, title, detail, replay) {
 }
 function finishTool(id, ok, summary) {
 	const card = toolEls.get(id); if (!card) return;
-	const st = card.querySelector('.tool-state'); st.textContent = ok ? '完成' : '出错'; st.className = 'tool-state ' + (ok ? 'ok' : 'err');
+	const st = card.querySelector('.tool-state');
+	if (ok) { st.innerHTML = icon('check', 15); st.title = '完成'; } else { st.textContent = '出错'; st.title = ''; }
+	st.className = 'tool-state ' + (ok ? 'ok' : 'err');
 	if (summary && summary.trim()) {
 		const pre = card.querySelector('.tool-body pre');
 		pre.textContent = (pre.textContent ? pre.textContent + '\n— — —\n' : '') + summary.trim();
@@ -188,11 +204,11 @@ function sysline(t) { const e = el('div', 'sysline'); e.textContent = t; thread.
 /* ---------------- live todo checklist (TodoWrite) ---------------- */
 // Mirrors the terminal's own behaviour: one checklist block per conversation that gets replaced
 // in place on every TodoWrite call, rather than piling up a new card each time.
-const TODO_ICON = { pending: '☐', in_progress: '◐', completed: '☑' };
+const TODO_ICON = { pending: '', in_progress: '', completed: '' }; // drawn by CSS
 function renderTodoList(todos) {
 	return (todos || []).map((t) => {
 		const label = t.status === 'in_progress' ? (t.activeForm || t.content) : t.content;
-		return `<div class="todo-row todo-${esc(t.status || 'pending')}"><span class="todo-ic">${TODO_ICON[t.status] || '☐'}</span><span class="todo-label">${esc(label || '')}</span></div>`;
+		return `<div class="todo-row todo-${esc(t.status || 'pending')}"><span class="todo-ic">${TODO_ICON[t.status] || ''}</span><span class="todo-label">${esc(label || '')}</span></div>`;
 	}).join('');
 }
 function upsertTodo(todos) {
@@ -206,7 +222,7 @@ function addPermission(p) {
 	endAssistant();
 	const cat = p.reason === '高危操作';
 	const card = el('div', 'perm' + (cat ? ' catastrophic' : ''));
-	card.innerHTML = `<div class="ptop"><span class="tag">${cat ? '⚠ 高危' : '需要确认'}</span><span class="pt"></span></div>${p.detail ? '<pre></pre>' : ''}<div class="pbtns"><button class="yes">允许</button><button class="no">拒绝</button><button class="no stop">停止</button></div><div class="verdict hidden"></div>`;
+	card.innerHTML = `<div class="ptop"><span class="tag">${cat ? '高危操作' : '需要你确认'}</span><span class="pt"></span></div>${p.detail ? '<pre></pre>' : ''}<div class="pbtns"><button class="yes">允许</button><button class="no">拒绝</button><button class="no stop">停止</button></div><div class="verdict hidden"></div>`;
 	card.querySelector('.pt').textContent = p.title || p.name;
 	if (p.detail) card.querySelector('pre').textContent = p.detail;
 	const sid = p.sessionId || curSession?.id;
@@ -1076,8 +1092,9 @@ function connect() {
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) { endAssistant(); setRunning(false); sysline('错误：' + m.message); } else renderSidebar();
 				break;
-			case 'login_url': loginUrl(m.url); break;
-			case 'login_need_code': $('#login-msg').textContent = ''; break;
+			case 'login_url': loginUrl(m.url, m.mode); break;
+			case 'login_need_code': break;
+			case 'login_status': loginStatus(m); break;
 			case 'login_done': loginDone(m.ok, m.message); break;
 		}
 	};
@@ -1176,11 +1193,22 @@ $('#btn-stop').onclick = () => {
 };
 
 /* ---------------- welcome suggestions ---------------- */
-const SUGGESTIONS = ['看看现在屏幕上是什么', '哪些应用最占空间？', '最近一次重启的原因', '查电池温度和健康度', '列出内部存储最大的文件'];
+const SUGGESTIONS = [
+	['phone', '看看现在屏幕上是什么'],
+	['disk', '哪些应用最占空间？'],
+	['battery', '查电池温度和健康度'],
+	['restart', '最近一次重启是什么原因'],
+	['file', '列出内部存储里最大的文件'],
+];
 function buildWelcome() {
-	const w = el('div', 'welcome', `<div class="logo"></div><h1>你的手机助手</h1><p>我在这台手机的 Debian 环境里，有 root，能帮你管文件、应用、进程，还能看屏幕替你操作。直接说你想做什么。</p><div class="suggest"></div>`);
+	const w = el('div', 'welcome', `${MARK_SVG}<h1>想让手机做什么？</h1><p>我在这台手机的 Linux 环境里，有 root 权限：能管理文件、应用和进程，也能看屏幕、替你点按。</p><div class="suggest"></div>`);
 	w.id = 'welcome'; const sg = w.querySelector('.suggest');
-	SUGGESTIONS.forEach((t) => { const b = el('button'); b.textContent = t; b.onclick = () => { input.value = t; send(); }; sg.appendChild(b); });
+	SUGGESTIONS.forEach(([ic, t]) => {
+		const b = el('button', null, `${icon(ic, 18)}<span></span><span class="go">${icon('chev', 16)}</span>`);
+		b.querySelector('span').textContent = t;
+		b.onclick = () => { input.value = t; send(); };
+		sg.appendChild(b);
+	});
 	thread.appendChild(w);
 }
 
@@ -1252,6 +1280,11 @@ async function loadAccount() {
 	html += accountRow('登录方式', AUTH_METHOD_LABEL[a.authMethod] || a.authMethod);
 	html += accountRow('服务提供方', API_PROVIDER_LABEL[a.apiProvider] || a.apiProvider);
 	html += accountRow('组织 ID', a.orgId);
+	if (Array.isArray(a.scopes)) {
+		const full = ['user:profile', 'user:inference', 'user:sessions:claude_code', 'user:mcp_servers', 'user:file_upload', 'user:plugins'];
+		const missing = full.filter((x) => !a.scopes.includes(x));
+		html += accountRow('授权范围', missing.length ? `缺少 ${missing.join('、')}（重新登录可补全）` : `完整（${a.scopes.length} 项）`);
+	}
 	html += accountRow('使用数据采集', a.analyticsDisabled ? '已关闭' : '已开启');
 	html += accountRow('配置目录', a.configDirectory);
 	html += accountRow('项目目录', a.projectsDirectory);
@@ -1424,31 +1457,175 @@ $('#mcp-add').onclick = async () => {
 };
 
 /* ---------------- login ---------------- */
-function showLogin() { $('#login').classList.remove('hidden'); }
+function showLogin() { $('#login').classList.remove('hidden'); loadProxy(); }
 function hideLogin() { $('#login').classList.add('hidden'); }
-$('#login-start').onclick = () => { $('#login-msg').className = 'login-msg wait'; $('#login-msg').textContent = '正在生成登录链接…'; api('/api/login/start'); };
-function loginUrl(url) { $('#login-step1').classList.add('hidden'); $('#login-step2').classList.remove('hidden'); const a = $('#login-url'); a.href = url; a.dataset.url = url; $('#login-msg').textContent = ''; }
-$('#login-copy').onclick = () => { navigator.clipboard?.writeText($('#login-url').dataset.url || '').then(() => { $('#login-msg').className = 'login-msg ok'; $('#login-msg').textContent = '链接已复制'; }); };
+function setLoginMsg(kind, text) { const m = $('#login-msg'); m.className = 'login-msg' + (kind ? ' ' + kind : ''); m.textContent = text || ''; }
+function loginWaiting(on) {
+	$('#login-start').classList.toggle('hidden', on);
+	$('#login-wait').classList.toggle('hidden', !on);
+}
+// While the code is being verified: seconds so far and what claude last printed, so a slow
+// exchange visibly moves instead of looking frozen. A way out appears after 20 s.
+let verifyTimer = null;
+let verifyStart = 0;
+let verifyLine = '';
+function verifyText() {
+	const secs = Math.round((Date.now() - verifyStart) / 1000);
+	let t = `正在验证授权码…（${secs} 秒）`;
+	if (verifyLine) t += `\nclaude：${verifyLine}`;
+	if (secs >= 20) t += '\n超过半分钟还没结果，多半是手机里的 Linux 环境连不上 Claude。可以点「取消」，在下方「网络代理」填好端口后重新登录。';
+	return t;
+}
+function startVerify() {
+	stopVerify();
+	verifyStart = Date.now();
+	verifyLine = '';
+	setLoginMsg('wait', verifyText());
+	verifyTimer = setInterval(() => {
+		setLoginMsg('wait', verifyText());
+		if (Date.now() - verifyStart >= 20000) $('#login-cancel').classList.remove('hidden');
+	}, 1000);
+}
+function stopVerify() {
+	if (verifyTimer) clearInterval(verifyTimer);
+	verifyTimer = null;
+	$('#login-cancel').classList.add('hidden');
+}
+function backToStart(label) {
+	stopVerify();
+	loginWaiting(false);
+	$('#login-submit').disabled = false;
+	$('#login-step2').classList.add('hidden');
+	$('#login-step1').classList.remove('hidden');
+	$('#login-start').textContent = label || '重新开始登录';
+}
+$('#login-cancel').onclick = () => {
+	api('/api/login/cancel');
+	backToStart();
+	setLoginMsg('', '');
+	$('#login-net').open = true;
+};
+function loginStatus(m) {
+	if (m.proxy) {
+		$('#login-proxy').value = m.proxy;
+		$('#entry-proxy-sub').textContent = m.proxy;
+	}
+	if (m.kind === 'cli') {
+		verifyLine = m.text;
+		setLoginMsg('wait', verifyTimer ? verifyText() : `claude：${m.text}`);
+		return;
+	}
+	if (m.kind === 'warn') $('#login-net').open = true;
+	setLoginMsg(m.kind === 'warn' ? 'err' : m.kind === 'ok' ? 'ok' : 'wait', m.text);
+}
+$('#login-start').onclick = () => {
+	setLoginMsg('', '');
+	loginWaiting(true);
+	api('/api/login/start');
+};
+// 'auto': after "Authorize" the browser is sent straight back to claude on this phone
+// (http://localhost:…/callback) and the login finishes by itself; pasting is only a fallback.
+const LOGIN_TEXT = {
+	auto: {
+		step1: '用你的 Claude 账号登录，然后点「Authorize」。授权后浏览器会跳回本机，登录自动完成，回到这里就行。',
+		title: '没有自动完成？',
+		step2: '如果浏览器最后停在一个打不开的 localhost 页面，复制它地址栏里的完整网址，粘贴到这里。',
+		placeholder: '粘贴 http://localhost:… 网址',
+		submit: '提交',
+		waiting: '等你在浏览器里点「Authorize」，授权后这里会自动完成。',
+	},
+	manual: {
+		step1: '用你的 Claude 账号登录，然后点「Authorize」。',
+		title: '粘贴授权码',
+		step2: '授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。',
+		placeholder: '粘贴授权码',
+		submit: '完成登录',
+		waiting: '',
+	},
+};
+function loginUrl(url, mode) {
+	const t = LOGIN_TEXT[mode] || LOGIN_TEXT.manual;
+	loginWaiting(false);
+	$('#login-step1').classList.add('hidden');
+	$('#login-step2').classList.remove('hidden');
+	const a = $('#login-url'); a.href = url; a.dataset.url = url;
+	$('#login-step1-hint').textContent = t.step1;
+	$('#login-step2-title').textContent = t.title;
+	$('#login-step2-hint').textContent = t.step2;
+	$('#login-code').placeholder = t.placeholder;
+	$('#login-submit').textContent = t.submit;
+	$('#login-code').value = '';
+	$('#login-submit').disabled = false;
+	// Keep what the network check concluded (proxy switched / unreachable); replace "checking…".
+	if (!$('#login-msg').textContent || $('#login-msg').classList.contains('wait')) setLoginMsg(t.waiting ? 'wait' : '', t.waiting);
+}
+$('#login-copy').onclick = () => {
+	const url = $('#login-url').dataset.url || '';
+	const done = () => setLoginMsg('ok', '链接已复制，可以粘贴到任意浏览器里打开');
+	if (navigator.clipboard?.writeText) navigator.clipboard.writeText(url).then(done, () => setLoginMsg('err', '复制失败，请长按「打开登录页」复制'));
+	else setLoginMsg('err', '复制失败，请长按「打开登录页」复制');
+};
 $('#login-submit').onclick = async () => {
 	const code = $('#login-code').value.trim();
-	if (!code) return;
-	$('#login-msg').className = 'login-msg wait';
-	$('#login-msg').textContent = '登录中…';
+	if (!code) { setLoginMsg('err', '先把授权码或网址粘贴到上面的输入框'); $('#login-code').focus(); return; }
+	$('#login-submit').disabled = true;
+	startVerify();
 	const r = await api('/api/login/code', { code });
 	if (!r.ok) {
-		$('#login-msg').className = 'login-msg err';
-		$('#login-msg').textContent = r.error || '登录会话已超时，请重试';
-		$('#login-step2').classList.add('hidden');
-		$('#login-step1').classList.remove('hidden');
+		backToStart();
+		setLoginMsg('err', r.error || '登录会话已超时，请重新开始登录');
 	}
 };
 function loginDone(ok, message) {
-	const m = $('#login-msg');
-	if (ok) { m.className = 'login-msg ok'; m.textContent = '登录成功！'; setTimeout(hideLogin, 900); }
-	else { m.className = 'login-msg err'; m.textContent = '登录失败：' + (message || '请重试'); $('#login-step2').classList.add('hidden'); $('#login-step1').classList.remove('hidden'); }
+	stopVerify();
+	loginWaiting(false);
+	$('#login-submit').disabled = false;
+	if (ok) { setLoginMsg('ok', '登录成功'); setTimeout(hideLogin, 800); return; }
+	backToStart();
+	setLoginMsg('err', '登录失败：' + (message || '请重试'));
+	// Can't reach Anthropic from here: point at the proxy setting right away.
+	if (/连接|连不上|网络|代理|回应|ETIMEDOUT|ECONN|ENOTFOUND|fetch failed/i.test(message || '')) $('#login-net').open = true;
 }
 
-/* ---------------- boot ---------------- */
+/* ---------------- network proxy ---------------- */
+async function loadProxy() {
+	const r = await fetch('/api/proxy').then((x) => x.json()).catch(() => null);
+	if (!r || !r.ok) return '';
+	$('#login-proxy').value = r.proxy || '';
+	if (r.proxy) $('#login-net').open = true;
+	$('#entry-proxy-sub').textContent = r.proxy || '直连';
+	return r.proxy || '';
+}
+async function saveProxy(value) {
+	const r = await api('/api/proxy', { proxy: String(value || '').trim() });
+	if (r.ok) $('#entry-proxy-sub').textContent = r.proxy || '直连';
+	return r;
+}
+$('#login-proxy-save').onclick = async () => {
+	setLoginMsg('wait', '正在保存并测试能否连上 Claude…');
+	const r = await saveProxy($('#login-proxy').value);
+	if (!r.ok) return setLoginMsg('err', r.error || '保存失败');
+	const where = r.proxy ? `代理 ${r.proxy}` : '直连';
+	if (r.reachable) setLoginMsg('ok', `已保存。${where}可以连上 Claude，现在可以登录了。`);
+	else setLoginMsg('err', `已保存，但${where}连不上 Claude（${r.summary}）。请检查端口是否正确、代理软件是否在运行。`);
+};
+$('#entry-proxy').onclick = async () => {
+	const cur = await loadProxy();
+	showModal({
+		title: '网络代理',
+		msg: '当前网络连不上 Claude 时，填写代理软件的本地 HTTP 端口，例如 <code>http://127.0.0.1:7890</code>。留空就是直连。',
+		showInput: true,
+		inputVal: cur,
+		confirmText: '保存',
+		onConfirm: async (v) => {
+			const r = await saveProxy(v);
+			if (!r.ok) showModal({ title: '没有保存', msg: esc(r.error || '格式不对'), confirmText: '知道了' });
+			else if (!r.reachable) showModal({ title: '已保存，但连不上 Claude', msg: esc(`${r.proxy ? '代理 ' + r.proxy : '直连'}：${r.summary}`), confirmText: '知道了' });
+		},
+	});
+};
+loadProxy();
+
 buildWelcome();
 connect();
 fetchSessions();

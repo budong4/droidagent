@@ -6,9 +6,10 @@
 <title>助手状态</title>
 <style>
 	:root {
-		--bg: #1a1a1a; --surface: #202020; --line: #2e2e2e;
-		--text: #ededed; --muted: #9a9a9a; --faint: #6b6b6b;
-		--accent: #c97a53; --ok: #6fbf8b; --warn: #d9a441;
+		/* the floating panel is always dark, in the app's green-black */
+		--bg: #111A16; --surface: #18231E; --line: #26332D;
+		--text: #E6ECE8; --muted: #9AA8A0; --faint: #67756E;
+		--accent: #E2B33C; --ok: #5FD3A6; --warn: #E2B33C;
 	}
 	* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 	html, body { height: 100%; }
@@ -44,7 +45,7 @@
 	.row.tool .v { color: var(--text); }
 	.row.think .v { color: var(--muted); font-style: italic; }
 	.row.perm .v { color: var(--warn); }
-	.row.err .v { color: #e06c5f; }
+	.row.err .v { color: #EB7C72; }
 	.stream { color: var(--muted); white-space: pre-wrap; word-break: break-word; font-size: 12.5px; }
 	.empty { color: var(--faint); text-align: center; padding: 28px 10px; font-size: 12.5px; }
 
@@ -53,7 +54,7 @@
 		flex: 1; padding: 8px; border-radius: 9px; border: 1px solid var(--line);
 		background: var(--surface); color: var(--text); font-size: 12.5px; font-family: inherit;
 	}
-	button:active { background: #292929; }
+	button:active { background: #1D2823; }
 </style>
 </head>
 <body>

@@ -1,11 +1,14 @@
 // K70U agent app backend: serves the chat UI and drives official Claude Code via the Agent SDK.
 // Supports multi-session history, apps/files/folders scope selection, screenshot capture, and rich model & effort controls.
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
+import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -25,11 +28,6 @@ delete process.env.ANTHROPIC_API_KEY;
 const LEGACY_TOKEN_FILE = join(homedir(), '.claude', 'agent-oauth-token'); // from the old setup-token flow
 unlink(LEGACY_TOKEN_FILE).catch(() => {}); // narrower-scoped and unused now; fine if it was never there
 
-let sdk = null;
-async function loadSdk() {
-	if (!sdk) sdk = await import('@anthropic-ai/claude-agent-sdk');
-	return sdk;
-}
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -468,7 +466,10 @@ async function ensureRuntime(id) {
 	if (rt) return rt;
 	const sess = await getOrLoadSessionObj(id);
 	if (!sess) throw new Error('session not found: ' + id);
-	const { query } = await loadSdk();
+	const runtime = await claudeRuntime();
+	if (!runtime.chat) throw new Error(noRuntimeMessage(runtime));
+	const chatSpec = runtime.chat;
+	const { query } = await loadSdkFor(chatSpec);
 
 	const queue = [];
 	let wake = null;
@@ -513,7 +514,7 @@ async function ensureRuntime(id) {
 	const mcpServers = await loadMcpServers();
 	const queryOpts = {
 		cwd: CWD,
-		model: getSdkModel(settings.model),
+		model: modelFor(chatSpec, settings.model),
 		effort: settings.effort || 'xhigh',
 		fastMode: !!settings.fastMode,
 		permissionMode: 'default',
@@ -526,13 +527,14 @@ async function ensureRuntime(id) {
 	if (skillIds.length) queryOpts.skills = skillIds;
 	if (Object.keys(mcpServers).length) queryOpts.mcpServers = mcpServers;
 	if (sess.claudeSessionId) queryOpts.resume = sess.claudeSessionId;
+	Object.assign(queryOpts, queryRuntimeOptions(chatSpec));
 
 	const q = query({
 		prompt: input(),
 		options: queryOpts,
 	});
 
-	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now() };
+	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now(), chatSpec };
 	runtimes.set(id, rt);
 	consume(id, q, rt).catch((e) => {
 		log('session error', id, e?.message || e);
@@ -802,34 +804,383 @@ async function installSkill(src) {
 	}
 }
 
+// ---------------------------------------------------------------- network proxy
+// The chroot shares Android's network, so where Anthropic is unreachable directly, login (token
+// exchange) and every chat turn need a proxy — typically a proxy app's local port such as
+// http://127.0.0.1:7890. It lives in /etc/agent/proxy.env (also read by login shells), and is
+// applied to this process's env so every claude it spawns from now on inherits it.
+const PROXY_FILE = process.env.AGENT_PROXY_FILE || '/etc/agent/proxy.env';
+const PROXY_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
+const NO_PROXY = 'localhost,127.0.0.1,::1,mirrors.tuna.tsinghua.edu.cn';
+function readProxySetting() {
+	try {
+		const m = readFileSync(PROXY_FILE, 'utf8').match(/^\s*PROXY=["']?([^"'\s#]*)/m);
+		return m ? m[1] : '';
+	} catch { return ''; }
+}
+function applyProxy(url) {
+	if (url) {
+		for (const k of PROXY_VARS) process.env[k] = url;
+		process.env.NO_PROXY = process.env.no_proxy = NO_PROXY;
+	} else {
+		for (const k of [...PROXY_VARS, 'NO_PROXY', 'no_proxy']) delete process.env[k];
+	}
+}
+function validProxy(url) {
+	return url === '' || /^https?:\/\/[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?\/?$/.test(url);
+}
+async function saveProxySetting(url) {
+	let text = '';
+	try { text = readFileSync(PROXY_FILE, 'utf8'); } catch { /* first time */ }
+	const line = url ? `PROXY=${url}` : '#PROXY=http://127.0.0.1:7890';
+	if (/^\s*#?\s*PROXY=.*$/m.test(text)) text = text.replace(/^\s*#?\s*PROXY=.*$/m, line);
+	else text = (text ? text.replace(/\n?$/, '\n') : '') + line + '\n';
+	await mkdir(dirname(PROXY_FILE), { recursive: true });
+	await writeFile(PROXY_FILE, text, 'utf8');
+	applyProxy(url);
+}
+applyProxy(readProxySetting());
+
+// ---------------------------------------------------------------- reaching Anthropic
+// Login (token exchange, then account lookups) and every chat turn need platform.claude.com and
+// api.anthropic.com. On a phone the VPN often doesn't carry traffic from root processes in the
+// chroot (per-app VPN modes leave them out), so the browser can open the sign-in page while
+// `claude` itself hangs. So check first, and when the current route fails, look for the proxy
+// app's local port (they almost all expose one next to their VPN) and use it.
+const ANTHROPIC_HOSTS = ['platform.claude.com', 'api.anthropic.com'];
+// Clash / Clash Meta / mihomo (7890, 7897 Verge, 7891), NekoBox / sing-box (2080), v2rayNG HTTP
+// (10809), and a few generic ones.
+const LOCAL_PROXY_PORTS = [7890, 7897, 7891, 7893, 2080, 10809, 1080, 8080, 8888, 20171];
+
+// One HTTPS request (HEAD /), directly or through an HTTP proxy via CONNECT, without any
+// dependency on curl or on how a library reads proxy variables. Resolves { ok, status } or { ok:false, error }.
+function httpsHead(host, proxy, timeout = 7000) {
+	return new Promise((resolve) => {
+		let settled = false;
+		const sockets = [];
+		const finish = (r) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			for (const sk of sockets) { try { sk.destroy(); } catch { /* */ } }
+			resolve(r);
+		};
+		const timer = setTimeout(() => finish({ ok: false, error: '超时' }), timeout);
+		const fail = (e) => finish({ ok: false, error: e?.code || e?.message || String(e) });
+		const overTls = (opts) => {
+			const t = tlsConnect({ servername: host, ...opts }, () => {
+				t.write(`HEAD / HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: DroidAgent-netcheck\r\nConnection: close\r\n\r\n`);
+			});
+			sockets.push(t);
+			let head = '';
+			t.on('data', (d) => {
+				head += d.toString('latin1');
+				const m = head.match(/^HTTP\/1\.[01] (\d{3})/);
+				if (m) finish({ ok: true, status: Number(m[1]) });
+			});
+			t.on('error', fail);
+			t.on('end', () => finish({ ok: false, error: '连接被关闭' }));
+		};
+		if (!proxy) return overTls({ host, port: 443 });
+		let u;
+		try { u = new URL(proxy); } catch { return finish({ ok: false, error: '代理地址无效' }); }
+		const req = httpRequest({ host: u.hostname, port: Number(u.port) || 80, method: 'CONNECT', path: `${host}:443`, headers: { host: `${host}:443` } });
+		req.on('connect', (res, socket) => {
+			sockets.push(socket);
+			if (res.statusCode !== 200) return finish({ ok: false, error: `代理拒绝（${res.statusCode}）` });
+			overTls({ socket });
+		});
+		req.on('error', fail);
+		req.end();
+	});
+}
+// Reachable means an HTTP answer that isn't Anthropic's region block (403).
+async function checkAnthropic(proxy) {
+	const results = await Promise.all(ANTHROPIC_HOSTS.map((h) => httpsHead(h, proxy)));
+	const bad = results.map((r, i) => ({ host: ANTHROPIC_HOSTS[i], ...r })).filter((r) => !r.ok || r.status === 403);
+	return { ok: bad.length === 0, summary: bad.map((b) => `${b.host} ${b.ok ? '地区受限（403）' : b.error}`).join('，') };
+}
+function portOpen(port, timeout = 700) {
+	return new Promise((resolve) => {
+		const sk = netConnect({ host: '127.0.0.1', port });
+		const done = (v) => { clearTimeout(t); sk.destroy(); resolve(v); };
+		const t = setTimeout(() => done(false), timeout);
+		sk.on('connect', () => done(true));
+		sk.on('error', () => done(false));
+	});
+}
+async function findLocalProxy(skip) {
+	for (const port of LOCAL_PROXY_PORTS) {
+		const proxy = `http://127.0.0.1:${port}`;
+		if (proxy === skip || !(await portOpen(port))) continue;
+		if ((await checkAnthropic(proxy)).ok) return proxy;
+	}
+	return null;
+}
+// Make sure claude will be able to reach Anthropic; switch to a working local proxy if needed.
+async function ensureNetwork(report) {
+	const current = readProxySetting();
+	const c = await checkAnthropic(current || null);
+	if (c.ok) return { ok: true, proxy: current };
+	report(`${current ? `代理 ${current} ` : '直连'}连不上 Claude（${c.summary}），正在查找本机代理端口…`);
+	const found = await findLocalProxy(current);
+	if (found) {
+		await saveProxySetting(found);
+		log('[net] switched to local proxy', found, 'after', c.summary);
+		return { ok: true, proxy: found, changed: true };
+	}
+	log('[net] Anthropic unreachable:', c.summary);
+	return { ok: false, proxy: current, summary: c.summary };
+}
+
+// ---------------------------------------------------------------- plan usage
+// The claude.ai usage endpoint that Claude Code's own /usage reads, called directly with the
+// stored login. That way usage works on either runtime (Agent SDK 0.2.112, behind the Node
+// runtime, has no usage call) and before any conversation has started.
+const CREDENTIALS_FILE = join(homedir(), '.claude', '.credentials.json');
+function readOauth() {
+	try { return JSON.parse(readFileSync(CREDENTIALS_FILE, 'utf8')).claudeAiOauth || null; } catch { return null; }
+}
+// GET over HTTPS, directly or through the configured HTTP proxy (CONNECT tunnel).
+function httpsGet(host, path, headers, proxy, timeout = 12000) {
+	return new Promise((resolve, reject) => {
+		const go = (socket) => {
+			// agent: false — a one-off connection, not one kept alive in the global pool.
+			const req = httpsRequest({ host, path, method: 'GET', headers: { host, ...headers }, timeout, agent: false, ...(socket ? { createConnection: () => socket } : {}) }, (res) => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => { body += d; });
+				res.on('end', () => resolve({ status: res.statusCode, body }));
+			});
+			req.on('timeout', () => req.destroy(new Error('超时')));
+			req.on('error', reject);
+			req.end();
+		};
+		if (!proxy) return go(null);
+		let u;
+		try { u = new URL(proxy); } catch { return reject(new Error('代理地址无效')); }
+		const c = httpRequest({ host: u.hostname, port: Number(u.port) || 80, method: 'CONNECT', path: `${host}:443`, headers: { host: `${host}:443` }, timeout });
+		c.on('connect', (res, sock) => {
+			if (res.statusCode !== 200) { sock.destroy(); return reject(new Error(`代理拒绝（${res.statusCode}）`)); }
+			go(tlsConnect({ socket: sock, servername: host }));
+		});
+		c.on('timeout', () => c.destroy(new Error('超时')));
+		c.on('error', reject);
+		c.end();
+	});
+}
+async function fetchPlanUsage() {
+	const o = readOauth();
+	if (!o?.accessToken) return { ok: false, error: '还没有登录 Claude 账号' };
+	if (o.expiresAt && o.expiresAt < Date.now()) return { ok: false, error: '登录凭据已过期。发一条消息（claude 会自动刷新），再回来看用量' };
+	const version = String(runtimeCache?.chat?.version || '').match(/\d+\.\d+\.\d+/)?.[0] || '2.1.112';
+	const r = await httpsGet('api.anthropic.com', '/api/oauth/usage', {
+		Authorization: `Bearer ${o.accessToken}`,
+		'anthropic-beta': 'oauth-2025-04-20',
+		'Content-Type': 'application/json',
+		'User-Agent': `claude-code/${version}`,
+	}, readProxySetting() || null);
+	if (r.status === 401) return { ok: false, error: '登录凭据已失效。发一条消息让 claude 刷新，或者重新登录' };
+	if (r.status === 403) return { ok: false, error: '这个登录没有读取用量的权限（缺少 user:profile），请重新登录' };
+	if (r.status !== 200) return { ok: false, error: `用量接口返回 ${r.status}` };
+	const d = JSON.parse(r.body);
+	const pick = (k) => d[k] ?? null;
+	return {
+		ok: true,
+		rate_limits_available: true,
+		rate_limits: {
+			five_hour: pick('five_hour'), seven_day: pick('seven_day'), seven_day_opus: pick('seven_day_opus'),
+			seven_day_sonnet: pick('seven_day_sonnet'), seven_day_oauth_apps: pick('seven_day_oauth_apps'), extra_usage: pick('extra_usage'),
+		},
+		subscription_type: o.subscriptionType ?? null,
+	};
+}
+
+// ---------------------------------------------------------------- Claude Code runtime
+// Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
+// inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
+// (SIGABRT in JSC::VM::tryCreate), before Claude Code itself runs. So nothing is assumed: each
+// option is started once with --version and the first that works is used, for chat and for
+// `claude auth …` alike:
+//   1. the native binaries as they are;
+//   2. the same with JavaScriptCoreUseJIT=0, which makes JavaScriptCore skip reserving JIT memory;
+//   3. Claude Code 2.1.112 on Node.js — the last release shipped as plain JavaScript — from Agent
+//      SDK 0.2.112 in server/legacy-sdk (installed by the update package). Node runs fine on
+//      these phones: this server is Node.
+const NO_JIT = { JavaScriptCoreUseJIT: '0' };
+const LEGACY_SDK = join(HERE, 'legacy-sdk', 'node_modules', '@anthropic-ai', 'claude-agent-sdk');
+const SDK_CLI_PKGS = {
+	arm64: ['claude-agent-sdk-linux-arm64', 'claude-agent-sdk-linux-arm64-musl'],
+	x64: ['claude-agent-sdk-linux-x64', 'claude-agent-sdk-linux-x64-musl'],
+};
+// The legacy CLI's own aliases point at the models it knew in April 2026; ask for current ones by id.
+const LEGACY_MODEL_IDS = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5', fable: 'claude-fable-5-1' };
+
+function nativeCandidates() {
+	const out = [];
+	const seen = new Set();
+	const add = (label, kind, path) => {
+		if (seen.has(path) || !existsSync(path)) return;
+		seen.add(path);
+		out.push({ label, kind, path });
+	};
+	for (const dir of String(process.env.PATH || '').split(':')) if (dir) add(`全局 claude（${join(dir, 'claude')}）`, 'global', join(dir, 'claude'));
+	add('全局 claude（~/.local/bin）', 'global', join(homedir(), '.local', 'bin', 'claude'));
+	for (const pkg of SDK_CLI_PKGS[process.arch] || []) add('SDK 内置 claude', 'sdk', join(HERE, 'node_modules', '@anthropic-ai', pkg, 'claude'));
+	return out;
+}
+function legacySpec() {
+	const cli = join(LEGACY_SDK, 'cli.js');
+	return existsSync(cli) ? { label: 'Node 版 claude', kind: 'legacy', cmd: [process.execPath, cli], env: {} } : null;
+}
+function runClaude(spec, args, opts = {}) {
+	return spawn(spec.cmd[0], [...spec.cmd.slice(1), ...args], { ...opts, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } });
+}
+function probe(spec) {
+	return new Promise((resolve) => {
+		execFile(spec.cmd[0], [...spec.cmd.slice(1), '--version'], { timeout: 45000, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } },
+			(err, stdout, stderr) => {
+				const version = String(stdout || '').trim().split('\n')[0];
+				if (!err && /\d+\.\d+\.\d+/.test(version)) return resolve({ ok: true, version });
+				const why = err?.signal ? `被信号 ${err.signal} 终止` : err?.killed ? '超时' : (String(stderr || '').trim().split('\n').pop() || err?.message || '无输出');
+				resolve({ ok: false, error: /bun\.report|Bun has crashed/.test(String(stderr) + String(stdout)) ? `Bun 崩溃（${why}）` : why.slice(0, 160) });
+			});
+	});
+}
+
+let runtimeCache = null;
+let runtimeProbe = null;
+async function claudeRuntime() {
+	if (runtimeCache) return runtimeCache;
+	if (runtimeProbe) return runtimeProbe;
+	runtimeProbe = (async () => {
+		const tried = [];
+		const working = [];
+		for (const c of nativeCandidates()) {
+			for (const env of [{}, NO_JIT]) {
+				const spec = { label: c.label + (env === NO_JIT ? ' + 关闭 JIT' : ''), kind: c.kind, cmd: [c.path], env };
+				const r = await probe(spec);
+				tried.push({ label: spec.label, ok: r.ok, detail: r.ok ? r.version : r.error });
+				if (r.ok) { working.push({ ...spec, version: r.version }); break; }
+			}
+		}
+		const legacy = legacySpec();
+		if (legacy) {
+			const r = await probe(legacy);
+			tried.push({ label: legacy.label, ok: r.ok, detail: r.ok ? r.version : r.error });
+			if (r.ok) working.push({ ...legacy, version: r.version });
+		}
+		const chatSpec = working.find((w) => w.kind === 'sdk') || working.find((w) => w.kind === 'legacy') || working.find((w) => w.kind === 'global') || null;
+		const result = {
+			chat: chatSpec,
+			// Log in with the same program chat uses; the credentials land in the same ~/.claude.
+			auth: chatSpec,
+			working,
+			tried,
+			allSpecs: [...nativeCandidates().map((c) => ({ label: c.label, kind: c.kind, cmd: [c.path], env: {} })), ...(legacy ? [legacy] : [])],
+		};
+		log('[runtime]', tried.map((t) => `${t.label}: ${t.ok ? t.detail : '✗ ' + t.detail}`).join(' | ') || 'no candidates');
+		log('[runtime] chat via', chatSpec ? `${chatSpec.label}（${chatSpec.version}）` : 'NOTHING');
+		if (chatSpec) runtimeCache = result; // with nothing working, look again next time
+		return result;
+	})();
+	try { return await runtimeProbe; } finally { runtimeProbe = null; }
+}
+function noRuntimeMessage(rt) {
+	const lines = (rt?.tried || []).map((t) => `${t.label}：${t.detail}`).join('；');
+	return `这台手机上启动不了 Claude Code${lines ? '（' + lines + '）' : ''}。请刷入最新的 DroidAgent 更新包，它带有 Node 版运行时。`;
+}
+const sdkModules = {};
+async function loadSdkFor(spec) {
+	if (spec.kind === 'legacy') return (sdkModules.legacy ||= await import(pathToFileURL(join(LEGACY_SDK, 'sdk.mjs')).href));
+	return (sdkModules.current ||= await import('@anthropic-ai/claude-agent-sdk'));
+}
+function modelFor(spec, m) {
+	const alias = getSdkModel(m);
+	return spec?.kind === 'legacy' ? (LEGACY_MODEL_IDS[alias] || alias) : alias;
+}
+// How the SDK should start Claude Code for this runtime.
+function queryRuntimeOptions(spec) {
+	const o = {};
+	if (Object.keys(spec.env).length) o.env = { ...process.env, ...spec.env };
+	if (spec.kind === 'legacy') { o.pathToClaudeCodeExecutable = spec.cmd[1]; o.executable = 'node'; }
+	else o.pathToClaudeCodeExecutable = spec.cmd[0];
+	return o;
+}
+
 // ---------------------------------------------------------------- login (pty)
 let login = null;
-function startLogin() {
-	if (login) { try { login.kill('SIGKILL'); } catch { /* */ } }
-	const child = spawn('python3', [join(HERE, 'login_pty.py')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+let loginRequest = 0;
+async function startLogin() {
+	cancelLogin();
+	const request = ++loginRequest;
+	const status = (text, extra = {}) => { if (request === loginRequest) broadcast({ type: 'login_status', text, ...extra }); };
+	// The CLI inherits the proxy when it starts, so the route has to be right before it does.
+	status('正在检查能否连上 Claude…');
+	const route = await ensureNetwork((text) => status(text));
+	if (request !== loginRequest) return;
+	if (route.changed) status(`已自动改用本机代理 ${route.proxy}`, { proxy: route.proxy, kind: 'ok' });
+	else if (!route.ok) status(`连不上 Claude 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方「网络代理」填写代理软件的 HTTP 端口。`, { kind: 'warn' });
+	const rt = await claudeRuntime();
+	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
+	// The program chat uses first, then anything else that starts. With nothing that passed
+	// --version, still let the script try every candidate: its output says why none can start.
+	const specs = rt.working.length ? [rt.auth, ...rt.working.filter((w) => w !== rt.auth)] : rt.allSpecs;
+	const child = spawn('python3', [join(HERE, 'login_pty.py')], {
+		stdio: ['pipe', 'pipe', 'pipe'],
+		env: { ...process.env, CLAUDE_CLI_SPECS: JSON.stringify(specs.map(({ label, cmd, env }) => ({ label, cmd, env }))) },
+	});
 	login = child;
 	let buf = '';
+	let done = false;
+	let gotDone = false;
+	let loginMode = 'manual'; // 'auto': the link sends the browser straight back to claude on localhost
+	const finish = (ok, message) => {
+		if (done || child.cancelled) return;
+		done = true;
+		broadcast({ type: 'login_done', ok, message });
+		if (login === child) login = null;
+		if (ok) isLoggedIn().then((li) => broadcast({ type: 'auth', loggedIn: li }));
+	};
 	child.stdout.on('data', (d) => {
 		buf += d.toString();
 		let i;
 		while ((i = buf.indexOf('\n')) >= 0) {
 			const line = buf.slice(0, i); buf = buf.slice(i + 1);
 			log('[login-pty]', line.startsWith('URL ') ? line.slice(0, 50) + '...' : line);
-			if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim() });
+			if (line.startsWith('MODE ')) loginMode = line.slice(5).trim();
+			else if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim(), mode: loginMode });
 			else if (line === 'NEED_CODE') broadcast({ type: 'login_need_code' });
 			else if (line.startsWith('TOKEN ')) {
 				// `claude auth login` doesn't normally print this (login_pty.py keeps the pattern
 				// as a harmless fallback) — intentionally not acted on: see the note at LEGACY_TOKEN_FILE.
 				log('[login-pty] unexpected TOKEN line from auth login, ignoring');
+			} else if (line.startsWith('STATUS ')) {
+				broadcast({ type: 'login_status', text: line.slice(7), kind: 'cli' });
 			} else if (line.startsWith('DONE ')) {
+				gotDone = true;
 				const ok = line.slice(5).startsWith('ok');
-				broadcast({ type: 'login_done', ok, message: ok ? '' : line.slice(5) });
-				login = null;
+				const message = ok ? '' : line.slice(5).replace(/^fail\s*/, '');
+				// A run that stalled after the tokens were already saved still logged in.
+				if (ok) finish(true, '');
+				else isLoggedIn().then((li) => finish(li, li ? '' : message), () => finish(false, message));
 			}
 		}
 	});
-	child.stderr.on('data', (d) => log('[login-err]', String(d).trim().slice(0, 200)));
-	child.on('exit', (c, s) => { log('[login-exit]', c, s); if (login === child) { login = null; } });
+	child.stderr.on('data', (d) => log('[login-err]', String(d).trim().slice(0, 300)));
+	child.on('error', (e) => { log('[login-spawn]', e?.message); finish(false, `无法运行登录脚本（python3）：${e?.message || e}`); });
+	// 'close', not 'exit': stdout may still hold the DONE line when the process itself has exited.
+	child.on('close', (c, s) => {
+		log('[login-exit]', c, s);
+		if (!gotDone) finish(false, `登录进程意外退出（${s || c}）`);
+	});
+}
+// Replacing or cancelling a login on purpose must not surface as "login failed" in the UI.
+function cancelLogin() {
+	if (!login) return;
+	login.cancelled = true;
+	try { login.kill('SIGKILL'); } catch { /* */ }
+	login = null;
 }
 function sendLoginCode(code) {
 	if (login && login.stdin.writable) { login.stdin.write(String(code).trim() + '\n'); return true; }
@@ -839,8 +1190,10 @@ function sendLoginCode(code) {
 // The full `claude auth status` object — email, org, subscription type, auth method, etc.
 // Null if the command fails or doesn't return valid JSON (treated as "not logged in").
 async function getAuthStatus() {
+	const spec = (await claudeRuntime()).auth;
+	if (!spec) return null;
 	return await new Promise((resolve) => {
-		const c = spawn('claude', ['auth', 'status'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+		const c = runClaude(spec, ['auth', 'status']);
 		let out = '';
 		const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(null); }, 15000);
 		c.stdout.on('data', (d) => { out += d; });
@@ -1192,7 +1545,7 @@ const server = createServer(async (req, res) => {
 			await persistSettings();
 			for (const rt of runtimes.values()) {
 				try { if (settings.mode === 'plan') rt.q.setPermissionMode?.('plan'); else rt.q.setPermissionMode?.('default'); } catch { /* */ }
-				try { rt.q.setModel?.(getSdkModel(settings.model)); } catch { /* */ }
+				try { rt.q.setModel?.(modelFor(rt.chatSpec, settings.model)); } catch { /* */ }
 			}
 			broadcast({ type: 'settings', settings });
 			return json(res, { ok: true, settings });
@@ -1326,18 +1679,21 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/usage' && req.method === 'GET') {
 			const fresh = url.searchParams.get('fresh') === '1';
 			if (!fresh && usageCache.data && Date.now() - usageCache.t < 60000) return json(res, { ok: true, ...usageCache.data });
+			let plan;
+			try { plan = await fetchPlanUsage(); } catch (e) { plan = { ok: false, error: `读取用量失败：${e?.message || e}` }; }
+			// The SDK's own call (newer SDKs only) adds this conversation's cost, and stands in for
+			// the direct call if that failed.
 			const rt = anyRuntime();
-			if (!rt) return json(res, { ok: false, error: '还没有进行中的对话，先发一条消息后再查看用量' });
-			try {
-				const fn = rt.q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
-				if (typeof fn !== 'function') return json(res, { ok: false, error: '当前 SDK 不支持用量查询' });
-				const u = await fn.call(rt.q, { skipBehaviors: true });
-				const data = { rate_limits_available: u.rate_limits_available, rate_limits: u.rate_limits || null, cost: u.total_cost_usd ?? u.cost ?? null };
-				usageCache = { t: Date.now(), data };
-				return json(res, { ok: true, ...data });
-			} catch (e) {
-				return json(res, { ok: false, error: e?.message || '查询失败' }, 500);
-			}
+			const fn = rt?.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+			let sdkUsage = null;
+			if (typeof fn === 'function') { try { sdkUsage = await fn.call(rt.q, { skipBehaviors: true }); } catch { /* */ } }
+			const cost = sdkUsage?.session?.total_cost_usd ?? sdkUsage?.total_cost_usd ?? null;
+			let data;
+			if (plan.ok) data = { rate_limits_available: true, rate_limits: plan.rate_limits, subscription_type: plan.subscription_type, cost };
+			else if (sdkUsage) data = { rate_limits_available: sdkUsage.rate_limits_available, rate_limits: sdkUsage.rate_limits || null, cost };
+			else return json(res, { ok: false, error: plan.error });
+			usageCache = { t: Date.now(), data };
+			return json(res, { ok: true, ...data });
 		}
 
 		// Legacy new chat endpoint
@@ -1355,24 +1711,49 @@ const server = createServer(async (req, res) => {
 		}
 
 		// Login flow
-		if (req.method === 'POST' && path === '/api/login/start') { startLogin(); return json(res, { ok: true }); }
+		if (req.method === 'POST' && path === '/api/login/start') { startLogin().catch((e) => log('[login]', e?.message)); return json(res, { ok: true }); }
 		if (req.method === 'POST' && path === '/api/login/code') {
 			const { code } = await body(req);
 			const ok = sendLoginCode(code);
 			log('[login-code-received]', ok ? 'sent to pty' : 'login session expired', (code || '').slice(0, 15) + '...');
 			return json(res, { ok, error: ok ? '' : '登录会话已超时失效，请重新点击「开始登录」' });
 		}
-		if (req.method === 'POST' && path === '/api/login/cancel') { try { login?.kill('SIGKILL'); } catch { /* */ } login = null; return json(res, { ok: true }); }
+		if (req.method === 'POST' && path === '/api/login/cancel') { cancelLogin(); return json(res, { ok: true }); }
+
+		// ---- Which program runs Claude Code here (diagnostics) ----
+		if (path === '/api/runtime' && req.method === 'GET') {
+			const r = await claudeRuntime();
+			return json(res, { ok: !!r.chat, chat: r.chat ? { label: r.chat.label, version: r.chat.version, env: r.chat.env } : null, tried: r.tried });
+		}
+
+		// ---- Network proxy ----
+		if (path === '/api/netcheck' && req.method === 'GET') {
+			const proxy = readProxySetting();
+			const c = await checkAnthropic(proxy || null);
+			return json(res, { ok: c.ok, proxy, summary: c.summary, localProxy: c.ok ? null : await findLocalProxy(proxy) });
+		}
+		if (path === '/api/proxy' && req.method === 'GET') return json(res, { ok: true, proxy: readProxySetting() });
+		if (path === '/api/proxy' && req.method === 'POST') {
+			const proxy = String((await body(req)).proxy || '').trim();
+			if (!validProxy(proxy)) return json(res, { ok: false, error: '格式应为 http://主机:端口，例如 http://127.0.0.1:7890' }, 400);
+			await saveProxySetting(proxy);
+			log('[proxy]', proxy || '(none)');
+			const check = await checkAnthropic(proxy || null);
+			return json(res, { ok: true, proxy, reachable: check.ok, summary: check.summary });
+		}
 
 		// ---- Account (everything `claude auth status` knows) ----
 		if (path === '/api/account' && req.method === 'GET') {
 			const s = await getAuthStatus();
 			if (!s?.loggedIn) return json(res, { ok: false, error: '未登录' });
-			return json(res, { ok: true, account: s });
+			// What this login is allowed to do, straight from the stored credentials.
+			const o = readOauth();
+			return json(res, { ok: true, account: { ...s, scopes: o?.scopes || null, subscriptionType: s.subscriptionType ?? o?.subscriptionType ?? null } });
 		}
 		if (path === '/api/account/logout' && req.method === 'POST') {
-			await new Promise((resolve) => {
-				const c = spawn('claude', ['auth', 'logout'], { env: { ...process.env, ANTHROPIC_API_KEY: '' } });
+			const spec = (await claudeRuntime()).auth;
+			if (spec) await new Promise((resolve) => {
+				const c = runClaude(spec, ['auth', 'logout']);
 				const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(); }, 15000);
 				c.on('exit', () => { clearTimeout(t); resolve(); });
 				c.on('error', () => { clearTimeout(t); resolve(); });
@@ -1389,4 +1770,7 @@ const server = createServer(async (req, res) => {
 });
 
 await initSessions();
-server.listen(PORT, HOST, () => log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`));
+server.listen(PORT, HOST, () => {
+	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
+	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks
+});
