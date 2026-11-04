@@ -636,7 +636,8 @@ input, textarea { font: inherit; }
 }
 .login-card input:focus { border-color: var(--accent); }
 .login-wait { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 15px; min-height: 50px; }
-.login-msg { font-size: 14px; margin: 14px 0 0; min-height: 0; line-height: 1.6; overflow-wrap: anywhere; }
+.login-msg { font-size: 14px; margin: 14px 0 0; min-height: 0; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-line; }
+#login-cancel { margin-top: 10px; }
 .login-msg:empty { display: none; }
 .login-msg.err { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); padding: 12px 14px; border-radius: 12px; }
 .login-msg.ok { color: var(--ok); } .login-msg.wait { color: var(--muted); }

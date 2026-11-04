@@ -18,6 +18,8 @@ Line protocol, this script's stdout -> Node server (one per line):
     URL <authorize-url>      link the user opens to sign in
     NEED_CODE                waiting for the code shown after signing in
     TOKEN <token>            long-lived token, if setup-token printed one (never shown in the UI)
+    STATUS <text>            after the code is sent: the latest thing the CLI printed, so a slow
+                             token exchange shows what it is doing instead of a frozen spinner
     DONE ok | DONE fail <reason>
 stdin, Node server -> this script: one line = the code the user pasted.
 
@@ -47,7 +49,11 @@ NET_ERR_RE = re.compile(
 # is a few seconds; a minute and a half without a link means it is stuck, not slow.
 URL_DEADLINE = int(os.environ.get("LOGIN_URL_TIMEOUT", "90"))
 CODE_DEADLINE = 600   # the user signing in in the browser
-EXCHANGE_DEADLINE = 180  # after the code is sent: token exchange with Anthropic
+# After the code is sent: the token exchange (15 s timeout in the CLI) and then account lookups
+# that have no timeout at all — on a network that drops packets those hang for minutes.
+EXCHANGE_DEADLINE = int(os.environ.get("LOGIN_EXCHANGE_TIMEOUT", "75"))
+NO_ANSWER = ("{secs} 秒内没有收到 Anthropic 服务器的回应。手机里的 Linux 环境多半没有走 VPN：请在下方「网络代理」"
+             "填写代理软件的本地端口（例如 Clash 的 http://127.0.0.1:7890），然后重新登录。")
 
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "agent-login.log")
 
@@ -179,6 +185,10 @@ class Attempt:
         self.token_sent = False
         self.state = ""
         self.reason = ""
+        self.status = ""
+        self.timed_out = False
+        self.code_mark = 0
+        self.sent_code = "\0"
 
     def run(self):
         pid, fd = spawn(self.spec)
@@ -195,22 +205,26 @@ class Attempt:
                 else:
                     timeout = EXCHANGE_DEADLINE - (time.time() - code_at)
                 if timeout <= 0:
+                    self.timed_out = True
                     break
                 watch = [fd]
                 if self.url_sent and not self.code_sent and stdin_open:
                     watch.append(stdin_fd)
                 r, _, _ = select.select(watch, [], [], timeout)
                 if not r:
+                    self.timed_out = True
                     break
                 if stdin_fd in r:
                     line = sys.stdin.readline()
                     if not line:
                         stdin_open = False  # server went away; nothing more will come
                         continue
-                    os.write(fd, normalize_code(line, self.state).encode())
+                    self.sent_code = normalize_code(line, self.state)
+                    os.write(fd, self.sent_code.encode())
                     time.sleep(0.15)
                     os.write(fd, b"\r")
                     self.code_sent = True
+                    self.code_mark = len(self.raw)
                     code_at = time.time()
                 if fd in r:
                     try:
@@ -247,6 +261,13 @@ class Attempt:
             if t:
                 emit("TOKEN " + t.group(0))
                 self.token_sent = True
+        if self.code_sent:
+            # The terminal echoes what was typed; never show the code itself.
+            after = self.raw[self.code_mark:].replace(self.sent_code, "")
+            line = tail_reason(after, 120).split(" / ")[-1]
+            if line and line != self.status:
+                self.status = line
+                emit("STATUS " + line)
         # Fast exit on a rejected code instead of hanging until the timeout.
         if self.code_sent and re.search(
                 r"(OAuth error|Invalid code|OAuth\s+failed|Login failed|Request failed with status code)",
@@ -282,10 +303,12 @@ class Attempt:
         if not self.code_sent:
             self.reason = "登录超时（10 分钟内没有提交授权码），请重新点「开始登录」"
             return "fail"
-        if NET_ERR_RE.search(text):
+        if NET_ERR_RE.search(clean(self.raw[self.code_mark:])):
             self.reason = "无法连接 Anthropic 服务器换取登录凭据。请检查网络，或在下方填写代理后重试"
+        elif self.timed_out:
+            self.reason = NO_ANSWER.format(secs=EXCHANGE_DEADLINE)
         else:
-            self.reason = tail_reason(self.raw, 160) or "登录未完成，请重试"
+            self.reason = tail_reason(self.raw[self.code_mark:], 160) or "登录未完成，请重试"
         return "fail"
 
 

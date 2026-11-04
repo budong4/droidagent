@@ -1,6 +1,8 @@
 // K70U agent app backend: serves the chat UI and drives official Claude Code via the Agent SDK.
 // Supports multi-session history, apps/files/folders scope selection, screenshot capture, and rich model & effort controls.
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
@@ -838,6 +840,98 @@ async function saveProxySetting(url) {
 }
 applyProxy(readProxySetting());
 
+// ---------------------------------------------------------------- reaching Anthropic
+// Login (token exchange, then account lookups) and every chat turn need platform.claude.com and
+// api.anthropic.com. On a phone the VPN often doesn't carry traffic from root processes in the
+// chroot (per-app VPN modes leave them out), so the browser can open the sign-in page while
+// `claude` itself hangs. So check first, and when the current route fails, look for the proxy
+// app's local port (they almost all expose one next to their VPN) and use it.
+const ANTHROPIC_HOSTS = ['platform.claude.com', 'api.anthropic.com'];
+// Clash / Clash Meta / mihomo (7890, 7897 Verge, 7891), NekoBox / sing-box (2080), v2rayNG HTTP
+// (10809), and a few generic ones.
+const LOCAL_PROXY_PORTS = [7890, 7897, 7891, 7893, 2080, 10809, 1080, 8080, 8888, 20171];
+
+// One HTTPS request (HEAD /), directly or through an HTTP proxy via CONNECT, without any
+// dependency on curl or on how a library reads proxy variables. Resolves { ok, status } or { ok:false, error }.
+function httpsHead(host, proxy, timeout = 7000) {
+	return new Promise((resolve) => {
+		let settled = false;
+		const sockets = [];
+		const finish = (r) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			for (const sk of sockets) { try { sk.destroy(); } catch { /* */ } }
+			resolve(r);
+		};
+		const timer = setTimeout(() => finish({ ok: false, error: '超时' }), timeout);
+		const fail = (e) => finish({ ok: false, error: e?.code || e?.message || String(e) });
+		const overTls = (opts) => {
+			const t = tlsConnect({ servername: host, ...opts }, () => {
+				t.write(`HEAD / HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: DroidAgent-netcheck\r\nConnection: close\r\n\r\n`);
+			});
+			sockets.push(t);
+			let head = '';
+			t.on('data', (d) => {
+				head += d.toString('latin1');
+				const m = head.match(/^HTTP\/1\.[01] (\d{3})/);
+				if (m) finish({ ok: true, status: Number(m[1]) });
+			});
+			t.on('error', fail);
+			t.on('end', () => finish({ ok: false, error: '连接被关闭' }));
+		};
+		if (!proxy) return overTls({ host, port: 443 });
+		let u;
+		try { u = new URL(proxy); } catch { return finish({ ok: false, error: '代理地址无效' }); }
+		const req = httpRequest({ host: u.hostname, port: Number(u.port) || 80, method: 'CONNECT', path: `${host}:443`, headers: { host: `${host}:443` } });
+		req.on('connect', (res, socket) => {
+			sockets.push(socket);
+			if (res.statusCode !== 200) return finish({ ok: false, error: `代理拒绝（${res.statusCode}）` });
+			overTls({ socket });
+		});
+		req.on('error', fail);
+		req.end();
+	});
+}
+// Reachable means an HTTP answer that isn't Anthropic's region block (403).
+async function checkAnthropic(proxy) {
+	const results = await Promise.all(ANTHROPIC_HOSTS.map((h) => httpsHead(h, proxy)));
+	const bad = results.map((r, i) => ({ host: ANTHROPIC_HOSTS[i], ...r })).filter((r) => !r.ok || r.status === 403);
+	return { ok: bad.length === 0, summary: bad.map((b) => `${b.host} ${b.ok ? '地区受限（403）' : b.error}`).join('，') };
+}
+function portOpen(port, timeout = 700) {
+	return new Promise((resolve) => {
+		const sk = netConnect({ host: '127.0.0.1', port });
+		const done = (v) => { clearTimeout(t); sk.destroy(); resolve(v); };
+		const t = setTimeout(() => done(false), timeout);
+		sk.on('connect', () => done(true));
+		sk.on('error', () => done(false));
+	});
+}
+async function findLocalProxy(skip) {
+	for (const port of LOCAL_PROXY_PORTS) {
+		const proxy = `http://127.0.0.1:${port}`;
+		if (proxy === skip || !(await portOpen(port))) continue;
+		if ((await checkAnthropic(proxy)).ok) return proxy;
+	}
+	return null;
+}
+// Make sure claude will be able to reach Anthropic; switch to a working local proxy if needed.
+async function ensureNetwork(report) {
+	const current = readProxySetting();
+	const c = await checkAnthropic(current || null);
+	if (c.ok) return { ok: true, proxy: current };
+	report(`${current ? `代理 ${current} ` : '直连'}连不上 Claude（${c.summary}），正在查找本机代理端口…`);
+	const found = await findLocalProxy(current);
+	if (found) {
+		await saveProxySetting(found);
+		log('[net] switched to local proxy', found, 'after', c.summary);
+		return { ok: true, proxy: found, changed: true };
+	}
+	log('[net] Anthropic unreachable:', c.summary);
+	return { ok: false, proxy: current, summary: c.summary };
+}
+
 // ---------------------------------------------------------------- Claude Code runtime
 // Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
 // inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
@@ -956,6 +1050,13 @@ let loginRequest = 0;
 async function startLogin() {
 	cancelLogin();
 	const request = ++loginRequest;
+	const status = (text, extra = {}) => { if (request === loginRequest) broadcast({ type: 'login_status', text, ...extra }); };
+	// The CLI inherits the proxy when it starts, so the route has to be right before it does.
+	status('正在检查能否连上 Claude…');
+	const route = await ensureNetwork((text) => status(text));
+	if (request !== loginRequest) return;
+	if (route.changed) status(`已自动改用本机代理 ${route.proxy}`, { proxy: route.proxy, kind: 'ok' });
+	else if (!route.ok) status(`连不上 Claude 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方「网络代理」填写代理软件的 HTTP 端口。`, { kind: 'warn' });
 	const rt = await claudeRuntime();
 	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
 	// The program chat uses first, then anything else that starts. With nothing that passed
@@ -968,6 +1069,7 @@ async function startLogin() {
 	login = child;
 	let buf = '';
 	let done = false;
+	let gotDone = false;
 	const finish = (ok, message) => {
 		if (done || child.cancelled) return;
 		done = true;
@@ -987,9 +1089,15 @@ async function startLogin() {
 				// `claude auth login` doesn't normally print this (login_pty.py keeps the pattern
 				// as a harmless fallback) — intentionally not acted on: see the note at LEGACY_TOKEN_FILE.
 				log('[login-pty] unexpected TOKEN line from auth login, ignoring');
+			} else if (line.startsWith('STATUS ')) {
+				broadcast({ type: 'login_status', text: line.slice(7), kind: 'cli' });
 			} else if (line.startsWith('DONE ')) {
+				gotDone = true;
 				const ok = line.slice(5).startsWith('ok');
-				finish(ok, ok ? '' : line.slice(5).replace(/^fail\s*/, ''));
+				const message = ok ? '' : line.slice(5).replace(/^fail\s*/, '');
+				// A run that stalled after the tokens were already saved still logged in.
+				if (ok) finish(true, '');
+				else isLoggedIn().then((li) => finish(li, li ? '' : message), () => finish(false, message));
 			}
 		}
 	});
@@ -998,7 +1106,7 @@ async function startLogin() {
 	// 'close', not 'exit': stdout may still hold the DONE line when the process itself has exited.
 	child.on('close', (c, s) => {
 		log('[login-exit]', c, s);
-		finish(false, `登录进程意外退出（${s || c}）`);
+		if (!gotDone) finish(false, `登录进程意外退出（${s || c}）`);
 	});
 }
 // Replacing or cancelling a login on purpose must not surface as "login failed" in the UI.
@@ -1550,13 +1658,19 @@ const server = createServer(async (req, res) => {
 		}
 
 		// ---- Network proxy ----
+		if (path === '/api/netcheck' && req.method === 'GET') {
+			const proxy = readProxySetting();
+			const c = await checkAnthropic(proxy || null);
+			return json(res, { ok: c.ok, proxy, summary: c.summary, localProxy: c.ok ? null : await findLocalProxy(proxy) });
+		}
 		if (path === '/api/proxy' && req.method === 'GET') return json(res, { ok: true, proxy: readProxySetting() });
 		if (path === '/api/proxy' && req.method === 'POST') {
 			const proxy = String((await body(req)).proxy || '').trim();
 			if (!validProxy(proxy)) return json(res, { ok: false, error: '格式应为 http://主机:端口，例如 http://127.0.0.1:7890' }, 400);
 			await saveProxySetting(proxy);
 			log('[proxy]', proxy || '(none)');
-			return json(res, { ok: true, proxy });
+			const check = await checkAnthropic(proxy || null);
+			return json(res, { ok: true, proxy, reachable: check.ok, summary: check.summary });
 		}
 
 		// ---- Account (everything `claude auth status` knows) ----

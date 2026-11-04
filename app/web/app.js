@@ -1093,7 +1093,8 @@ function connect() {
 				if (mine) { endAssistant(); setRunning(false); sysline('错误：' + m.message); } else renderSidebar();
 				break;
 			case 'login_url': loginUrl(m.url); break;
-			case 'login_need_code': $('#login-msg').textContent = ''; break;
+			case 'login_need_code': break;
+			case 'login_status': loginStatus(m); break;
 			case 'login_done': loginDone(m.ok, m.message); break;
 		}
 	};
@@ -1458,6 +1459,61 @@ function loginWaiting(on) {
 	$('#login-start').classList.toggle('hidden', on);
 	$('#login-wait').classList.toggle('hidden', !on);
 }
+// While the code is being verified: seconds so far and what claude last printed, so a slow
+// exchange visibly moves instead of looking frozen. A way out appears after 20 s.
+let verifyTimer = null;
+let verifyStart = 0;
+let verifyLine = '';
+function verifyText() {
+	const secs = Math.round((Date.now() - verifyStart) / 1000);
+	let t = `正在验证授权码…（${secs} 秒）`;
+	if (verifyLine) t += `\nclaude：${verifyLine}`;
+	if (secs >= 20) t += '\n超过半分钟还没结果，多半是手机里的 Linux 环境连不上 Claude。可以点「取消」，在下方「网络代理」填好端口后重新登录。';
+	return t;
+}
+function startVerify() {
+	stopVerify();
+	verifyStart = Date.now();
+	verifyLine = '';
+	setLoginMsg('wait', verifyText());
+	verifyTimer = setInterval(() => {
+		setLoginMsg('wait', verifyText());
+		if (Date.now() - verifyStart >= 20000) $('#login-cancel').classList.remove('hidden');
+	}, 1000);
+}
+function stopVerify() {
+	if (verifyTimer) clearInterval(verifyTimer);
+	verifyTimer = null;
+	$('#login-cancel').classList.add('hidden');
+}
+function backToStart(label) {
+	stopVerify();
+	loginWaiting(false);
+	$('#login-submit').disabled = false;
+	$('#login-step2').classList.add('hidden');
+	$('#login-step1').classList.remove('hidden');
+	$('#login-start').textContent = label || '重新开始登录';
+}
+$('#login-cancel').onclick = () => {
+	api('/api/login/cancel');
+	backToStart();
+	setLoginMsg('', '');
+	$('#login-net').open = true;
+};
+function loginStatus(m) {
+	if (m.proxy) {
+		$('#login-proxy').value = m.proxy;
+		$('#entry-proxy-sub').textContent = m.proxy;
+	}
+	if (m.kind === 'cli') {
+		if (!verifyTimer) return;
+		verifyLine = m.text;
+		setLoginMsg('wait', verifyText());
+		return;
+	}
+	if (m.kind === 'warn') $('#login-net').open = true;
+	setLoginMsg(m.kind === 'warn' ? 'err' : m.kind === 'ok' ? 'ok' : 'wait', m.text);
+}
 $('#login-start').onclick = () => {
 	setLoginMsg('', '');
 	loginWaiting(true);
@@ -1470,7 +1526,8 @@ function loginUrl(url) {
 	const a = $('#login-url'); a.href = url; a.dataset.url = url;
 	$('#login-code').value = '';
 	$('#login-submit').disabled = false;
-	setLoginMsg('', '');
+	// Keep what the network check concluded (proxy switched / unreachable); drop "checking…".
+	if ($('#login-msg').classList.contains('wait')) setLoginMsg('', '');
 }
 $('#login-copy').onclick = () => {
 	const url = $('#login-url').dataset.url || '';
@@ -1482,26 +1539,22 @@ $('#login-submit').onclick = async () => {
 	const code = $('#login-code').value.trim();
 	if (!code) { setLoginMsg('err', '先把授权码粘贴到上面的输入框'); $('#login-code').focus(); return; }
 	$('#login-submit').disabled = true;
-	setLoginMsg('wait', '正在验证授权码…');
+	startVerify();
 	const r = await api('/api/login/code', { code });
 	if (!r.ok) {
-		$('#login-submit').disabled = false;
+		backToStart();
 		setLoginMsg('err', r.error || '登录会话已超时，请重新开始登录');
-		$('#login-step2').classList.add('hidden');
-		$('#login-step1').classList.remove('hidden');
-		$('#login-start').textContent = '重新开始登录';
 	}
 };
 function loginDone(ok, message) {
+	stopVerify();
 	loginWaiting(false);
 	$('#login-submit').disabled = false;
 	if (ok) { setLoginMsg('ok', '登录成功'); setTimeout(hideLogin, 800); return; }
+	backToStart();
 	setLoginMsg('err', '登录失败：' + (message || '请重试'));
-	$('#login-step2').classList.add('hidden');
-	$('#login-step1').classList.remove('hidden');
-	$('#login-start').textContent = '重新开始登录';
 	// Can't reach Anthropic from here: point at the proxy setting right away.
-	if (/连接|网络|代理|ETIMEDOUT|ECONN|ENOTFOUND|fetch failed/i.test(message || '')) $('#login-net').open = true;
+	if (/连接|连不上|网络|代理|回应|ETIMEDOUT|ECONN|ENOTFOUND|fetch failed/i.test(message || '')) $('#login-net').open = true;
 }
 
 /* ---------------- network proxy ---------------- */
@@ -1519,9 +1572,12 @@ async function saveProxy(value) {
 	return r;
 }
 $('#login-proxy-save').onclick = async () => {
+	setLoginMsg('wait', '正在保存并测试能否连上 Claude…');
 	const r = await saveProxy($('#login-proxy').value);
-	if (r.ok) setLoginMsg('ok', r.proxy ? `已保存代理 ${r.proxy}，登录和对话都会经过它` : '已改为直连');
-	else setLoginMsg('err', r.error || '保存失败');
+	if (!r.ok) return setLoginMsg('err', r.error || '保存失败');
+	const where = r.proxy ? `代理 ${r.proxy}` : '直连';
+	if (r.reachable) setLoginMsg('ok', `已保存。${where}可以连上 Claude，现在可以登录了。`);
+	else setLoginMsg('err', `已保存，但${where}连不上 Claude（${r.summary}）。请检查端口是否正确、代理软件是否在运行。`);
 };
 $('#entry-proxy').onclick = async () => {
 	const cur = await loadProxy();
@@ -1534,6 +1590,7 @@ $('#entry-proxy').onclick = async () => {
 		onConfirm: async (v) => {
 			const r = await saveProxy(v);
 			if (!r.ok) showModal({ title: '没有保存', msg: esc(r.error || '格式不对'), confirmText: '知道了' });
+			else if (!r.reachable) showModal({ title: '已保存，但连不上 Claude', msg: esc(`${r.proxy ? '代理 ' + r.proxy : '直连'}：${r.summary}`), confirmText: '知道了' });
 		},
 	});
 };
