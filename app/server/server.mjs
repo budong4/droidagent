@@ -1070,6 +1070,7 @@ async function startLogin() {
 	let buf = '';
 	let done = false;
 	let gotDone = false;
+	let loginMode = 'manual'; // 'auto': the link sends the browser straight back to claude on localhost
 	const finish = (ok, message) => {
 		if (done || child.cancelled) return;
 		done = true;
@@ -1083,7 +1084,8 @@ async function startLogin() {
 		while ((i = buf.indexOf('\n')) >= 0) {
 			const line = buf.slice(0, i); buf = buf.slice(i + 1);
 			log('[login-pty]', line.startsWith('URL ') ? line.slice(0, 50) + '...' : line);
-			if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim() });
+			if (line.startsWith('MODE ')) loginMode = line.slice(5).trim();
+			else if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim(), mode: loginMode });
 			else if (line === 'NEED_CODE') broadcast({ type: 'login_need_code' });
 			else if (line.startsWith('TOKEN ')) {
 				// `claude auth login` doesn't normally print this (login_pty.py keeps the pattern

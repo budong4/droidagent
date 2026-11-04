@@ -116,6 +116,8 @@ debian retools                               装逆向分析工具链
 
 ### 登录失败怎么办
 
+- 登录用的是「自动回调」：授权后浏览器会跳到 `http://localhost:端口/callback`，也就是手机上 `claude` 自己开的本地服务（Linux 环境和安卓共用网络），登录自动完成，不用复制授权码。浏览器停在打不开的 localhost 页面时，把地址栏里的网址粘贴回 App 即可。Node 版 Claude Code 2.1.112 的 `auth login` 本来就没有粘贴授权码的入口，旧做法在它上面会一直卡在「正在验证授权码」。
+
 - 登录失败时界面会显示 `claude` 实际报的错。完整输出在 chroot 里的 `~/.claude/agent-login.log`。
 - 新版 Claude Code 是用 Bun 编译的原生程序，在部分安卓内核上一启动就崩溃（`Bun has crashed`，信号 6）。后台启动时会逐个试：全局 `claude`、SDK 自带的 `claude`、以上两者关闭 JIT（`JavaScriptCoreUseJIT=0`），最后是跑在 Node.js 上的 Claude Code 2.1.112（最后一个纯 JavaScript 版本，随 APK 和更新包一起提供）。第一个能启动的同时用于登录和对话。日志 `/var/log/agent-app.log` 里的 `[runtime]` 行会写明试了哪些、用的是哪个。
 - 手机开着 VPN、浏览器能打开登录页，不代表 Linux 环境里的 `claude` 也能连上：很多 VPN（尤其是分应用代理模式）不转发 root 进程的流量，结果就是卡在「正在验证授权码」。现在每次登录前会先测试能否连上 `platform.claude.com` 和 `api.anthropic.com`；连不上时会自动查找本机代理端口（Clash 7890/7897、NekoBox 2080、v2rayNG 10809 等），找到能用的就自动保存。

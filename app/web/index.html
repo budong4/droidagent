@@ -12,7 +12,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=4">
+	<link rel="stylesheet" href="style.css?v=5">
 	<script>
 		// Theme before first paint (app.js keeps it in sync afterwards). Inside the app, the
 		// system's night mode comes from the host: WebView's prefers-color-scheme doesn't follow it.
@@ -535,7 +535,7 @@
 				<li>
 					<span class="num">1</span><span class="what">在浏览器里授权</span>
 					<div class="body">
-						<p class="hint">用你的 Claude 账号登录，然后点「Authorize」。</p>
+						<p class="hint" id="login-step1-hint">用你的 Claude 账号登录，然后点「Authorize」。</p>
 						<div class="login-actions">
 							<a id="login-url" class="login-url" target="_blank" rel="noopener">打开登录页</a>
 							<button class="ghost small" id="login-copy">复制链接</button>
@@ -543,9 +543,9 @@
 					</div>
 				</li>
 				<li>
-					<span class="num">2</span><span class="what">粘贴授权码</span>
+					<span class="num">2</span><span class="what" id="login-step2-title">粘贴授权码</span>
 					<div class="body">
-						<p class="hint">授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。</p>
+						<p class="hint" id="login-step2-hint">授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。</p>
 						<input id="login-code" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴授权码">
 						<button class="primary" id="login-submit">完成登录</button>
 						<button class="ghost small hidden" id="login-cancel">取消，重新开始</button>
@@ -566,6 +566,6 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=4"></script>
+	<script src="app.js?v=5"></script>
 </body>
 </html>

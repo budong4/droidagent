@@ -1092,7 +1092,7 @@ function connect() {
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) { endAssistant(); setRunning(false); sysline('错误：' + m.message); } else renderSidebar();
 				break;
-			case 'login_url': loginUrl(m.url); break;
+			case 'login_url': loginUrl(m.url, m.mode); break;
 			case 'login_need_code': break;
 			case 'login_status': loginStatus(m); break;
 			case 'login_done': loginDone(m.ok, m.message); break;
@@ -1506,9 +1506,8 @@ function loginStatus(m) {
 		$('#entry-proxy-sub').textContent = m.proxy;
 	}
 	if (m.kind === 'cli') {
-		if (!verifyTimer) return;
 		verifyLine = m.text;
-		setLoginMsg('wait', verifyText());
+		setLoginMsg('wait', verifyTimer ? verifyText() : `claude：${m.text}`);
 		return;
 	}
 	if (m.kind === 'warn') $('#login-net').open = true;
@@ -1519,15 +1518,41 @@ $('#login-start').onclick = () => {
 	loginWaiting(true);
 	api('/api/login/start');
 };
-function loginUrl(url) {
+// 'auto': after "Authorize" the browser is sent straight back to claude on this phone
+// (http://localhost:…/callback) and the login finishes by itself; pasting is only a fallback.
+const LOGIN_TEXT = {
+	auto: {
+		step1: '用你的 Claude 账号登录，然后点「Authorize」。授权后浏览器会跳回本机，登录自动完成，回到这里就行。',
+		title: '没有自动完成？',
+		step2: '如果浏览器最后停在一个打不开的 localhost 页面，复制它地址栏里的完整网址，粘贴到这里。',
+		placeholder: '粘贴 http://localhost:… 网址',
+		submit: '提交',
+		waiting: '等你在浏览器里点「Authorize」，授权后这里会自动完成。',
+	},
+	manual: {
+		step1: '用你的 Claude 账号登录，然后点「Authorize」。',
+		title: '粘贴授权码',
+		step2: '授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。',
+		placeholder: '粘贴授权码',
+		submit: '完成登录',
+		waiting: '',
+	},
+};
+function loginUrl(url, mode) {
+	const t = LOGIN_TEXT[mode] || LOGIN_TEXT.manual;
 	loginWaiting(false);
 	$('#login-step1').classList.add('hidden');
 	$('#login-step2').classList.remove('hidden');
 	const a = $('#login-url'); a.href = url; a.dataset.url = url;
+	$('#login-step1-hint').textContent = t.step1;
+	$('#login-step2-title').textContent = t.title;
+	$('#login-step2-hint').textContent = t.step2;
+	$('#login-code').placeholder = t.placeholder;
+	$('#login-submit').textContent = t.submit;
 	$('#login-code').value = '';
 	$('#login-submit').disabled = false;
-	// Keep what the network check concluded (proxy switched / unreachable); drop "checking…".
-	if ($('#login-msg').classList.contains('wait')) setLoginMsg('', '');
+	// Keep what the network check concluded (proxy switched / unreachable); replace "checking…".
+	if (!$('#login-msg').textContent || $('#login-msg').classList.contains('wait')) setLoginMsg(t.waiting ? 'wait' : '', t.waiting);
 }
 $('#login-copy').onclick = () => {
 	const url = $('#login-url').dataset.url || '';
@@ -1537,7 +1562,7 @@ $('#login-copy').onclick = () => {
 };
 $('#login-submit').onclick = async () => {
 	const code = $('#login-code').value.trim();
-	if (!code) { setLoginMsg('err', '先把授权码粘贴到上面的输入框'); $('#login-code').focus(); return; }
+	if (!code) { setLoginMsg('err', '先把授权码或网址粘贴到上面的输入框'); $('#login-code').focus(); return; }
 	$('#login-submit').disabled = true;
 	startVerify();
 	const r = await api('/api/login/code', { code });
