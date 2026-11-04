@@ -1,0 +1,61 @@
+#!/bin/bash
+# frida-server - control the device-side frida-server daemon (installed by `debian retools`).
+#
+#   frida-server start      launch it (root, detached) if not already running
+#   frida-server stop       kill it
+#   frida-server status     print its pid, or nothing if not running
+#   frida-server --version  print the binary's version
+#
+# It runs via `ashell` (Android's real process/mount namespace), not inside the chroot, because
+# it has to see and attach to real app processes. The chroot shares Android's network namespace,
+# so once it's listening on 127.0.0.1:27042, frida-tools run from Debian can reach it over
+# localhost with no extra setup — but address it with `-H 127.0.0.1:27042` (a TCP host target),
+# not `-U` (that means "a device reached over USB/adb", which doesn't apply here: frida-tools
+# and frida-server are both already running on this same phone).
+set -euo pipefail
+
+BIN=/data/local/tmp/frida-server
+LOG=/data/local/tmp/frida-server.log
+
+die() { echo "frida-server: $*" >&2; exit 1; }
+
+# `pidof` exits 1 when nothing matches, and with pipefail that would make `p=$(pid)` itself fail
+# and (under set -e) silently kill this whole script before it can print anything — hence `|| true`.
+pid() { ashell -c 'pidof frida-server' 2>/dev/null | tr -d '\r' | awk '{print $1}' || true; }
+
+case "${1:-status}" in
+start)
+	[ -n "$(pid)" ] && { echo "already running (pid $(pid))"; exit 0; }
+	ashell test -x "$BIN" || die "not installed at $BIN (run: debian retools)"
+	# setsid already detaches this into its own session (immune to us exiting); `disown` is a
+	# bash builtin the Android shell doesn't have, and isn't needed on top of setsid.
+	ashell -c "nohup setsid '$BIN' >'$LOG' 2>&1 & sleep 1; pidof frida-server" | tail -1
+	p=$(pid)
+	[ -n "$p" ] || { ashell cat "$LOG" 2>/dev/null | tail -5; die "failed to start, see $LOG"; }
+	echo "started (pid $p)"
+	;;
+stop)
+	p=$(pid)
+	[ -z "$p" ] && { echo "not running"; exit 0; }
+	ashell -c "kill $p" || true
+	# Wait briefly for it to actually exit before reporting, instead of trusting kill's return
+	# (which just means the signal was sent) — a `status` run moments later should agree with this.
+	for _ in 1 2 3 4 5; do [ -z "$(pid)" ] && break; sleep 0.3; done
+	if [ -n "$(pid)" ]; then
+		ashell -c "kill -9 $p" || true
+		sleep 0.3
+	fi
+	[ -z "$(pid)" ] && echo "stopped (was pid $p)" || echo "stop requested (pid $p), but it may still be exiting — check status again shortly"
+	;;
+status)
+	p=$(pid)
+	[ -n "$p" ] && echo "running (pid $p)" || echo "stopped"
+	;;
+--version | -v)
+	ashell test -x "$BIN" || die "not installed at $BIN (run: debian retools)"
+	ashell "$BIN" --version
+	;;
+*)
+	die "usage: frida-server start|stop|status|--version"
+	;;
+esac

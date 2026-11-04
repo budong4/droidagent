@@ -1,0 +1,34 @@
+#!/bin/bash
+# ashell - run commands in the real Android environment from inside the chroot.
+# Enters init's mount namespace (escaping the chroot) as root, u:r:ksu:s0, with Android's env.
+#
+#   ashell                      interactive Android shell
+#   ashell -c 'cmd | grep x'    run a shell string with Android's /system/bin/sh
+#   ashell prog args...         exec a program directly (no shell parsing; safest for data)
+set -euo pipefail
+
+ANDROID_PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:/data/adb/ksu/bin
+
+envs=()
+if [ -r /etc/android.env ]; then
+	mapfile -t envs < <(grep -E '^[A-Z_][A-Z0-9_]*=' /etc/android.env || true)
+fi
+
+# Keep the working directory when it is a path Android also has. Android's shell does the cd:
+# nsenter --wd would open the directory through the chroot and report chroot-prefixed paths.
+wd=/
+case $PWD in
+/data | /data/* | /storage/* | /sdcard | /sdcard/* | /system* | /vendor* | /product* | /apex*) wd=$PWD ;;
+esac
+
+run=(nsenter -t 1 -m -- /system/bin/env -i PATH="$ANDROID_PATH" HOME=/ TMPDIR=/data/local/tmp TERM="${TERM:-dumb}" "${envs[@]}")
+
+if [ $# -eq 0 ]; then
+	exec "${run[@]}" /system/bin/sh -c 'cd "$0" 2>/dev/null; exec /system/bin/sh -i' "$wd"
+elif [ "$1" = -c ]; then
+	[ $# -ge 2 ] || { echo "usage: ashell -c 'command'" >&2; exit 2; }
+	q=${wd//\'/\'\\\'\'}
+	exec "${run[@]}" /system/bin/sh -c "cd '$q' 2>/dev/null; $2" ashell "${@:3}"
+else
+	exec "${run[@]}" /system/bin/sh -c 'cd "$0" 2>/dev/null; exec "$@"' "$wd" "$@"
+fi

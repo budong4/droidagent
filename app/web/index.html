@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+	<meta name="theme-color" content="#0f1115">
+	<meta name="mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+	<title>DroidAgent</title>
+	<link rel="manifest" href="manifest.webmanifest">
+	<link rel="icon" href="icon.svg" type="image/svg+xml">
+	<link rel="apple-touch-icon" href="icon-192.png">
+	<link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+	<div id="app">
+		<!-- Header with Title & Status -->
+		<header id="bar">
+			<button id="btn-sidebar" class="icon-btn" title="历史对话" aria-label="历史对话">
+				<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+			</button>
+
+			<div class="header-center">
+				<span id="chat-title" class="chat-title">新对话</span>
+				<span id="status" class="status"><i class="dot"></i><span id="status-text">连接中…</span></span>
+			</div>
+
+			<div class="header-actions">
+				<button id="btn-new" class="icon-btn" title="新建对话" aria-label="新建对话">
+					<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+				</button>
+				<button id="btn-account" class="avatar-btn" title="账号" aria-label="账号"><span id="avatar-initial">·</span></button>
+				<button id="btn-settings" class="icon-btn" title="设置" aria-label="设置">
+					<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+				</button>
+			</div>
+		</header>
+
+		<!-- Main chat thread -->
+		<main id="thread" aria-live="polite"></main>
+
+		<!-- Composer Input Card with Scope Badges, Add Button & Model Pill -->
+		<div id="composer">
+			<div id="perm-anchor"></div>
+
+			<!-- Slash-command autocomplete (shown while the input starts with "/") -->
+			<div id="slash-menu" class="slash-menu hidden"></div>
+
+			<!-- Selected Scope Badges (Apps, Folders, Files, Paths, Images) -->
+			<div id="scope-container" class="scope-container hidden"></div>
+
+			<div class="composer-card">
+				<textarea id="input" rows="1" placeholder="给手机助手发消息… 输入 / 查看命令" enterkeyhint="send"></textarea>
+				
+				<div class="composer-toolbar">
+					<div class="toolbar-left">
+						<!-- Plus Attach / Scope Button -->
+						<button id="btn-attach" class="attach-btn" title="添加范围或附件" aria-label="添加范围或附件">
+							<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+						</button>
+
+						<!-- Model Pill directly next to the plus button -->
+						<button id="btn-model-pill" class="model-pill" aria-label="选择模型与努力程度">
+							<svg class="model-pill-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/></svg>
+							<span id="model-name-label">Sonnet 5.5</span>
+							<span class="pill-dot">·</span>
+							<span id="effort-label">超高</span>
+							<svg class="pill-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+						</button>
+					</div>
+
+					<div class="toolbar-right">
+						<button id="btn-send" class="send" aria-label="发送">
+							<svg viewBox="0 0 24 24"><path d="M7 11l5-5 5 5M12 6v13"/></svg>
+						</button>
+						<button id="btn-stop" class="send stop hidden" aria-label="停止">
+							<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+						</button>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- Hidden image file picker -->
+	<input type="file" id="file-picker-image" accept="image/*" class="hidden">
+
+	<!-- Attachment / Scope Popover Menu (Triggered by [+]) -->
+	<div id="attach-backdrop" class="backdrop-transparent hidden"></div>
+	<div id="attach-menu" class="attach-menu hidden" aria-label="添加操作范围或附件">
+		<div class="attach-item" id="opt-image">
+			<div class="attach-ic img-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="14" rx="2.5"/><circle cx="12" cy="13" r="3.5"/><path d="M8 6l1.5-2h5L16 6"/></svg></div>
+			<div class="attach-info">
+				<span class="attach-title">图片与截图</span>
+				<span class="attach-desc">选取手机相册图片或截取当前屏幕</span>
+			</div>
+		</div>
+		<div class="attach-item" id="opt-app">
+			<div class="attach-ic app-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 18.5h3"/></svg></div>
+			<div class="attach-info">
+				<span class="attach-title">手机应用</span>
+				<span class="attach-desc">指定操作或分析某款已安装应用</span>
+			</div>
+		</div>
+		<div class="attach-item" id="opt-folder">
+			<div class="attach-ic folder-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 012-2h4l2 2.5h8a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg></div>
+			<div class="attach-info">
+				<span class="attach-title">文件夹</span>
+				<span class="attach-desc">限定扫描或操作的目标目录</span>
+			</div>
+		</div>
+		<div class="attach-item" id="opt-file">
+			<div class="attach-ic file-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5"/></svg></div>
+			<div class="attach-info">
+				<span class="attach-title">选择文件</span>
+				<span class="attach-desc">选取手机或Debian中的具体文件</span>
+			</div>
+		</div>
+		<div class="attach-item" id="opt-path">
+			<div class="attach-ic path-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.2"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/></svg></div>
+			<div class="attach-info">
+				<span class="attach-title">输入路径</span>
+				<span class="attach-desc">直接输入自定义设备绝对路径</span>
+			</div>
+		</div>
+	</div>
+
+	<!-- Image Choice Sub-Menu (Album vs Screenshot) -->
+	<div id="image-choice-menu" class="attach-sub-menu hidden">
+		<button id="btn-pick-album" class="image-sub-btn">🖼 从相册中选取</button>
+		<button id="btn-take-shot" class="image-sub-btn">截取当前手机屏幕</button>
+	</div>
+
+	<!-- App Selector Sheet -->
+	<div id="sheet-apps-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-apps" class="sheet sheet-modal hidden" aria-label="选择手机应用">
+		<div class="sheet-grip"></div>
+		<div class="modal-header">
+			<h3>选择手机应用</h3>
+			<button id="btn-close-apps" class="icon-btn-small">✕</button>
+		</div>
+		<div class="search-box">
+			<svg class="search-ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+			<input id="input-search-app" type="search" placeholder="搜索应用名称或包名…">
+		</div>
+		<div id="apps-list" class="sheet-scroll-list"></div>
+	</section>
+
+	<!-- File/Folder Browser Sheet -->
+	<div id="sheet-fs-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-fs" class="sheet sheet-modal hidden" aria-label="文件与目录浏览">
+		<div class="sheet-grip"></div>
+		<div class="modal-header">
+			<h3 id="fs-title">选择目录或文件</h3>
+			<button id="btn-close-fs" class="icon-btn-small">✕</button>
+		</div>
+
+		<div class="search-box">
+			<svg class="search-ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+			<input id="fs-search" type="search" placeholder="在当前目录内搜索文件名…" enterkeyhint="search">
+			<button id="fs-search-clear" class="search-clear hidden" aria-label="清除搜索">×</button>
+		</div>
+
+		<!-- Quick preset paths -->
+		<div class="fs-presets">
+			<button data-path="/sdcard" class="fs-preset-pill">🏠 内部存储</button>
+			<button data-path="/sdcard/Download" class="fs-preset-pill">📥 下载</button>
+			<button data-path="/sdcard/DCIM" class="fs-preset-pill">🖼 相册</button>
+			<button data-path="/data/local" class="fs-preset-pill">本地数据</button>
+			<button data-path="/root" class="fs-preset-pill">🐧 Debian环境</button>
+		</div>
+
+		<!-- Current path navigation -->
+		<div class="fs-nav-bar">
+			<button id="fs-btn-up" class="fs-nav-btn" title="上一级">
+				<svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+			</button>
+			<span id="fs-current-path" class="fs-path-text">/sdcard</span>
+		</div>
+
+		<div id="fs-list" class="sheet-scroll-list"></div>
+
+		<!-- Bottom bar: select current directory -->
+		<div id="fs-footer" class="fs-footer">
+			<button id="fs-btn-select-dir" class="primary">选择当前目录</button>
+		</div>
+	</section>
+
+	<!-- History Sidebar Drawer -->
+	<div id="sidebar-backdrop" class="backdrop hidden"></div>
+	<aside id="sidebar" class="sidebar hidden" aria-label="历史对话侧边栏">
+		<div class="sidebar-header">
+			<div class="sidebar-brand">
+				<div class="logo-mini"></div>
+				<span class="brand-title">历史对话</span>
+			</div>
+			<button id="btn-sidebar-close" class="icon-btn" aria-label="关闭侧边栏">
+				<svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+			</button>
+		</div>
+
+		<div class="sidebar-actions">
+			<button id="sidebar-new-btn" class="sidebar-new-btn">
+				<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+				<span>新建对话</span>
+			</button>
+		</div>
+
+		<div class="sidebar-search">
+			<svg class="search-ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+			<input id="search-input" type="search" placeholder="搜索历史对话…" autocomplete="off">
+			<button id="search-clear" class="search-clear hidden" aria-label="清除搜索">×</button>
+		</div>
+
+		<div class="sidebar-list-wrap">
+			<div id="pinned-group" class="session-group hidden">
+				<div class="group-title">
+					<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M16 4a1 1 0 0 1 1 1v3.2a1 1 0 0 0 .29.7l2.42 2.43a1 1 0 0 1 .29.71V13a1 1 0 0 1-1 1h-5v7a1 1 0 0 1-2 0v-7H7a1 1 0 0 1-1-1v-.96a1 1 0 0 1 .29-.7l2.42-2.43a1 1 0 0 0 .29-.71V5a1 1 0 0 1 1-1h6z"/></svg>
+					<span>置顶对话</span>
+				</div>
+				<div id="pinned-list" class="session-list"></div>
+			</div>
+
+			<div id="recent-group" class="session-group">
+				<div class="group-title">
+					<span>最近对话</span>
+				</div>
+				<div id="recent-list" class="session-list"></div>
+			</div>
+
+			<div id="empty-search" class="empty-state hidden">没有找到相关的对话</div>
+		</div>
+
+		<div class="sidebar-footer">
+			<span id="session-count" class="session-count">0 个对话</span>
+			<button id="btn-clear-all" class="clear-all-btn">清空全部</button>
+		</div>
+	</aside>
+
+	<!-- Model & Effort Popover Menu -->
+	<div id="model-backdrop" class="backdrop-transparent hidden"></div>
+	<div id="model-popover" class="model-popover hidden" aria-label="模型与努力程度选择">
+		<!-- Main Menu View -->
+		<div id="menu-view-main" class="popover-view">
+			<div class="menu-list">
+				<div class="menu-item" data-model="opus" data-name="Opus 5.5">
+					<span class="item-name">Opus 5.5</span>
+					<span class="item-shortcut">1</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="sonnet" data-name="Sonnet 5.5">
+					<span class="item-name">Sonnet 5.5</span>
+					<span class="item-shortcut">2</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="fable" data-name="Fable 5.1">
+					<span class="item-name">Fable 5.1</span>
+					<span class="item-tag">ⓘ 需要使用额度</span>
+					<span class="item-shortcut">3</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="haiku" data-name="Haiku 5.5">
+					<span class="item-name">Haiku 5.5</span>
+					<span class="item-shortcut">4</span>
+					<span class="item-check">✓</span>
+				</div>
+			</div>
+
+			<div class="menu-divider"></div>
+
+			<div class="menu-list">
+				<div class="menu-item nav-item" id="btn-open-effort">
+					<span class="item-name">努力程度</span>
+					<div class="item-right">
+						<span id="popover-effort-val" class="sub-val">超高</span>
+						<svg class="chev-right" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
+					</div>
+				</div>
+				<div class="menu-item nav-item" id="btn-open-more">
+					<span class="item-name">更多模型</span>
+					<div class="item-right">
+						<svg class="chev-right" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
+					</div>
+				</div>
+			</div>
+
+			<div class="menu-divider"></div>
+
+			<div class="menu-section fast-mode-section">
+				<div class="fast-mode-title">快速模式</div>
+				<div class="fast-mode-row">
+					<span>启用快速模式</span>
+					<label class="sw">
+						<input type="checkbox" id="t-fastmode">
+						<i></i>
+					</label>
+				</div>
+			</div>
+		</div>
+
+		<!-- Effort Submenu View -->
+		<div id="menu-view-effort" class="popover-view hidden">
+			<div class="submenu-header">
+				<button id="btn-back-effort" class="submenu-back-btn">
+					<svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+					<span>努力程度</span>
+				</button>
+			</div>
+			<div class="menu-list">
+				<div class="menu-item effort-item" data-effort="low" data-label="低">
+					<span class="item-name">低</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item effort-item" data-effort="medium" data-label="中">
+					<span class="item-name">中</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item effort-item" data-effort="high" data-label="高">
+					<span class="item-name">高</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item effort-item" data-effort="xhigh" data-label="超高">
+					<span class="item-name">超高</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item effort-item" data-effort="max" data-label="最大">
+					<span class="item-name">最大</span>
+					<span class="item-check">✓</span>
+				</div>
+			</div>
+		</div>
+
+		<!-- More Models Submenu View -->
+		<div id="menu-view-more" class="popover-view hidden">
+			<div class="submenu-header">
+				<button id="btn-back-more" class="submenu-back-btn">
+					<svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+					<span>更多模型</span>
+				</button>
+			</div>
+			<div class="menu-list">
+				<div class="menu-item" data-model="haiku-4.5" data-name="Haiku 4.5">
+					<span class="item-name">Haiku 4.5</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="sonnet-5" data-name="Sonnet 5">
+					<span class="item-name">Sonnet 5</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="opus-5" data-name="Opus 5">
+					<span class="item-name">Opus 5</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="fable-5" data-name="Fable 5">
+					<span class="item-name">Fable 5</span>
+					<span class="item-tag">ⓘ 需要使用额度</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="opus-4.8" data-name="Opus 4.8">
+					<span class="item-name">Opus 4.8</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="opus-4.7" data-name="Opus 4.7">
+					<span class="item-name">Opus 4.7</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="opus-4.6" data-name="Opus 4.6">
+					<span class="item-name">Opus 4.6</span>
+					<span class="item-check">✓</span>
+				</div>
+				<div class="menu-item" data-model="sonnet-4.6" data-name="Sonnet 4.6">
+					<span class="item-name">Sonnet 4.6</span>
+					<span class="item-check">✓</span>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- General Settings Sheet -->
+	<div id="sheet-backdrop" class="backdrop hidden"></div>
+	<section id="sheet" class="sheet hidden" aria-label="设置">
+		<div class="sheet-grip"></div>
+		<h2>设置</h2>
+
+		<div class="field">
+			<label>执行模式</label>
+			<div class="seg col" id="seg-mode">
+				<button data-v="ask">每步问我确认<small>最安全</small></button>
+				<button data-v="autoEdit">改文件自动 · 危险才问<small>推荐</small></button>
+				<button data-v="auto">全自动<small>什么都不问</small></button>
+				<button data-v="plan">只做计划<small>不执行</small></button>
+			</div>
+		</div>
+
+		<div class="field toggles">
+			<div class="toggle"><span>只读模式<small>禁止写入和执行</small></span><label class="sw"><input type="checkbox" id="t-readonly"><i></i></label></div>
+			<div class="toggle"><span>屏幕自动化<small>允许点按、滑动、输入</small></span><label class="sw"><input type="checkbox" id="t-screen"><i></i></label></div>
+			<div class="toggle"><span>联网搜索<small>允许搜索和抓取网页</small></span><label class="sw"><input type="checkbox" id="t-web"><i></i></label></div>
+			<div class="toggle"><span>个人数据<small>读联系人/短信/通话/相册等（用时仍确认）</small></span><label class="sw"><input type="checkbox" id="t-personal"><i></i></label></div>
+			<div class="toggle"><span>显示思考过程<small>展示模型的推理</small></span><label class="sw"><input type="checkbox" id="t-thinking"><i></i></label></div>
+			<div class="toggle hidden" id="row-overlay"><span>悬浮窗<small>任务跑到别的应用时自动浮出来，回到对话自动收起</small></span><label class="sw"><input type="checkbox" id="t-overlay"><i></i></label></div>
+		</div>
+
+		<div class="field">
+			<label>外观</label>
+			<div class="seg" id="theme-seg">
+				<button data-v="auto" class="sel">跟随系统</button>
+				<button data-v="light">浅色</button>
+				<button data-v="dark">深色</button>
+			</div>
+		</div>
+
+		<div class="field">
+			<label>高级</label>
+			<div class="entry-list">
+				<button class="entry-row" id="entry-account"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.2-3.5 4-5.2 7-5.2s5.8 1.7 7 5.2"/></svg><span class="entry-txt">账号<small>登录身份、订阅信息</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+				<button class="entry-row" id="entry-usage"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span class="entry-txt">用量与额度<small>5 小时 / 每周窗口</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+				<button class="entry-row" id="entry-sysprompt"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L18 10a2.8 2.8 0 10-4-4L4 16v4z"/><path d="M13 7l4 4"/></svg><span class="entry-txt">系统提示词<small>给助手的额外规则（AgentMD）</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+				<button class="entry-row" id="entry-skills"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 14l9 5 9-5"/></svg><span class="entry-txt">Skills<small>安装、启用技能</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+				<button class="entry-row" id="entry-mcp"><svg class="entry-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v6M15 3v6"/><path d="M7 9h10v3a5 5 0 01-5 5 5 5 0 01-5-5V9z"/><path d="M12 17v4"/></svg><span class="entry-txt">MCP 服务器<small>连接外部工具</small></span><svg class="entry-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+			</div>
+		</div>
+
+		<button class="sheet-close" id="sheet-close">完成</button>
+	</section>
+
+	<!-- Account Sheet -->
+	<div id="sheet-account-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-account" class="sheet sheet-modal hidden" aria-label="账号">
+		<div class="sheet-grip"></div>
+		<div class="modal-header"><h3>账号</h3><button id="btn-close-account" class="icon-btn-small">✕</button></div>
+		<div id="account-body" class="account-body"><div class="empty-state">正在读取…</div></div>
+	</section>
+
+	<!-- Usage / Quota Sheet -->
+	<div id="sheet-usage-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-usage" class="sheet sheet-modal hidden" aria-label="用量与额度">
+		<div class="sheet-grip"></div>
+		<div class="modal-header"><h3>用量与额度</h3><button id="btn-close-usage" class="icon-btn-small">✕</button></div>
+		<div id="usage-body" class="usage-body"><div class="empty-state">正在读取…</div></div>
+		<button class="ghost small" id="usage-refresh">刷新</button>
+	</section>
+
+	<!-- System Prompt Editor Sheet -->
+	<div id="sheet-sysprompt-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-sysprompt" class="sheet sheet-modal hidden" aria-label="系统提示词">
+		<div class="sheet-grip"></div>
+		<div class="modal-header"><h3>系统提示词</h3><button id="btn-close-sysprompt" class="icon-btn-small">✕</button></div>
+		<p class="muted sheet-hint">这里写的内容会作为额外规则加到助手的系统提示词里，对所有新对话生效。</p>
+		<textarea id="sysprompt-text" class="big-textarea" placeholder="例如：始终用简体中文回答；分析 APK 时先列出权限和组件……"></textarea>
+		<div class="sheet-actions"><button class="ghost" id="sysprompt-cancel">取消</button><button class="primary" id="sysprompt-save">保存</button></div>
+	</section>
+
+	<!-- Skills Manager Sheet -->
+	<div id="sheet-skills-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-skills" class="sheet sheet-modal hidden" aria-label="Skills 管理">
+		<div class="sheet-grip"></div>
+		<div class="modal-header"><h3>Skills</h3><button id="btn-close-skills" class="icon-btn-small">✕</button></div>
+		<div class="add-row">
+			<input id="skill-src" type="text" placeholder="GitHub 仓库地址或本机 ZIP/目录路径" autocomplete="off">
+			<button class="primary small" id="skill-install">安装</button>
+		</div>
+		<p id="skill-msg" class="sheet-msg"></p>
+		<div id="skills-list" class="sheet-scroll-list"></div>
+	</section>
+
+	<!-- MCP Manager Sheet -->
+	<div id="sheet-mcp-backdrop" class="backdrop hidden"></div>
+	<section id="sheet-mcp" class="sheet sheet-modal hidden" aria-label="MCP 服务器">
+		<div class="sheet-grip"></div>
+		<div class="modal-header"><h3>MCP 服务器</h3><button id="btn-close-mcp" class="icon-btn-small">✕</button></div>
+		<div id="mcp-list" class="sheet-scroll-list"></div>
+		<div class="mcp-add-form">
+			<div class="mcp-form-title">添加服务器</div>
+			<input id="mcp-name" type="text" placeholder="名称（字母数字 . _ -）" autocomplete="off">
+			<div class="seg" id="mcp-type-seg">
+				<button data-v="http" class="sel">HTTP</button>
+				<button data-v="sse">SSE</button>
+				<button data-v="stdio">本地命令</button>
+			</div>
+			<input id="mcp-url" type="text" placeholder="URL（https://…）" autocomplete="off">
+			<input id="mcp-bearer" type="text" placeholder="Bearer Token（可选）" autocomplete="off">
+			<input id="mcp-command" type="text" placeholder="命令，如 npx" autocomplete="off" class="hidden">
+			<input id="mcp-args" type="text" placeholder="参数，空格分隔，如 -y @playwright/mcp" autocomplete="off" class="hidden">
+			<p id="mcp-msg" class="sheet-msg"></p>
+			<button class="primary" id="mcp-add">添加</button>
+		</div>
+	</section>
+
+	<!-- Interactive Modal for Rename, Custom Path & Confirmations -->
+	<div id="modal-backdrop" class="backdrop hidden"></div>
+	<div id="modal" class="modal-card hidden" role="dialog" aria-modal="true">
+		<h3 id="modal-title">操作</h3>
+		<p id="modal-msg" class="muted"></p>
+		<input id="modal-input" type="text" class="hidden" placeholder="输入内容">
+		<div id="modal-presets" class="modal-presets hidden">
+			<button data-v="/sdcard/">/sdcard/</button>
+			<button data-v="/sdcard/Download/">/sdcard/Download/</button>
+			<button data-v="/data/local/">/data/local/</button>
+			<button data-v="/data/data/">/data/data/</button>
+			<button data-v="/root/">/root/</button>
+		</div>
+		<div class="modal-buttons">
+			<button id="modal-btn-cancel" class="ghost">取消</button>
+			<button id="modal-btn-confirm" class="primary">确定</button>
+		</div>
+	</div>
+
+	<!-- Login Overlay -->
+	<div id="login" class="login hidden">
+		<div class="login-card">
+			<div class="logo"></div>
+			<h2>登录 Claude 账号</h2>
+			<p class="muted">用你的 Claude 订阅账号登录（Pro / Max）。不需要 API key。</p>
+			<div id="login-step1">
+				<button class="primary" id="login-start">开始登录</button>
+			</div>
+			<div id="login-step2" class="hidden">
+				<p class="muted">1. 打开下面的链接并登录授权：</p>
+				<a id="login-url" class="login-url" target="_blank" rel="noopener">打开登录页</a>
+				<button class="ghost small" id="login-copy">复制链接</button>
+				<p class="muted">2. 把页面给出的授权码粘贴到这里：</p>
+				<input id="login-code" type="text" inputmode="text" autocomplete="off" placeholder="粘贴授权码（或回调网址）">
+				<p class="muted" style="font-size:12px;margin:4px 0 10px;line-height:1.4;color:var(--faint);">提示：点击授权网页上的「Copy code」直接粘贴即可（包含 #），若复制了地址栏的回调网址也支持直接粘贴。</p>
+				<button class="primary" id="login-submit">完成登录</button>
+			</div>
+			<p id="login-msg" class="login-msg"></p>
+		</div>
+	</div>
+
+	<script src="app.js?v=2"></script>
+</body>
+</html>

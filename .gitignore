@@ -1,0 +1,30 @@
+# ---- large / generated artifacts (never commit) ----
+# The Debian rootfs snapshot is multi-GB and device-provisioned — build it, don't ship it.
+apk/assets/rootfs.tar.*
+rootfs/*.tar.*
+*.apk
+*.apk.idsig
+
+# APK build intermediates
+apk/build/
+apk/gen/
+# Debug signing key — each builder generates their own (build.py creates it if missing)
+apk/debug.keystore
+
+# Node
+node_modules/
+app/server/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Screenshots / scratch images
+apk/*.png
+apk/screenshot*.png
+apk/final.png
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp

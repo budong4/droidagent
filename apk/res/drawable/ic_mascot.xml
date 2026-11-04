@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bubble mascot: a small cat-eared companion. Kept bold and flat so it still
+     reads at 30dp inside the floating bubble. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+
+    <!-- ears -->
+    <path
+        android:fillColor="#C9A6F2"
+        android:pathData="M26,30 L19,9 L42,19 Z" />
+    <path
+        android:fillColor="#C9A6F2"
+        android:pathData="M74,30 L81,9 L58,19 Z" />
+    <path
+        android:fillColor="#F2B8D8"
+        android:pathData="M28,27 L24,15 L37,21 Z" />
+    <path
+        android:fillColor="#F2B8D8"
+        android:pathData="M72,27 L76,15 L63,21 Z" />
+
+    <!-- face -->
+    <path
+        android:fillColor="#B392E8"
+        android:pathData="M50,15 C73,15 90,30 90,53 C90,76 73,91 50,91 C27,91 10,76 10,53 C10,30 27,15 50,15 Z" />
+
+    <!-- soft highlight on the forehead -->
+    <path
+        android:fillColor="#C9ACF0"
+        android:pathData="M50,20 C66,20 78,28 82,40 C72,32 60,28 50,28 C40,28 28,32 18,40 C22,28 34,20 50,20 Z" />
+
+    <!-- eyes -->
+    <path
+        android:fillColor="#2B2140"
+        android:pathData="M36,40 C42,40 46,46 46,54 C46,62 42,67 36,67 C30,67 26,62 26,54 C26,46 30,40 36,40 Z" />
+    <path
+        android:fillColor="#2B2140"
+        android:pathData="M64,40 C70,40 74,46 74,54 C74,62 70,67 64,67 C58,67 54,62 54,54 C54,46 58,40 64,40 Z" />
+
+    <!-- eye highlights -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M33,46 C36,46 38,48 38,51 C38,54 36,56 33,56 C30,56 28,54 28,51 C28,48 30,46 33,46 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M61,46 C64,46 66,48 66,51 C66,54 64,56 61,56 C58,56 56,54 56,51 C56,48 58,46 61,46 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.75"
+        android:pathData="M39,60 C40.7,60 42,61.3 42,63 C42,64.7 40.7,66 39,66 C37.3,66 36,64.7 36,63 C36,61.3 37.3,60 39,60 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.75"
+        android:pathData="M67,60 C68.7,60 70,61.3 70,63 C70,64.7 68.7,66 67,66 C65.3,66 64,64.7 64,63 C64,61.3 65.3,60 67,60 Z" />
+
+    <!-- blush -->
+    <path
+        android:fillColor="#F58FB8"
+        android:fillAlpha="0.55"
+        android:pathData="M21,66 C24,66 26,68 26,70.5 C26,73 24,75 21,75 C18,75 16,73 16,70.5 C16,68 18,66 21,66 Z" />
+    <path
+        android:fillColor="#F58FB8"
+        android:fillAlpha="0.55"
+        android:pathData="M79,66 C82,66 84,68 84,70.5 C84,73 82,75 79,75 C76,75 74,73 74,70.5 C74,68 76,66 79,66 Z" />
+
+    <!-- mouth -->
+    <path
+        android:fillColor="#2B2140"
+        android:pathData="M46,72 C47.2,74.4 48.5,75.6 50,75.6 C51.5,75.6 52.8,74.4 54,72 C53,76 51.7,78 50,78 C48.3,78 47,76 46,72 Z" />
+</vector>

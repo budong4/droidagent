@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""droid - drive the Android screen from the chroot (screencap / uiautomator / input via ashell).
+
+Observe -> act -> observe again:
+  droid ui [--all]            list on-screen controls: number, text, centre in device px
+  droid shot [--grid] [--scale S] [-o FILE]
+                              screenshot PNG (default /tmp/droid/shot.png at 0.5x)
+  droid tap-id N              tap control N from the last `droid ui`
+  droid tap-text TEXT         fresh dump, tap the control whose text/desc matches
+  droid tap X Y | longpress X Y [MS] | swipe X1 Y1 X2 Y2 [MS]
+  droid text STRING           type text (non-ASCII needs ADBKeyboard installed)
+  droid key NAME              back home enter recent power del tab esc up down left right ...
+  droid app PKG | apps [FILTER] | top | wake
+  droid wait-text TEXT [--timeout SEC]
+Coordinates are always device pixels unless stated otherwise.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+STATE = "/tmp/droid"
+UI_JSON = f"{STATE}/ui.json"
+# /data is bind-mounted into the chroot at the same path, so the dump is readable directly.
+UI_XML = "/data/local/tmp/droid_ui.xml"
+ADB_IME = "com.android.adbkeyboard/.AdbIME"
+
+KEYS = {
+    "back": "BACK", "home": "HOME", "enter": "ENTER", "recent": "APP_SWITCH",
+    "recents": "APP_SWITCH", "power": "POWER", "menu": "MENU", "del": "DEL",
+    "backspace": "DEL", "tab": "TAB", "esc": "ESCAPE", "escape": "ESCAPE",
+    "up": "DPAD_UP", "down": "DPAD_DOWN", "left": "DPAD_LEFT", "right": "DPAD_RIGHT",
+    "volup": "VOLUME_UP", "voldown": "VOLUME_DOWN", "wake": "WAKEUP", "sleep": "SLEEP",
+    "search": "SEARCH", "space": "SPACE",
+}
+
+
+def ash(*args, check=True, data=None):
+    r = subprocess.run(["ashell", *map(str, args)], capture_output=True, input=data)
+    if check and r.returncode != 0:
+        err = (r.stderr or r.stdout).decode(errors="replace").strip()
+        sys.exit(f"droid: `{' '.join(map(str, args))}` failed: {err}")
+    return r
+
+
+def out(*args):
+    return ash(*args).stdout.decode(errors="replace")
+
+
+# ---------- observe ----------
+
+def dump_ui(show_all=False):
+    os.makedirs(STATE, exist_ok=True)
+    err = ""
+    for _ in range(4):
+        if os.path.exists(UI_XML):
+            os.remove(UI_XML)
+        r = ash("uiautomator", "dump", UI_XML, check=False)
+        if os.path.exists(UI_XML) and os.path.getsize(UI_XML) > 0:
+            break
+        err = (r.stderr + r.stdout).decode(errors="replace").strip()
+        time.sleep(0.8)  # "could not get idle state" while animating
+    else:
+        sys.exit(f"droid: uiautomator dump failed: {err}")
+
+    nodes = []
+    pkg = None
+    for n in ET.parse(UI_XML).getroot().iter("node"):
+        b = [int(v) for v in re.findall(r"-?\d+", n.get("bounds", ""))]
+        if len(b) != 4 or b[2] <= b[0] or b[3] <= b[1]:
+            continue
+        pkg = pkg or n.get("package")
+        text, desc = n.get("text", ""), n.get("content-desc", "")
+        cls = n.get("class", "").rsplit(".", 1)[-1]
+        flags = [f for f, k in (("click", "clickable"), ("long", "long-clickable"),
+                                ("scroll", "scrollable"), ("checked", "checked"),
+                                ("focused", "focused")) if n.get(k) == "true"]
+        if cls == "EditText":
+            flags.append("edit")
+        if n.get("enabled") == "false":
+            flags.append("disabled")
+        if not show_all and not (text or desc or set(flags) & {"click", "long", "scroll", "edit"}):
+            continue
+        nodes.append({
+            "i": len(nodes), "cls": cls, "text": text, "desc": desc,
+            "id": n.get("resource-id", "").rsplit("/", 1)[-1],
+            "x": (b[0] + b[2]) // 2, "y": (b[1] + b[3]) // 2, "bounds": b, "flags": flags,
+        })
+    with open(UI_JSON, "w") as f:
+        json.dump({"pkg": pkg, "nodes": nodes}, f, ensure_ascii=False)
+    return pkg, nodes
+
+
+def fmt(d):
+    s = f"[{d['i']}] {d['cls']}"
+    if d["text"]:
+        s += f' "{d["text"]}"'
+    if d["desc"]:
+        s += f' desc="{d["desc"]}"'
+    if d["id"]:
+        s += f" id={d['id']}"
+    s += f" @({d['x']},{d['y']})"
+    if d["flags"]:
+        s += " [" + ",".join(d["flags"]) + "]"
+    return s
+
+
+def cmd_ui(a):
+    pkg, nodes = dump_ui(a.all)
+    print(f"# app={pkg}  {len(nodes)} controls  (device px; tap with `droid tap-id N`)")
+    for d in nodes:
+        print(fmt(d))
+
+
+def cmd_shot(a):
+    from PIL import Image, ImageDraw
+
+    os.makedirs(STATE, exist_ok=True)
+    full = f"{STATE}/shot_full.png"
+    with open(full, "wb") as f:
+        f.write(ash("screencap", "-p").stdout)
+    im = Image.open(full).convert("RGB")
+    w, h = im.size
+    dest = a.output or f"{STATE}/shot.png"
+    if a.scale != 1:
+        im = im.resize((round(w * a.scale), round(h * a.scale)), Image.LANCZOS)
+    if a.grid:
+        d = ImageDraw.Draw(im)
+        step = 200
+        for dev in range(step, max(w, h), step):
+            p = dev * a.scale
+            if dev < w:
+                d.line([(p, 0), (p, im.height)], fill=(255, 0, 64), width=1)
+                d.text((p + 3, 3), str(dev), fill=(255, 0, 64))
+            if dev < h:
+                d.line([(0, p), (im.width, p)], fill=(255, 0, 64), width=1)
+                d.text((3, p + 3), str(dev), fill=(255, 0, 64))
+    im.save(dest)
+    print(f"{dest}  {im.width}x{im.height}  device {w}x{h}  "
+          f"(device coord = image coord / {a.scale}{'; grid labels are device px' if a.grid else ''})")
+
+
+# ---------- act ----------
+
+def tap(x, y):
+    ash("input", "tap", x, y)
+    print(f"tapped ({x},{y})")
+
+
+def load_nodes():
+    try:
+        with open(UI_JSON) as f:
+            return json.load(f)["nodes"]
+    except FileNotFoundError:
+        sys.exit("droid: no UI dump yet, run `droid ui` first")
+
+
+def find_text(nodes, text):
+    exact = [d for d in nodes if text in (d["text"], d["desc"])]
+    if exact:
+        return exact
+    low = text.lower()
+    return [d for d in nodes if low in d["text"].lower() or low in d["desc"].lower()]
+
+
+def cmd_tap_id(a):
+    nodes = load_nodes()
+    if not 0 <= a.n < len(nodes):
+        sys.exit(f"droid: no control [{a.n}] in last dump ({len(nodes)} controls)")
+    d = nodes[a.n]
+    print(fmt(d))
+    tap(d["x"], d["y"])
+
+
+def cmd_tap_text(a):
+    _, nodes = dump_ui(True)
+    hits = find_text(nodes, a.text)
+    if not hits:
+        sys.exit(f'droid: nothing on screen matches "{a.text}"')
+    if len(hits) > 1:
+        print(f"note: {len(hits)} matches, tapping the first:", *map(fmt, hits[:5]), sep="\n  ")
+    print(fmt(hits[0]))
+    tap(hits[0]["x"], hits[0]["y"])
+
+
+def cmd_text(a):
+    s = a.string
+    if s.isascii():
+        ash("input", "text", s.replace(" ", "%s"))
+    else:
+        if "package:" not in ash("pm", "path", "com.android.adbkeyboard", check=False).stdout.decode():
+            sys.exit("droid: non-ASCII text needs ADBKeyboard (com.android.adbkeyboard): "
+                     "install it from github.com/senzhk/ADBKeyBoard, then retry")
+        prev = out("settings", "get", "secure", "default_input_method").strip()
+        ash("ime", "enable", ADB_IME, check=False)
+        ash("ime", "set", ADB_IME)
+        time.sleep(0.4)
+        ash("am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg",
+            base64.b64encode(s.encode()).decode())
+        time.sleep(0.3)
+        if prev and prev != ADB_IME and prev != "null":
+            ash("ime", "set", prev, check=False)
+    print(f"typed {len(s)} chars")
+
+
+def cmd_key(a):
+    k = KEYS.get(a.name.lower(), a.name.upper())
+    ash("input", "keyevent", k if k.isdigit() or k.startswith("KEYCODE_") else "KEYCODE_" + k)
+    print(f"key {k}")
+
+
+def cmd_app(a):
+    res = out("cmd", "package", "resolve-activity", "--brief", "-c",
+              "android.intent.category.LAUNCHER", a.pkg).strip().splitlines()
+    comp = res[-1].strip() if res else ""
+    if "/" in comp:
+        ash("am", "start", "-n", comp)
+        print(f"started {comp}")
+    else:
+        ash("monkey", "-p", a.pkg, "-c", "android.intent.category.LAUNCHER", "1")
+        print(f"started {a.pkg} (via monkey)")
+
+
+def cmd_apps(a):
+    pkgs = sorted(l.split(":", 1)[1] for l in out("pm", "list", "packages", "-3").split() if ":" in l)
+    for p in pkgs:
+        if not a.filter or a.filter.lower() in p.lower():
+            print(p)
+
+
+def cmd_top(a):
+    for l in out("dumpsys", "window").splitlines():
+        if "mCurrentFocus" in l or "mFocusedApp" in l:
+            print(l.strip())
+
+
+def cmd_wake(a):
+    ash("input", "keyevent", "KEYCODE_WAKEUP")
+    ash("wm", "dismiss-keyguard", check=False)
+    print("awake (keyguard dismissed if not secure)")
+
+
+def cmd_wait_text(a):
+    end = time.time() + a.timeout
+    while time.time() < end:
+        _, nodes = dump_ui(True)
+        hits = find_text(nodes, a.text)
+        if hits:
+            print(fmt(hits[0]))
+            return
+        time.sleep(1)
+    sys.exit(f'droid: "{a.text}" did not appear within {a.timeout}s')
+
+
+def main():
+    if not shutil.which("ashell"):
+        sys.exit("droid: ashell not found on PATH")
+    p = argparse.ArgumentParser(prog="droid", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("ui"); s.add_argument("--all", action="store_true"); s.set_defaults(f=cmd_ui)
+    s = sub.add_parser("shot")
+    s.add_argument("--scale", type=float, default=0.5)
+    s.add_argument("--grid", action="store_true")
+    s.add_argument("-o", "--output")
+    s.set_defaults(f=cmd_shot)
+    s = sub.add_parser("tap-id"); s.add_argument("n", type=int); s.set_defaults(f=cmd_tap_id)
+    s = sub.add_parser("tap-text"); s.add_argument("text"); s.set_defaults(f=cmd_tap_text)
+    s = sub.add_parser("tap"); s.add_argument("x", type=int); s.add_argument("y", type=int)
+    s.set_defaults(f=lambda a: tap(a.x, a.y))
+    s = sub.add_parser("longpress"); s.add_argument("x", type=int); s.add_argument("y", type=int)
+    s.add_argument("ms", type=int, nargs="?", default=800)
+    s.set_defaults(f=lambda a: (ash("input", "swipe", a.x, a.y, a.x, a.y, a.ms), print("long-pressed")))
+    s = sub.add_parser("swipe")
+    for k in ("x1", "y1", "x2", "y2"):
+        s.add_argument(k, type=int)
+    s.add_argument("ms", type=int, nargs="?", default=300)
+    s.set_defaults(f=lambda a: (ash("input", "swipe", a.x1, a.y1, a.x2, a.y2, a.ms), print("swiped")))
+    s = sub.add_parser("text"); s.add_argument("string"); s.set_defaults(f=cmd_text)
+    s = sub.add_parser("key"); s.add_argument("name"); s.set_defaults(f=cmd_key)
+    s = sub.add_parser("app"); s.add_argument("pkg"); s.set_defaults(f=cmd_app)
+    s = sub.add_parser("apps"); s.add_argument("filter", nargs="?"); s.set_defaults(f=cmd_apps)
+    sub.add_parser("top").set_defaults(f=cmd_top)
+    sub.add_parser("wake").set_defaults(f=cmd_wake)
+    s = sub.add_parser("wait-text"); s.add_argument("text")
+    s.add_argument("--timeout", type=float, default=10); s.set_defaults(f=cmd_wait_text)
+
+    a = p.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

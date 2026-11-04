@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""pdata - read this phone's own personal data sources (root, via `ashell content query` / `dumpsys`).
+
+Subcommands (each prints one JSON object to stdout):
+  pdata contacts  [--limit N]            name + phone numbers from the contacts provider
+  pdata sms       [--limit N] [--body]   SMS metadata; --body also includes the message text
+  pdata calllog   [--limit N]            call history: number, date, duration, type
+  pdata calendar  [--limit N]            calendar events: title, start/end, location
+  pdata album     [--limit N]            photos: filename, path, date, dimensions
+  pdata video     [--limit N]            videos, same shape as album
+  pdata audio     [--limit N]            audio files, same shape as album
+  pdata notifications                    raw `dumpsys notification` text (truncated)
+  pdata usage                            raw `dumpsys usagestats` text (truncated)
+
+All reads are scoped to this device's own data (uid 0 via KernelSU). --limit defaults to 50 and
+caps at 500. Every call here is gated by the app's "个人数据" setting and asks for confirmation
+per use — this tool does not decide that; it only does the read once allowed.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 500
+RAW_TRUNCATE = 20000
+
+
+def ashell(args, timeout=15):
+    try:
+        r = subprocess.run(["ashell", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", "timed out", 1
+    except FileNotFoundError:
+        return "", "ashell not found on PATH", 127
+    return r.stdout, r.stderr, r.returncode
+
+
+def content_query(uri, columns, sort=None, limit=DEFAULT_LIMIT):
+    args = ["content", "query", "--uri", uri, "--projection", ":".join(columns)]
+    if sort:
+        args += ["--sort", sort]
+    out, err, rc = ashell(args, timeout=20)
+    if rc != 0 and not out:
+        return None, (err.strip() or "content query failed").splitlines()[-1][:200]
+    return parse_rows(out, columns)[:limit], None
+
+
+def parse_rows(output, columns):
+    # Android's `content query` prints: "Row: 0 col1=val1, col2=val2, ..." — split on known column
+    # names rather than on ", " so values containing commas (titles, addresses) stay intact.
+    key_pat = "(?:, )?(" + "|".join(re.escape(c) for c in columns) + ")="
+    rows = []
+    for line in output.splitlines():
+        m = re.match(r"Row:\s*\d+\s+(.*)", line.strip())
+        if not m:
+            continue
+        parts = re.split(key_pat, m.group(1))
+        row = {}
+        it = iter(parts[1:])
+        for key, val in zip(it, it):
+            row[key] = val.rstrip(", ").strip()
+        if row:
+            rows.append(row)
+    return rows
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def cmd_contacts(a):
+    rows, err = content_query(
+        "content://com.android.contacts/contacts",
+        ["_id", "display_name", "has_phone_number"],
+        sort="display_name ASC", limit=a.limit,
+    )
+    if err:
+        return out({"ok": False, "error": err})
+    phones, perr = content_query("content://com.android.contacts/data/phones", ["contact_id", "data1"], limit=2000)
+    by_contact = {}
+    if phones:
+        for p in phones:
+            by_contact.setdefault(p.get("contact_id"), []).append(p.get("data1", ""))
+    for r in rows:
+        r["phones"] = by_contact.get(r.get("_id"), [])
+        r.pop("has_phone_number", None)
+    out({"ok": True, "count": len(rows), "contacts": rows})
+
+
+def cmd_sms(a):
+    cols = ["_id", "address", "date", "type"] + (["body"] if a.body else [])
+    rows, err = content_query("content://sms", cols, sort="date DESC", limit=a.limit)
+    if err:
+        return out({"ok": False, "error": err})
+    TYPE = {"1": "收到", "2": "发出", "3": "草稿"}
+    for r in rows:
+        r["type"] = TYPE.get(r.get("type"), r.get("type"))
+    out({"ok": True, "count": len(rows), "messages": rows, "body_included": a.body})
+
+
+def cmd_calllog(a):
+    rows, err = content_query("content://call_log/calls", ["_id", "number", "date", "duration", "type"], sort="date DESC", limit=a.limit)
+    if err:
+        return out({"ok": False, "error": err})
+    TYPE = {"1": "呼入", "2": "呼出", "3": "未接", "5": "拒接"}
+    for r in rows:
+        r["type"] = TYPE.get(r.get("type"), r.get("type"))
+    out({"ok": True, "count": len(rows), "calls": rows})
+
+
+def cmd_calendar(a):
+    rows, err = content_query(
+        "content://com.android.calendar/events",
+        ["_id", "title", "dtstart", "dtend", "eventLocation"],
+        sort="dtstart DESC", limit=a.limit,
+    )
+    if err:
+        return out({"ok": False, "error": err})
+    out({"ok": True, "count": len(rows), "events": rows})
+
+
+def media(label, uri, a):
+    rows, err = content_query(uri, ["_id", "_display_name", "_data", "date_added"], sort="date_added DESC", limit=a.limit)
+    if err:
+        return out({"ok": False, "error": err})
+    out({"ok": True, "count": len(rows), label: rows})
+
+
+def cmd_album(a): media("photos", "content://media/external/images/media", a)
+def cmd_video(a): media("videos", "content://media/external/video/media", a)
+def cmd_audio(a): media("audio", "content://media/external/audio/media", a)
+
+
+def raw_dump(args_list, label):
+    out_text, err, rc = ashell(args_list, timeout=20)
+    if rc != 0 and not out_text:
+        return out({"ok": False, "error": (err.strip() or "dumpsys failed")[:200]})
+    truncated = len(out_text) > RAW_TRUNCATE
+    out({"ok": True, "format": "raw-dumpsys", label: out_text[:RAW_TRUNCATE], "truncated": truncated})
+
+
+def cmd_notifications(a): raw_dump(["dumpsys", "notification", "--noredact"], "text")
+def cmd_usage(a): raw_dump(["dumpsys", "usagestats"], "text")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pdata", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn in [("contacts", cmd_contacts), ("sms", cmd_sms), ("calllog", cmd_calllog),
+                      ("calendar", cmd_calendar), ("album", cmd_album), ("video", cmd_video), ("audio", cmd_audio)]:
+        s = sub.add_parser(name)
+        s.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+        if name == "sms":
+            s.add_argument("--body", action="store_true", help="include message text (default: metadata only)")
+        s.set_defaults(f=fn)
+    for name, fn in [("notifications", cmd_notifications), ("usage", cmd_usage)]:
+        sub.add_parser(name).set_defaults(f=fn)
+
+    a = p.parse_args()
+    if hasattr(a, "limit"):
+        a.limit = max(1, min(a.limit, MAX_LIMIT))
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

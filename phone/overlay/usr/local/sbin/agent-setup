@@ -1,0 +1,125 @@
+#!/bin/bash
+# agent-setup - provision the Debian chroot for the phone agent. Safe to re-run.
+#   MIRROR=...        Debian mirror        (default: TUNA)
+#   NPM_REGISTRY=...  npm registry         (default: the official registry.npmjs.org)
+#   EXTRA=1           also install the heavy toolset (JRE + apktool, ffmpeg, imagemagick, nmap)
+#   NODE_MAJOR=24     Node.js LTS line to install from nodejs.org
+set -uo pipefail
+
+MIRROR=${MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}
+NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmjs.org}
+NODE_MAJOR=${NODE_MAJOR:-24}
+export DEBIAN_FRONTEND=noninteractive
+FAILED_LOG=/var/log/agent-setup.failed
+
+step() { printf '\n==> %s\n' "$*"; }
+die() { echo "agent-setup: $*" >&2; exit 1; }
+
+install_pkgs() { # install_pkgs <label> pkg...
+	local label=$1 p
+	local failed=()
+	shift
+	step "packages: $label"
+	apt-get install -y --no-install-recommends "$@" && return 0
+	echo "!! batch install failed, retrying one by one"
+	for p in "$@"; do
+		apt-get install -y --no-install-recommends "$p" || failed+=("$p")
+	done
+	if ((${#failed[@]})); then
+		echo "!! not installed ($label): ${failed[*]}" | tee -a "$FAILED_LOG"
+	fi
+}
+
+: > "$FAILED_LOG"
+
+step "apt: chroot-safe config"
+# Android kernels may only let group inet (3003) open sockets, so keep apt as root
+# instead of dropping to _apt, and never let postinst scripts start services (no init here).
+echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/01android
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+chmod 755 /usr/sbin/policy-rc.d
+getent group aid_inet >/dev/null || groupadd -g 3003 aid_inet
+getent group aid_net_raw >/dev/null || groupadd -g 3004 aid_net_raw
+usermod -aG aid_inet,aid_net_raw root
+id _apt >/dev/null 2>&1 && usermod -aG aid_inet _apt
+
+step "apt sources -> $MIRROR"
+rm -f /etc/apt/sources.list
+cat > /etc/apt/sources.list.d/debian.sources <<EOF
+Types: deb
+URIs: $MIRROR/debian
+Suites: trixie trixie-updates trixie-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: $MIRROR/debian-security
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+apt-get update || die "apt-get update failed (network/DNS? check /etc/resolv.conf)"
+apt-get -y full-upgrade || echo "!! upgrade had errors, continuing"
+
+install_pkgs base \
+	ca-certificates curl wget git openssh-client less vim nano htop procps psmisc lsof file \
+	zip unzip xz-utils zstd 7zip jq ripgrep fd-find tree tmux bash-completion tzdata \
+	iproute2 iputils-ping bind9-dnsutils netcat-openbsd socat rsync sqlite3 strace xxd
+install_pkgs python python3 python3-pip python3-venv python3-pil
+install_pkgs dev build-essential gdb cmake pkg-config
+if [ "${EXTRA:-0}" = 1 ]; then
+	install_pkgs extra default-jre-headless apktool ffmpeg imagemagick nmap
+fi
+apt-get clean
+
+step "system bits"
+ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+echo Asia/Shanghai > /etc/timezone
+[ -x /usr/bin/fdfind ] && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+step "Node.js $NODE_MAJOR LTS (official build from nodejs.org)"
+# Debian 13's nodejs is 20.x; Claude Code needs >= 22.
+if dpkg -s nodejs >/dev/null 2>&1 || dpkg -s npm >/dev/null 2>&1; then
+	apt-get purge -y nodejs npm && apt-get autoremove -y --purge
+fi
+base="https://nodejs.org/dist/latest-v$NODE_MAJOR.x"
+sums=$(curl -fsSL --retry 3 "$base/SHASUMS256.txt") || die "cannot reach nodejs.org"
+line=$(grep -E ' node-v[0-9.]+-linux-arm64\.tar\.xz$' <<<"$sums") || die "no linux-arm64 build in $base"
+file=${line##* }
+ver=${file#node-}
+ver=${ver%-linux-arm64.tar.xz}
+if [ "$(/usr/local/bin/node -v 2>/dev/null)" = "$ver" ]; then
+	echo "already $ver"
+else
+	tmp=$(mktemp -d)
+	curl -fsSL --retry 3 -o "$tmp/$file" "$base/$file" || die "node download failed"
+	(cd "$tmp" && echo "$line" | sha256sum -c --quiet) || die "node checksum mismatch"
+	tar -xJf "$tmp/$file" -C /usr/local --strip-components=1 --no-same-owner
+	rm -f /usr/local/CHANGELOG.md /usr/local/README.md /usr/local/LICENSE
+	rm -rf "$tmp"
+fi
+hash -r
+echo "node $(node -v), npm $(npm -v)"
+
+step "Claude Code"
+npm config set registry "$NPM_REGISTRY" --location=global
+if claude --version >/dev/null 2>&1; then
+	echo "already installed"
+else
+	npm install -g @anthropic-ai/claude-code || die "npm install @anthropic-ai/claude-code failed"
+fi
+claude --version || echo "!! claude is installed but did not run"
+
+step "chat app dependencies"
+mkdir -p /etc/agent
+if [ -f /usr/local/share/agent-app/server/package.json ]; then
+	(cd /usr/local/share/agent-app/server && npm install --omit=dev --no-audit --no-fund) ||
+		echo "!! app npm install failed (retry later: debian appdeps)" | tee -a "$FAILED_LOG"
+else
+	echo "app not pushed yet; after pushing it run: debian appdeps"
+fi
+
+step "done"
+[ -s "$FAILED_LOG" ] && { echo "some steps failed:"; cat "$FAILED_LOG"; }
+echo "next (Android side): su -c /data/local/debian-agent/debian app start"
+echo "then open http://127.0.0.1:8787 on the phone"

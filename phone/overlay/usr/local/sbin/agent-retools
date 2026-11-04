@@ -1,0 +1,167 @@
+#!/bin/bash
+# agent-retools - install the reverse-engineering / APK analysis toolchain. Safe to re-run.
+# Separate from agent-setup: this is slow, needs network, and only the user who asked for
+# analysis tooling needs it. Every downloaded binary is pinned to an exact version and
+# verified against a SHA256 fetched once (by a human, from the GitHub Releases API) and
+# hardcoded below — never trust-on-first-use against whatever "latest" resolves to later.
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+FAILED_LOG=/var/log/agent-retools.failed
+VERSIONS_FILE=/root/retools-versions.txt
+
+JADX_VERSION=1.5.6
+JADX_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+DEX2JAR_VERSION=2.4
+DEX2JAR_SHA256=ee7c45eb3c1d2474a6145d8d447e651a736a22d9664b6d3d3be5a5a817dda23a
+FRIDA_VERSION=17.24.3
+FRIDA_SERVER_SHA256=a56beefc862e5cc6d02ba9a6203cc98057839c2097a62f8eaba867eb537b6d12
+RADARE2_VERSION=6.2.4
+RADARE2_DEB_SHA256=bbf48ee7bd5d8282f65a297dcabd34c9961a500e62d6b036679caab187b32ef1
+UV_VERSION=0.13.1
+UV_SHA256=9041c73c99fdc5892cf128140beb354eca9231d502068cc36e6cb53a8e59ad14
+
+step() { printf '\n==> %s\n' "$*"; }
+die() { echo "agent-retools: $*" >&2; exit 1; }
+fail_note() { echo "!! $*" | tee -a "$FAILED_LOG"; }
+
+: > "$FAILED_LOG"
+
+# fetch_verify <url> <expected-sha256> <dest-file>
+# --max-time bounds the whole transfer: on a slow/flaky link a stalled-but-not-yet-erroring
+# connection can otherwise hang here indefinitely instead of failing and letting --retry kick in.
+fetch_verify() {
+	local url=$1 sum=$2 dest=$3
+	curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 -o "$dest" "$url" || { rm -f "$dest"; return 1; }
+	echo "$sum  $dest" | sha256sum -c --quiet || { echo "checksum mismatch: $url"; rm -f "$dest"; return 1; }
+}
+
+# install_pkgs <label> pkg...  (same pattern as agent-setup: retry one-by-one so a single bad
+# or unavailable package name doesn't take the rest of the batch down with it)
+install_pkgs() {
+	local label=$1 p failed=()
+	shift
+	step "packages: $label"
+	apt-get install -y --no-install-recommends "$@" && return 0
+	echo "!! batch install failed, retrying one by one"
+	for p in "$@"; do
+		apt-get install -y --no-install-recommends "$p" || failed+=("$p")
+	done
+	if ((${#failed[@]})); then
+		fail_note "not installed ($label): ${failed[*]}"
+	fi
+}
+
+apt-get update -qq || fail_note "apt-get update failed"
+install_pkgs "JDK (javac) + pipx" default-jdk-headless pipx
+
+step "jadx $JADX_VERSION (APK/DEX decompiler)"
+if command -v jadx >/dev/null && [ "$(jadx --version 2>/dev/null)" = "$JADX_VERSION" ]; then
+	echo "already $JADX_VERSION"
+else
+	tmp=$(mktemp -d)
+	if fetch_verify "https://github.com/skylot/jadx/releases/download/v$JADX_VERSION/jadx-$JADX_VERSION.zip" "$JADX_SHA256" "$tmp/jadx.zip"; then
+		rm -rf /opt/jadx && mkdir -p /opt/jadx
+		unzip -q "$tmp/jadx.zip" -d /opt/jadx
+		ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
+		ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui
+		chmod +x /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui
+	else
+		fail_note "jadx download/checksum failed"
+	fi
+	rm -rf "$tmp"
+fi
+
+step "dex2jar $DEX2JAR_VERSION (dex -> jar)"
+if [ -x /opt/dex2jar/d2j-dex2jar.sh ]; then
+	echo "already installed"
+else
+	tmp=$(mktemp -d)
+	if fetch_verify "https://github.com/pxb1988/dex2jar/releases/download/v$DEX2JAR_VERSION/dex-tools-v$DEX2JAR_VERSION.zip" "$DEX2JAR_SHA256" "$tmp/d2j.zip"; then
+		rm -rf /opt/dex2jar && mkdir -p /opt/dex2jar
+		unzip -q "$tmp/d2j.zip" -d "$tmp/x"
+		inner=$(find "$tmp/x" -maxdepth 1 -mindepth 1 -type d | head -1)
+		cp -a "$inner"/. /opt/dex2jar/
+		chmod +x /opt/dex2jar/*.sh
+		for s in /opt/dex2jar/d2j-*.sh; do ln -sf "$s" "/usr/local/bin/$(basename "$s")"; done
+	else
+		fail_note "dex2jar download/checksum failed"
+	fi
+	rm -rf "$tmp"
+fi
+
+step "radare2 $RADARE2_VERSION (binary/firmware analysis, official arm64 .deb)"
+# Debian's own 'radare2' package is absent from the current index on this chroot (confirmed via
+# apt-cache policy), so install the project's own official Debian package instead of building
+# from source.
+if command -v radare2 >/dev/null && [ "$(radare2 -v 2>/dev/null | head -1 | grep -o "$RADARE2_VERSION")" = "$RADARE2_VERSION" ]; then
+	echo "already $RADARE2_VERSION"
+else
+	tmp=$(mktemp -d)
+	if fetch_verify "https://github.com/radareorg/radare2/releases/download/$RADARE2_VERSION/radare2_${RADARE2_VERSION}_arm64.deb" "$RADARE2_DEB_SHA256" "$tmp/r2.deb"; then
+		apt-get install -y --no-install-recommends "$tmp/r2.deb" || fail_note "radare2 .deb install failed"
+	else
+		fail_note "radare2 download/checksum failed"
+	fi
+	rm -rf "$tmp"
+fi
+echo "!! rizin skipped: upstream publishes no glibc Linux arm64 build (only Android/bionic and desktop OSes), which won't run in this Debian chroot. radare2 covers the same role." | tee -a "$FAILED_LOG"
+
+install_pkgs "binwalk, androguard" binwalk androguard
+
+step "uv $UV_VERSION (Python env/tooling) + pipx-installed analysis CLIs"
+if command -v uv >/dev/null && [ "$(uv --version 2>/dev/null | awk '{print $2}')" = "$UV_VERSION" ]; then
+	echo "uv already $UV_VERSION"
+else
+	tmp=$(mktemp -d)
+	if fetch_verify "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-unknown-linux-gnu.tar.gz" "$UV_SHA256" "$tmp/uv.tar.gz"; then
+		tar -xzf "$tmp/uv.tar.gz" -C "$tmp"
+		inner=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -1)
+		install -m 755 "$inner/uv" "$inner/uvx" /usr/local/bin/
+	else
+		fail_note "uv download/checksum failed"
+	fi
+	rm -rf "$tmp"
+fi
+pipx ensurepath >/dev/null 2>&1 || true
+export PATH="/root/.local/bin:$PATH"
+pipx install --quiet frida-tools || fail_note "pipx install frida-tools failed"
+pipx install --quiet objection || fail_note "pipx install objection failed"
+pipx install --quiet mitmproxy || fail_note "pipx install mitmproxy failed"
+
+step "frida-server $FRIDA_VERSION (device-side daemon, android-arm64)"
+DEV_BIN=/data/local/tmp/frida-server
+if ashell test -x "$DEV_BIN" 2>/dev/null && [ "$(ashell "$DEV_BIN" --version 2>/dev/null)" = "$FRIDA_VERSION" ]; then
+	echo "already $FRIDA_VERSION"
+else
+	tmp=$(mktemp -d)
+	if fetch_verify "https://github.com/frida/frida/releases/download/$FRIDA_VERSION/frida-server-$FRIDA_VERSION-android-arm64.xz" "$FRIDA_SERVER_SHA256" "$tmp/fs.xz"; then
+		unxz -c "$tmp/fs.xz" > "$tmp/frida-server"
+		# /data is bind-mounted into the chroot at the same path, so this is visible from Android too.
+		install -m 755 "$tmp/frida-server" "$DEV_BIN"
+		ashell chmod 755 "$DEV_BIN" 2>/dev/null || true
+	else
+		fail_note "frida-server download/checksum failed"
+	fi
+	rm -rf "$tmp"
+fi
+
+step "done"
+{
+	echo "retools install — $(date -Is)"
+	echo "jadx:      $(jadx --version 2>&1 | head -1)"
+	echo "dex2jar:   $([ -x /opt/dex2jar/d2j-dex2jar.sh ] && echo "$DEX2JAR_VERSION installed" || echo "not installed")"
+	echo "radare2:   $(radare2 -v 2>&1 | head -1)"
+	echo "rizin:     skipped (no glibc arm64 build upstream)"
+	echo "binwalk:   $(binwalk --help 2>&1 | head -1)"
+	echo "androguard: $(androguard --version 2>&1 | head -1)"
+	echo "uv:        $(uv --version 2>&1)"
+	echo "frida (python): $(frida --version 2>&1)"
+	echo "frida-server (device): $(ashell "$DEV_BIN" --version 2>&1 || echo "not installed")"
+	echo "objection: $(objection version 2>&1 | head -1)"
+	echo "mitmproxy: $(mitmdump --version 2>&1 | head -1)"
+	echo "javac:     $(javac -version 2>&1)"
+} > "$VERSIONS_FILE"
+cat "$VERSIONS_FILE"
+[ -s "$FAILED_LOG" ] && { echo; echo "some steps had issues:"; cat "$FAILED_LOG"; }
+echo
+echo "frida-server control: frida-server start|stop|status (runs on the Android side via ashell)"

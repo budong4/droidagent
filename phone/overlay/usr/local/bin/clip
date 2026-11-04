@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""clip - best-effort clipboard access via `ashell cmd clipboard`.
+
+  clip get            print the current primary clip as text (if the ROM supports it)
+  clip set TEXT        set the primary clip to TEXT (if the ROM supports it)
+
+Not every Android build implements a shell handler for ClipboardService — on some ROMs
+`cmd clipboard` reports "No shell command implementation", so both directions fail there.
+This tool tries the documented subcommands anyway (OEMs and Android versions vary) and
+reports a clear, honest failure instead of pretending to succeed.
+"""
+import subprocess
+import sys
+
+
+def ashell(args, timeout=10):
+    try:
+        r = subprocess.run(["ashell", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", "timed out", 1
+    except FileNotFoundError:
+        return "", "ashell not found on PATH", 127
+    return r.stdout, r.stderr, r.returncode
+
+
+def looks_unsupported(text):
+    t = text.lower()
+    return "no shell command implementation" in t or "unknown command" in t
+
+
+def cmd_get():
+    for args in (["cmd", "clipboard", "get-primary-clip"], ["cmd", "clipboard", "get"]):
+        out, err, rc = ashell(args)
+        combined = out + err
+        if looks_unsupported(combined):
+            continue
+        if rc == 0 and out.strip():
+            print(out.strip())
+            return 0
+    sys.stderr.write("clip: 这台设备的 ClipboardService 不支持 shell 读取（cmd clipboard: No shell command implementation）\n")
+    return 1
+
+
+def cmd_set(text):
+    for args in (["cmd", "clipboard", "set-primary-clip", "text/plain", text], ["cmd", "clipboard", "set", text]):
+        out, err, rc = ashell(args)
+        combined = out + err
+        if looks_unsupported(combined):
+            continue
+        if rc == 0:
+            print("ok")
+            return 0
+    sys.stderr.write("clip: 这台设备的 ClipboardService 不支持 shell 写入（cmd clipboard: No shell command implementation）。"
+                      "可以改用 droid 的截图+用户手动复制，或者在 UI 里定位输入框后用 `droid text` 直接把内容打进去。\n")
+    return 1
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("get", "set"):
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    if sys.argv[1] == "get":
+        sys.exit(cmd_get())
+    else:
+        if len(sys.argv) < 3:
+            sys.stderr.write("usage: clip set TEXT\n")
+            sys.exit(2)
+        sys.exit(cmd_set(" ".join(sys.argv[2:])))
+
+
+if __name__ == "__main__":
+    main()
