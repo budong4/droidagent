@@ -371,7 +371,13 @@ do_sync() {
 			rm -rf "$ROOT$APP_DIR/web.old"
 			[ -d "$ROOT$APP_DIR/web" ] && mv "$ROOT$APP_DIR/web" "$ROOT$APP_DIR/web.old"
 			mv "$tmp/web" "$ROOT$APP_DIR/web" || { mv "$ROOT$APP_DIR/web.old" "$ROOT$APP_DIR/web"; rm -rf "$tmp"; die "cannot update the app's web files"; }
-			rm -rf "$ROOT$APP_DIR/web.old" "$tmp"
+			rm -rf "$ROOT$APP_DIR/web.old"
+			# Built-in skills; the server copies them into ~/.claude/skills on start.
+			if [ -d "$tmp/skills" ]; then
+				rm -rf "$ROOT$APP_DIR/skills"
+				mv "$tmp/skills" "$ROOT$APP_DIR/skills" || log "warn: could not update built-in skills"
+			fi
+			rm -rf "$tmp"
 			echo "$sum" > "$stamp"
 			changed=1
 		fi

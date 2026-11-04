@@ -5,7 +5,7 @@ import { connect as netConnect } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
-import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open } from 'node:fs/promises';
+import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open, cp } from 'node:fs/promises';
 import { readFileSync, existsSync, createReadStream, createWriteStream } from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -38,14 +38,16 @@ const settings = {
 	modelName: 'Sonnet 5.5',  // Display name
 	effort: 'xhigh',          // low | medium | high | xhigh | max
 	fastMode: false,          // fast mode toggle
-	mode: 'autoEdit',         // ask | autoEdit | auto | plan
-	readonly: false,          // deny writes / side effects
-	screen: true,             // allow droid screen actions
-	web: true,                // allow WebSearch / WebFetch
-	thinking: true,           // show thinking blocks
-	personalData: false,      // allow reading personal data (contacts/SMS/call log/photos…) — default OFF
+	mode: 'acceptEdits',      // Claude Code's permission modes: default | acceptEdits | plan | auto | bypassPermissions
 	autoUpdate: true,         // install new releases by itself (off: only report them)
 };
+// The modes, as Claude Code names them. Older builds stored their own names.
+const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
+const MODE_MIGRATE = { ask: 'default', autoEdit: 'acceptEdits' };
+// What the client may change through /api/settings. Screen automation, web access, personal
+// data and showing thinking used to be switches; they are simply on now (the mode decides what
+// needs a confirmation), and "read-only" is what Plan mode is for.
+const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate'];
 
 // Config files for the Eta-parity features.
 const SYSTEM_PROMPT_FILE = join(homedir(), '.claude', 'agent-system-prompt.md');
@@ -56,7 +58,10 @@ const MCP_FILE = join(homedir(), '.claude', 'agent-mcp.json');
 try {
 	if (existsSync(SETTINGS_FILE)) {
 		const saved = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'));
-		Object.assign(settings, saved);
+		for (const k of SETTING_KEYS) if (k in saved) settings[k] = saved[k];
+		settings.mode = MODE_MIGRATE[settings.mode] || settings.mode;
+		if (saved.readonly) settings.mode = 'plan'; // the old read-only switch
+		if (!MODES.includes(settings.mode)) settings.mode = 'acceptEdits';
 	}
 } catch (e) {
 	log('settings load failed', e?.message);
@@ -305,44 +310,38 @@ const ask = (reason, title, detail) => ({ decision: 'ask', reason, title, detail
 function policy(toolName, input) {
 	const name = toolName || '';
 	const isWrite = /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name);
-	const isRead = /^(Read|Glob|Grep|LS|NotebookRead|TodoWrite|Task)$/.test(name);
-	const isNet = /^(WebSearch|WebFetch)$/.test(name);
+	const isRead = /^(Read|Glob|Grep|LS|NotebookRead|TodoWrite|Task|WebSearch|WebFetch)$/.test(name);
 	const cmd = name === 'Bash' ? String(input?.command || '') : '';
 	const target = readPath(input);
+	const mode = settings.mode;
 
 	const title = toolTitle(name, input);
 	const detail = toolDetail(name, input);
 
-	// Hard gates
-	if (isNet && !settings.web) return deny('联网搜索已关闭', title, detail);
-	if (!settings.screen && (SCREEN_ACTION.test(cmd))) return deny('屏幕自动化已关闭', title, detail);
+	// Full access: nothing is asked, by the owner's explicit choice of that mode.
+	if (mode === 'bypassPermissions') return allow(title, detail);
+
+	// Leaving Plan mode means "go ahead with this plan" — always the owner's call.
+	if (name === 'ExitPlanMode') return ask('计划已就绪', '按这个计划开始执行？', String(input?.plan || ''));
+
 	const personal = name === 'Bash' && PERSONAL_DATA.test(cmd);
-	if (personal && !settings.personalData) return deny('个人数据访问未开启（去设置里打开「个人数据」）', title, detail);
-	if (settings.readonly) {
-		const roOk = isRead || personal || (name === 'Bash' && READ_ONLY_BASH.test(cmd) && !DANGER.test(cmd) && !DANGER_ANDROID.test(cmd) && !CATASTROPHIC.test(cmd));
-		if (!roOk) return deny('只读模式已开启', title, detail);
-	}
-
-	// Personal data: enabled → still confirm per use (except in full-auto). Reading SMS/contacts/etc. is sensitive.
-	if (personal) return settings.mode === 'auto' ? allow(title, detail) : ask('个人数据', title, detail);
-	// Starting a resident root service or a traffic-intercepting proxy always asks.
-	if (name === 'Bash' && START_SERVICE.test(cmd)) return ask('启动服务', title, detail);
-
+	const readOnlyCmd = name === 'Bash' && READ_ONLY_BASH.test(cmd) && !DANGER.test(cmd) && !DANGER_ANDROID.test(cmd) && !CATASTROPHIC.test(cmd);
 	const catastrophic = name === 'Bash' && (CATASTROPHIC.test(cmd) || PIPE_TO_SHELL.test(cmd));
 	const dangerous =
 		(name === 'Bash' && (DANGER.test(cmd) || DANGER_ANDROID.test(cmd))) ||
 		(isWrite && SENSITIVE_PATH.test(normalize(target || '/')));
 
+	// Plan: look, don't touch.
+	if (mode === 'plan') return isRead || readOnlyCmd ? allow(title, detail) : ask('Plan 模式', title, detail);
+	// Bricking-class operations always ask, in every mode below Full access.
 	if (catastrophic) return ask('高危操作', title, detail);
-
-	if (settings.mode === 'auto') return allow(title, detail);
-	if (settings.mode === 'plan') return isRead ? allow(title, detail) : ask('计划模式', title, detail);
-	if (settings.mode === 'ask') {
-		if (isRead) return allow(title, detail);
-		if (name === 'Bash' && READ_ONLY_BASH.test(cmd) && !dangerous) return allow(title, detail);
-		return ask('确认', title, detail);
-	}
-	return dangerous ? ask('需要确认', title, detail) : allow(title, detail);
+	if (mode === 'auto') return allow(title, detail);
+	// Personal data (contacts, SMS, call log, photos …) and resident services ask per use.
+	if (personal) return ask('个人数据', title, detail);
+	if (name === 'Bash' && START_SERVICE.test(cmd)) return ask('启动服务', title, detail);
+	if (mode === 'acceptEdits') return dangerous ? ask('需要确认', title, detail) : allow(title, detail);
+	// default (Ask): anything with side effects asks.
+	return isRead || readOnlyCmd ? allow(title, detail) : ask('需要确认', title, detail);
 }
 
 // ---------------------------------------------------------------- session & Claude SDK
@@ -412,7 +411,8 @@ async function listSkills() {
 				const ds = fm[1].match(/^description:\s*(.+)$/m); if (ds) description = ds[1].trim().replace(/^["']|["']$/g, '');
 			}
 		} catch { /* no SKILL.md */ }
-		out.push({ id, name, description, enabled: state.enabled.includes(id) });
+		const builtin = existsSync(join(SKILLS_DIR, id, '.builtin'));
+		out.push({ id, name, description, enabled: state.enabled.includes(id), builtin });
 	}
 	return out;
 }
@@ -506,6 +506,7 @@ async function ensureRuntime(id) {
 			pending.set(permId, {
 				resolve: (r) => { pending.delete(permId); resolve(r); },
 				input: toolInput,
+				toolName,
 			});
 		});
 	};
@@ -518,7 +519,7 @@ async function ensureRuntime(id) {
 		model: modelFor(chatSpec, settings.model),
 		effort: settings.effort || 'xhigh',
 		fastMode: !!settings.fastMode,
-		permissionMode: 'default',
+		permissionMode: settings.mode === 'plan' ? 'plan' : 'default',
 		includePartialMessages: true,
 		settingSources: ['user', 'project', 'local'],
 		systemPrompt: append ? { type: 'preset', preset: 'claude_code', append } : { type: 'preset', preset: 'claude_code' },
@@ -564,7 +565,7 @@ async function consume(id, q, rt) {
 					rt.assistantText += ev.delta.text;
 					rt.label = '正在回复';
 					broadcast({ type: 'assistant_delta', sessionId: id, text: ev.delta.text });
-				} else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking && settings.thinking) {
+				} else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
 					rt.label = '思考中';
 					broadcast({ type: 'thinking_delta', sessionId: id, text: ev.delta.thinking });
 				}
@@ -946,8 +947,9 @@ function readOauth() {
 function httpsGet(host, path, headers, proxy, timeout = 12000) {
 	return new Promise((resolve, reject) => {
 		const go = (socket) => {
-			// agent: false — a one-off connection, not one kept alive in the global pool.
-			const req = httpsRequest({ host, path, method: 'GET', headers: { host, ...headers }, timeout, agent: false, ...(socket ? { createConnection: () => socket } : {}) }, (res) => {
+			// A one-off connection, not one kept alive in the global pool. Through a proxy the tunnel
+			// is handed over with createConnection, which Node only honours when no agent is given.
+			const req = httpsRequest({ host, path, method: 'GET', headers: { host, ...headers }, timeout, ...(socket ? { createConnection: () => socket } : { agent: false }) }, (res) => {
 				let body = '';
 				res.setEncoding('utf8');
 				res.on('data', (d) => { body += d; });
@@ -995,6 +997,94 @@ async function fetchPlanUsage() {
 		},
 		subscription_type: o.subscriptionType ?? null,
 	};
+}
+
+// ---------------------------------------------------------------- fonts
+// Open-source Chinese fonts (OFL / MIT), offered in Appearance. They are split by the font
+// projects into many small woff2 slices by character range; the page only asks for the slices
+// of characters actually on screen, and this server fetches each once from an npm mirror and
+// keeps it, so a font costs a few hundred KB of real use rather than a 10–80 MB package.
+const FONTS = {
+	'lxgw-wenkai': { pkg: 'lxgw-wenkai-screen-webfont', ver: '1.7.0', css: 'lxgwwenkaigbscreen.css' },
+	'noto-serif': { pkg: '@fontsource/noto-serif-sc', ver: '5.3.1', css: '400.css' },
+	'zcool-xiaowei': { pkg: '@fontsource/zcool-xiaowei', ver: '5.3.0', css: 'index.css' },
+	'zcool-kuaile': { pkg: '@fontsource/zcool-kuaile', ver: '5.3.0', css: 'index.css' },
+	'qingke': { pkg: '@fontsource/zcool-qingke-huangyou', ver: '5.3.0', css: 'index.css' },
+	'ma-shan-zheng': { pkg: '@fontsource/ma-shan-zheng', ver: '5.3.1', css: 'index.css' },
+};
+const FONTS_DIR = join(homedir(), '.claude', 'fonts');
+const fontFetches = new Map();
+function fontMirrors(f, rel) {
+	return [
+		`https://registry.npmmirror.com/${f.pkg}/${f.ver}/files/${rel}`, // fast in mainland China
+		`https://cdn.jsdelivr.net/npm/${f.pkg}@${f.ver}/${rel}`,
+	];
+}
+async function fontFile(id, rel) {
+	const f = FONTS[id];
+	if (!f || !/^[A-Za-z0-9._/-]+$/.test(rel) || rel.includes('..')) return null;
+	const local = join(FONTS_DIR, id, rel);
+	if (existsSync(local)) return local;
+	if (!fontFetches.has(local)) {
+		fontFetches.set(local, (async () => {
+			await mkdir(dirname(local), { recursive: true });
+			const tmp = `${local}.part`;
+			let lastErr;
+			for (const url of fontMirrors(f, rel)) {
+				try {
+					await fetchUrl(url, { file: tmp, timeout: 30000 });
+					await rename(tmp, local);
+					return local;
+				} catch (e) { lastErr = e; }
+			}
+			await rm(tmp, { force: true }).catch(() => {});
+			throw lastErr || new Error('download failed');
+		})().finally(() => fontFetches.delete(local)));
+	}
+	return fontFetches.get(local);
+}
+
+// ---------------------------------------------------------------- chat background
+// A wallpaper the owner picks (any image of their own), shown behind the conversation.
+const BG_FILE = join(homedir(), '.claude', 'agent-background');
+
+// ---------------------------------------------------------------- built-in skills
+// Android skills that ship with the app (app/skills/<id>/SKILL.md). Each is installed once and
+// enabled once; after that the owner's choices stand: a disabled one stays disabled, and one the
+// owner edited is never overwritten (the .builtin marker records the hash we last wrote).
+const BUILTIN_SKILLS_DIR = join(HERE, '..', 'skills');
+async function seedBuiltinSkills() {
+	let ids = [];
+	try { ids = (await readdir(BUILTIN_SKILLS_DIR, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return; }
+	const state = await readSkillsState();
+	state.enabled ||= [];
+	state.seeded ||= [];
+	const hash = (t) => createHash('sha256').update(t).digest('hex');
+	for (const id of ids) {
+		const src = join(BUILTIN_SKILLS_DIR, id);
+		const dst = join(SKILLS_DIR, id);
+		let srcText;
+		try { srcText = await readFile(join(src, 'SKILL.md'), 'utf8'); } catch { continue; }
+		let write = !existsSync(dst);
+		if (!write) {
+			try {
+				const marker = (await readFile(join(dst, '.builtin'), 'utf8')).trim();
+				const cur = await readFile(join(dst, 'SKILL.md'), 'utf8');
+				write = marker === hash(cur) && marker !== hash(srcText); // untouched by the owner, and we have a newer one
+			} catch { /* no marker: the owner's own copy */ }
+		}
+		if (write) {
+			await mkdir(dst, { recursive: true });
+			await cp(src, dst, { recursive: true, force: true });
+			await writeFile(join(dst, '.builtin'), hash(srcText));
+			log('[skills] installed built-in', id);
+		}
+		if (!state.seeded.includes(id)) {
+			state.seeded.push(id);
+			if (!state.enabled.includes(id)) state.enabled.push(id);
+		}
+	}
+	await writeSkillsState(state);
 }
 
 // ---------------------------------------------------------------- self-update
@@ -1052,9 +1142,10 @@ function fetchUrl(url, { headers = {}, file = null, timeout = 30000, redirects =
 		const u = new URL(url);
 		const go = (socket) => {
 			const req = httpsRequest({
-				host: u.hostname, port: Number(u.port) || 443, path: u.pathname + u.search, method: 'GET', timeout, agent: false,
+				host: u.hostname, port: Number(u.port) || 443, path: u.pathname + u.search, method: 'GET', timeout,
 				headers: { host: u.hostname, 'User-Agent': 'DroidAgent-updater', ...headers },
-				...(socket ? { createConnection: () => socket } : {}),
+				// createConnection is ignored whenever an agent is set, so only go agent-less directly.
+				...(socket ? { createConnection: () => socket } : { agent: false }),
 			}, (res) => {
 				if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
 					res.resume();
@@ -1357,7 +1448,7 @@ async function startLogin() {
 	const route = await ensureNetwork((text) => status(text));
 	if (request !== loginRequest) return;
 	if (route.changed) status(`已自动改用本机代理 ${route.proxy}`, { proxy: route.proxy, kind: 'ok' });
-	else if (!route.ok) status(`连不上 Claude 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方「网络代理」填写代理软件的 HTTP 端口。`, { kind: 'warn' });
+	else if (!route.ok) status(`连不上 Claude 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方填写代理软件的 HTTP 端口。`, { kind: 'warn' });
 	const rt = await claudeRuntime();
 	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
 	// The program chat uses first, then anything else that starts. With nothing that passed
@@ -1459,6 +1550,8 @@ const MIME = {
 	'.jpg': 'image/jpeg',
 	'.jpeg': 'image/jpeg',
 	'.ico': 'image/x-icon',
+	'.woff2': 'font/woff2',
+	'.woff': 'font/woff',
 };
 
 function body(req) {
@@ -1574,6 +1667,13 @@ const server = createServer(async (req, res) => {
 			if (decision === 'allow') p.resolve({ behavior: 'allow', updatedInput: p.input });
 			else p.resolve({ behavior: 'deny', message: '用户拒绝了这个操作', interrupt: decision === 'stop' });
 			broadcast({ type: 'permission_resolved', sessionId: sid, id: permId, decision });
+			// An approved plan means "do it": leave Plan mode the way Claude Code does, into Accept edits.
+			if (decision === 'allow' && p.toolName === 'ExitPlanMode' && settings.mode === 'plan') {
+				settings.mode = 'acceptEdits';
+				await persistSettings();
+				for (const r of runtimes.values()) { try { r.q.setPermissionMode?.('default'); } catch { /* */ } }
+				broadcast({ type: 'settings', settings });
+			}
 			return json(res, { ok: true });
 		}
 
@@ -1779,7 +1879,8 @@ const server = createServer(async (req, res) => {
 		// Settings API — these are app-wide, so push live changes to every open conversation, not just one.
 		if (req.method === 'POST' && path === '/api/settings') {
 			const next = await body(req);
-			for (const k of Object.keys(settings)) if (k in next) settings[k] = next[k];
+			if ('mode' in next && !MODES.includes(next.mode)) delete next.mode; // unknown mode: keep the current one
+			for (const k of SETTING_KEYS) if (k in next) settings[k] = next[k];
 			await persistSettings();
 			for (const rt of runtimes.values()) {
 				try { if (settings.mode === 'plan') rt.q.setPermissionMode?.('plan'); else rt.q.setPermissionMode?.('default'); } catch { /* */ }
@@ -2008,6 +2109,44 @@ const server = createServer(async (req, res) => {
 			return json(res, { ok: true });
 		}
 
+		// ---- Fonts (fetched slice by slice on first use, then served from disk) ----
+		const fm = path.match(/^\/fonts\/([a-z0-9-]+)\/(.+)$/);
+		if (fm && req.method === 'GET') {
+			try {
+				const file = await fontFile(fm[1], decodeURIComponent(fm[2]));
+				if (!file) { res.writeHead(404); return res.end(); }
+				res.writeHead(200, { 'content-type': MIME[extname(file)] || (file.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream'), 'cache-control': 'public, max-age=31536000, immutable' });
+				return res.end(await readFile(file));
+			} catch (e) {
+				log('[fonts]', fm[1], fm[2], e?.message);
+				res.writeHead(502); return res.end();
+			}
+		}
+
+		// ---- Chat background ----
+		if (path === '/api/background' && req.method === 'GET') {
+			try {
+				const data = await readFile(BG_FILE);
+				const type = data[0] === 0x89 ? 'image/png' : data[0] === 0x52 ? 'image/webp' : data[0] === 0x47 ? 'image/gif' : 'image/jpeg';
+				res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache' });
+				return res.end(data);
+			} catch { res.writeHead(404); return res.end(); }
+		}
+		if (path === '/api/background' && req.method === 'POST') {
+			const { dataUrl } = await body(req);
+			const m = /^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/.exec(String(dataUrl || ''));
+			if (!m) return json(res, { ok: false, error: '只支持 PNG / JPG / WebP / GIF 图片' }, 400);
+			const buf = Buffer.from(m[2], 'base64');
+			if (buf.length > 12e6) return json(res, { ok: false, error: '图片太大（超过 12 MB）' }, 400);
+			await mkdir(dirname(BG_FILE), { recursive: true });
+			await writeFile(BG_FILE, buf);
+			return json(res, { ok: true, v: Date.now() });
+		}
+		if (path === '/api/background/clear' && req.method === 'POST') {
+			await rm(BG_FILE, { force: true });
+			return json(res, { ok: true });
+		}
+
 		return serveStatic(req, res);
 	} catch (e) {
 		log('http error', e?.message || e);
@@ -2016,6 +2155,7 @@ const server = createServer(async (req, res) => {
 });
 
 await initSessions();
+await seedBuiltinSkills().catch((e) => log('[skills] seeding failed', e?.message));
 server.listen(PORT, HOST, () => {
 	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
 	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks

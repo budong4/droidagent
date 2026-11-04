@@ -33,7 +33,7 @@
 ```
 
 - **真 root**：chroot 里绑定挂载了安卓真实的 `/data`、`/system`、`/proc`、`/dev` 等，agent 能看到并操作整台手机。
-- **App 样式**：不是终端套壳，是自建的聊天前端，有多会话并发、斜杠命令、实时待办、权限确认卡片、亮/暗主题、账号/用量面板。
+- **App 样式**：不是终端套壳，是自建的聊天前端，有多会话并发、斜杠命令、实时待办、权限确认卡片、和 Claude Code 一致的执行模式（Ask / Accept edits / Plan / Auto / Full access）、输入框里的用量环、11 套主题（纯色和原创插画）、7 种开源字体和自定义聊天背景。
 - **跑在手机本地**：后端 Node 服务监听 `127.0.0.1:8787`，APK 用 WebView 加载它。
 
 ## 前置条件
@@ -76,7 +76,7 @@ adb install -r apk/DroidAgent.apk
 
 `.github/workflows/apk.yml` 在每次推送到 `main` 时构建更新版 APK（不含 Linux 系统，约 7 MB）和 Root 管理器更新包，并以版本号发布到 Releases（`v<版本>`，标为预发布）。之后手机上的更新方式就是：打开 Releases，下载最新的 `DroidAgent-<版本>.apk` 直接安装，App 启动时会自动同步聊天程序和运行时。
 
-**自动更新**：手机上的后台服务（root，常驻）启动 2 分钟后和之后每小时检查一次（读取 Releases 里「自动更新通道」的 latest.json，不受 GitHub 接口限流影响），发现更高版本就下载 APK、核对 GitHub 公布的 sha256、用 `pm install` 静默安装（安卓会拒绝签名不同的包），再把新的启动器、聊天程序和运行时同步进 Linux 环境并重启服务；装的时候 App 若开着，会自动重新打开。正在进行的对话不会被打断，会等它结束再装。设置 → 更新 里可以关掉自动安装（改为只提示）或手动检查。需要仓库是公开的（手机不带 GitHub 凭据）。发布新版本时，同时修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode` 并在 `CHANGELOG.md` 加一节；版本号没变的推送不会覆盖已发布的包。
+**自动更新**：手机上的后台服务（root，常驻）启动 2 分钟后和之后每小时检查一次（读取 Releases 里「自动更新通道」的 latest.json，不受 GitHub 接口限流影响），发现更高版本就下载 APK、核对 GitHub 公布的 sha256、用 `pm install` 静默安装（安卓会拒绝签名不同的包），再把新的启动器、聊天程序和运行时同步进 Linux 环境并重启服务；装的时候 App 若开着，会自动重新打开。正在进行的对话不会被打断，会等它结束再装。设置 → 通用 里可以关掉自动安装（改为只提示）或手动检查。需要仓库是公开的（手机不带 GitHub 凭据）。发布新版本时，同时修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode` 并在 `CHANGELOG.md` 加一节；版本号没变的推送不会覆盖已发布的包。
 
 一次性设置：安卓只接受同一签名的更新，所以 CI 必须用当初签名手机上那个 APK 的密钥。在构建过那个 APK 的电脑上，把 `apk/debug.keystore` 转成 base64，存为仓库的 Actions Secret `ANDROID_KEYSTORE_BASE64`（仓库 Settings → Secrets and variables → Actions）。Windows PowerShell：
 
@@ -133,18 +133,20 @@ debian retools                               装逆向分析工具链
 - 登录失败时界面会显示 `claude` 实际报的错。完整输出在 chroot 里的 `~/.claude/agent-login.log`。
 - 新版 Claude Code 是用 Bun 编译的原生程序，在部分安卓内核上一启动就崩溃（`Bun has crashed`，信号 6）。后台启动时会逐个试：全局 `claude`、SDK 自带的 `claude`、以上两者关闭 JIT（`JavaScriptCoreUseJIT=0`），最后是跑在 Node.js 上的 Claude Code 2.1.112（最后一个纯 JavaScript 版本，随 APK 和更新包一起提供）。第一个能启动的同时用于登录和对话。日志 `/var/log/agent-app.log` 里的 `[runtime]` 行会写明试了哪些、用的是哪个。
 - 手机开着 VPN、浏览器能打开登录页，不代表 Linux 环境里的 `claude` 也能连上：很多 VPN（尤其是分应用代理模式）不转发 root 进程的流量，结果就是卡在「正在验证授权码」。现在每次登录前会先测试能否连上 `platform.claude.com` 和 `api.anthropic.com`；连不上时会自动查找本机代理端口（Clash 7890/7897、NekoBox 2080、v2rayNG 10809 等），找到能用的就自动保存。
-- 也可以手动在登录页底部的「网络代理」（或 设置 → 网络代理）填写代理软件的本地 HTTP 端口，例如 `http://127.0.0.1:7890`；保存时会立即测试能否连上。
+- 自动检测失败时，登录页底部会出现代理输入框，可以手动填写代理软件的本地 HTTP 端口，例如 `http://127.0.0.1:7890`；保存时会立即测试能否连上。
 
 > 开机自启：把 `optional/99-debian-agent.sh` 放到 `/data/adb/service.d/` 即可（KernelSU/Magisk 的 service.d）。
 
 ## 配置
 
-- **代理**（访问 Anthropic API）：App 里 设置 → 网络代理（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录和对话都会使用）。
-- **系统提示词 / Skills / MCP**：在 App 的设置里管理，下一条消息生效。
-- **用量与额度**：直接读取 claude.ai 的用量接口（和 Claude Code 自己的 `/usage` 同一个），不依赖 SDK 版本，也不需要先开始对话。
+- **代理**（访问 Anthropic API）：登录前自动检测；检测不到时在登录页手动填写（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录、对话、字体下载和自动更新都会使用）。
+- **执行模式**（输入框左下角）：Ask（只读操作直接做，其余逐步确认）、Accept edits（自动改文件和跑常规命令，有风险的先问，默认）、Plan（只读分析，先出计划，同意后执行）、Auto（只有刷机、重启、格式化等高危操作才问）、Full access（不再询问，切换时确认一次）。
+- **系统提示词 / 技能 / MCP**：在 App 的设置里管理，下一条消息生效。内置 8 个安卓常用技能（手机体检、存储清理、应用管理、屏幕自动化、日志诊断、网络诊断、APK 分析、备份与恢复），首次启动自动启用；关掉或改过的不会被更新覆盖。
+- **外观**：设置 → 外观 里选主题、字体和聊天背景（自己的图片，带可调遮罩）。字体第一次使用时按需下载用到的字，之后缓存在 `~/.claude/fonts`。
+- **用量与额度**：输入框右下角的圆环是 5 小时窗口的用量，点开看每周额度和重置时间。直接读取 claude.ai 的用量接口（和 Claude Code 自己的 `/usage` 同一个），不依赖 SDK 版本，也不需要先开始对话。
 - **登录权限**：登录链接总是申请最新版 Claude Code 的完整授权范围（含 `user:plugins`），不管手机上跑的是哪个版本；在 设置 → 账号 里可以看到当前登录的授权范围是否完整。
-- **个人数据开关**：默认关闭；打开后读联系人/短信/相册等仍会逐次弹确认。
-- **悬浮窗**：任务跳到别的应用时自动浮出进度，回到对话自动收起（可在设置里总开关）。
+- **个人数据**：联系人、短信、相册等在 Ask 和 Accept edits 模式下逐次确认。
+- **悬浮窗**：任务跳到别的应用时自动浮出进度，回到对话自动收起。
 
 ## 目录结构
 
