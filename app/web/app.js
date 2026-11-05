@@ -654,7 +654,7 @@ function upsertTodo(todos) {
 	scroll();
 }
 
-const VERDICT = { allow: '已允许', deny: '已拒绝', stop: '已停止' };
+const VERDICT = { allow: '已允许', deny: '已拒绝', stop: '已停止', expired: '已失效（服务重启过，需要的话重新发一次）' };
 function addPermission(p) {
 	endAssistant();
 	killWelcome();
@@ -1451,6 +1451,9 @@ function connect() {
 		const mine = !m.sessionId || m.sessionId === curSession?.id;
 		switch (m.type) {
 			case 'hello':
+				// A fresh connection: forget what the last one said was running (after a restart
+				// those turns are gone); the session list right below says what still is.
+				runningIds.clear(); pendingIds.clear(); setRunning(false);
 				applySettings(m.settings);
 				if (m.activeSession) { curSession = m.activeSession; renderTranscript(curSession); }
 				showUpdateNotice(m.lastUpdate); // after the redraw, which would wipe it

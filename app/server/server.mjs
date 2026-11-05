@@ -31,6 +31,12 @@ unlink(LEGACY_TOKEN_FILE).catch(() => {}); // narrower-scoped and unused now; fi
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+// One stray error (a promise nobody awaited, a socket error with no listener) must not take
+// down every conversation on the phone. Record it with its stack and keep serving; the launcher
+// still restarts the service if it ever does exit.
+process.on('unhandledRejection', (e) => log('[bug] unhandled rejection:', e?.stack || e));
+process.on('uncaughtException', (e) => log('[bug] uncaught exception:', e?.stack || e));
+
 // ---------------------------------------------------------------- settings & persistence
 const SETTINGS_FILE = join(homedir(), '.claude', 'agent-settings.json');
 const settings = {
@@ -89,8 +95,24 @@ let activeSessionId = null;
 async function getOrLoadSessionObj(id) {
 	if (sessionCache.has(id)) return sessionCache.get(id);
 	const loaded = await loadSession(id);
-	if (loaded) sessionCache.set(id, loaded);
+	if (loaded) {
+		markInterrupted(loaded);
+		sessionCache.set(id, loaded);
+	}
 	return loaded;
+}
+
+// A conversation read from disk has no live turn (a running one is always in the cache), so a
+// step still marked running, or a confirmation never answered, was cut off when the service
+// stopped. Say so instead of leaving a spinner that never ends.
+function markInterrupted(sess) {
+	let changed = false;
+	for (const m of sess.messages || []) {
+		if (m.role === 'tool' && m.state === 'running' && m.kind !== 'todo') {
+			m.state = 'err'; m.ok = false; m.summary = (m.summary ? m.summary + '\n' : '') + '（服务中途重启，这一步没有完成）'; changed = true;
+		} else if (m.role === 'perm' && !m.verdict) { m.verdict = 'expired'; changed = true; }
+	}
+	if (changed) saveSession(sess);
 }
 
 async function ensureSessionsDir() {
@@ -103,16 +125,33 @@ async function ensureSessionsDir() {
 // This phone has come back from reboots with recently-written files full of NULs — the size
 // was recorded but the blocks were never flushed. rename() alone only guarantees that readers
 // see one version or the other, so the data is forced to disk before the rename.
-async function writeJsonAtomic(path, value) {
-	const tmp = `${path}.tmp`;
-	const fh = await open(tmp, 'w');
-	try {
-		await fh.writeFile(JSON.stringify(value, null, 2), 'utf8');
-		await fh.sync();
-	} finally {
-		await fh.close();
-	}
-	await rename(tmp, path);
+//
+// Writes of one file run one at a time. A turn saves its conversation on every event, often
+// several in the same instant (parallel tool calls, an answered confirmation): two writes
+// sharing the temp file made the second rename fail with ENOENT, and as nobody awaited those
+// saves, the rejection took the whole service down mid-conversation.
+const fileLocks = new Map(); // key -> tail of its queue
+function withLock(key, fn) {
+	const prev = fileLocks.get(key) || Promise.resolve();
+	const run = prev.catch(() => {}).then(fn);
+	const tail = run.catch(() => {});
+	fileLocks.set(key, tail);
+	tail.then(() => { if (fileLocks.get(key) === tail) fileLocks.delete(key); });
+	return run;
+}
+let tmpSeq = 0;
+function writeJsonAtomic(path, value) {
+	return withLock(path, async () => {
+		const tmp = `${path}.${process.pid}.${++tmpSeq}.tmp`;
+		const fh = await open(tmp, 'w');
+		try {
+			await fh.writeFile(JSON.stringify(value, null, 2), 'utf8'); // serialized now, so the newest state
+			await fh.sync();
+		} finally {
+			await fh.close();
+		}
+		try { await rename(tmp, path); } catch (e) { await rm(tmp, { force: true }).catch(() => {}); throw e; }
+	});
 }
 
 function sessionMeta(sess) {
@@ -182,21 +221,27 @@ async function loadSession(id) {
 	}
 }
 
+// Called fire-and-forget from the turn loop, so it must never reject: a failed save is logged,
+// the conversation keeps going (it is still in memory, and the next event saves it again).
 async function saveSession(sess) {
 	if (!sess || !sess.id) return;
-	await ensureSessionsDir();
-	sess.updatedAt = Date.now();
-	await writeJsonAtomic(join(SESSIONS_DIR, `${sess.id}.json`), sess);
-
-	const idx = await loadSessionsIndex();
-	const existing = idx.findIndex((s) => s.id === sess.id);
-	const meta = sessionMeta(sess);
-	if (existing >= 0) {
-		idx[existing] = meta;
-	} else {
-		idx.unshift(meta);
+	try {
+		await ensureSessionsDir();
+		sess.updatedAt = Date.now();
+		await writeJsonAtomic(join(SESSIONS_DIR, `${sess.id}.json`), sess);
+		// Read-modify-write of the shared index: one at a time, or two conversations saving
+		// together would each write back an index missing the other's change.
+		await withLock('sessions-index', async () => {
+			const idx = await loadSessionsIndex();
+			const existing = idx.findIndex((s) => s.id === sess.id);
+			const meta = sessionMeta(sess);
+			if (existing >= 0) idx[existing] = meta;
+			else idx.unshift(meta);
+			await saveSessionsIndex(idx);
+		});
+	} catch (e) {
+		log('[sessions] save failed', sess.id, e?.message || e);
 	}
-	await saveSessionsIndex(idx);
 }
 
 async function createNewSession(title = '新对话') {
@@ -1769,9 +1814,11 @@ const server = createServer(async (req, res) => {
 			try {
 				await unlink(join(SESSIONS_DIR, `${id}.json`));
 			} catch {}
-			const idx = await loadSessionsIndex();
-			const nextIdx = idx.filter((s) => s.id !== id);
-			await saveSessionsIndex(nextIdx);
+			const nextIdx = await withLock('sessions-index', async () => {
+				const list = (await loadSessionsIndex()).filter((s) => s.id !== id);
+				await saveSessionsIndex(list);
+				return list;
+			});
 
 			let switched = null;
 			if (activeSessionId === id) {

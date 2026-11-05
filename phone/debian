@@ -186,10 +186,17 @@ app_start() {
 	[ -f "$ROOT$APP_DIR/server/server.mjs" ] || die "app not installed at $ROOT$APP_DIR (push it from the PC)"
 	[ -d "$ROOT$APP_DIR/server/node_modules" ] || die "app deps missing (run: debian appdeps)"
 	mkdir -p "$ROOT/var/log"
+	# The previous run's log is kept as .1, so what happened before a restart can still be read.
+	[ -f "$ROOT/var/log/agent-app.log" ] && mv -f "$ROOT/var/log/agent-app.log" "$ROOT/var/log/agent-app.log.1"
+	# Supervised: if the server ever exits, it is started again (sooner the longer it had been
+	# up, so a server that cannot start does not spin). The loop's own command line names
+	# server.mjs too, so app_pids/app_stop find and stop the loop together with the server.
 	"$B" nohup "$B" setsid "$B" chroot "$ROOT" /usr/bin/env -i -C /root \
 		HOME=/root USER=root LOGNAME=root SHELL=/bin/bash LANG=C.UTF-8 \
 		TERM=dumb PATH="$CHROOT_PATH" AGENT_HOST="$APP_HOST" AGENT_PORT="$APP_PORT" \
-		/usr/local/bin/node "$APP_DIR/server/server.mjs" \
+		/bin/sh -c "wait_s=2; while :; do t0=\$(date +%s); /usr/local/bin/node $APP_DIR/server/server.mjs; code=\$?; \
+			[ \$((\$(date +%s) - t0)) -gt 60 ] && wait_s=2 || wait_s=\$((wait_s < 30 ? wait_s * 2 : 30)); \
+			echo \"\$(date -u +%Y-%m-%dT%H:%M:%SZ) [supervisor] server exited with code \$code, starting again in \${wait_s}s\"; sleep \$wait_s; done" \
 		</dev/null >"$ROOT/var/log/agent-app.log" 2>&1 &
 	sleep 3
 	[ -n "$(app_pids)" ] || { tail -15 "$ROOT/var/log/agent-app.log"; die "app failed to start"; }
