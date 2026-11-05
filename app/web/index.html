@@ -10,7 +10,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=9">
+	<link rel="stylesheet" href="style.css?v=10">
 	<!-- applies the saved theme and font before the first paint -->
 	<script src="themes.js?v=8"></script>
 </head>
@@ -40,7 +40,6 @@
 			<symbol id="i-app" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/></symbol>
 			<symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 015.5 5H9l2 2.5h7.5A2.5 2.5 0 0121 10v7.5a2.5 2.5 0 01-2.5 2.5h-13A2.5 2.5 0 013 17.5z"/></symbol>
 			<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5"/></symbol>
-			<symbol id="i-path" viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></symbol>
 			<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
 			<symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.4" fill="currentColor"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="19" cy="12" r="1.4" fill="currentColor"/></symbol>
 			<symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 4h6l-1 6 4 3v2H6v-2l4-3zM12 15v6"/></symbol>
@@ -91,6 +90,7 @@
 
 		<footer id="composer">
 			<div id="slash-menu" class="slash-menu hidden"></div>
+			<div id="queue-box" class="queue-box hidden" aria-label="排队的消息"></div>
 			<div id="activity" class="activity hidden" role="status" aria-live="polite"><svg class="ic act-ic"><use href="#i-spark"/></svg><span id="act-label">正在思考</span><span id="act-time" class="act-time">0 秒</span></div>
 			<div id="scope-container" class="scope-container hidden"></div>
 			<div class="composer-card">
@@ -114,11 +114,8 @@
 	<div id="menu-attach" class="menu hidden" role="menu">
 		<div class="tiles">
 			<button class="tile" data-act="album"><span class="tile-ic"><svg class="ic"><use href="#i-image"/></svg></span>相册</button>
-			<button class="tile" data-act="shot"><span class="tile-ic"><svg class="ic"><use href="#i-shot"/></svg></span>截屏</button>
+			<button class="tile" data-act="files"><span class="tile-ic"><svg class="ic"><use href="#i-folder"/></svg></span>文件</button>
 			<button class="tile" data-act="app"><span class="tile-ic"><svg class="ic"><use href="#i-app"/></svg></span>应用</button>
-			<button class="tile" data-act="folder"><span class="tile-ic"><svg class="ic"><use href="#i-folder"/></svg></span>文件夹</button>
-			<button class="tile" data-act="file"><span class="tile-ic"><svg class="ic"><use href="#i-file"/></svg></span>文件</button>
-			<button class="tile" data-act="path"><span class="tile-ic"><svg class="ic"><use href="#i-path"/></svg></span>路径</button>
 		</div>
 	</div>
 
@@ -288,16 +285,16 @@
 		<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="apps-search" type="search" placeholder="搜索应用名或包名" autocomplete="off"></label>
 		<div id="apps-list" class="sheet-list"></div>
 	</section>
-	<section id="sheet-fs" class="sheet hidden" aria-label="选择文件">
+	<section id="sheet-fs" class="sheet hidden" aria-label="选择文件或文件夹">
 		<div class="grip"></div>
-		<div class="sheet-head"><h3 id="fs-title">选择文件夹</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
-		<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="fs-search" type="search" placeholder="在当前文件夹里搜索" enterkeyhint="search" autocomplete="off"></label>
+		<div class="sheet-head"><h3 id="fs-title">选择文件或文件夹</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
+		<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="fs-search" type="search" placeholder="搜索当前文件夹，或输入路径" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
 		<div class="fs-presets">
 			<button data-path="/sdcard">内部存储</button><button data-path="/sdcard/Download">下载</button><button data-path="/sdcard/DCIM">相机</button><button data-path="/data/local/tmp">本地临时</button><button data-path="/root">Linux 主目录</button>
 		</div>
 		<div class="fs-nav"><button id="fs-up" class="icon-btn sm" aria-label="上一级"><svg class="ic sm"><use href="#i-back"/></svg></button><span id="fs-path" class="fs-path">/sdcard</span></div>
 		<div id="fs-list" class="sheet-list"></div>
-		<button id="fs-select-dir" class="primary">选择这个文件夹</button>
+		<button id="fs-select-dir" class="primary">使用这个文件夹</button>
 	</section>
 
 	<!-- ===== dialog & toast ===== -->
@@ -306,7 +303,6 @@
 		<h3 id="dialog-title"></h3>
 		<p id="dialog-msg"></p>
 		<input id="dialog-input" type="text" class="hidden" autocomplete="off" autocapitalize="off" spellcheck="false">
-		<div id="dialog-presets" class="presets hidden"><button data-v="/sdcard/">/sdcard/</button><button data-v="/sdcard/Download/">/sdcard/Download/</button><button data-v="/data/local/tmp/">/data/local/tmp/</button><button data-v="/root/">/root/</button></div>
 		<div class="dialog-btns"><button id="dialog-cancel" class="text-btn">取消</button><button id="dialog-ok" class="text-btn">确定</button></div>
 	</div>
 	<div id="toast" class="toast hidden" role="status"></div>
@@ -351,7 +347,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=11"></script>
+	<script src="app.js?v=12"></script>
 	<script src="market.js?v=5"></script>
 </body>
 </html>

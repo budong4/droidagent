@@ -509,11 +509,80 @@ function restartRuntimesWhenIdle() {
 	for (const rt of runtimes.values()) rt.restartWhenIdle = true;
 }
 
-// A conversation as the page needs it: with the reply still being written, which joins `messages`
-// only once finished. Without it a page opened mid-reply loses everything written so far.
+// Messages sent during a turn wait here, in the owner's sight, until it ends. They join the
+// conversation only when they go out, so it reads in the order things happened. Kept in memory: an
+// update waits for quiet, so only a crash of this server can lose them.
+const queues = new Map(); // conversation id -> [{ id, text, scopes }]
+const heldQueues = new Set(); // Stop was pressed: what waits doesn't start by itself
+const delivering = new Set(); // a message on its way out, its runtime possibly still starting
+
+function broadcastQueue(id) {
+	broadcast({ type: 'queue', sessionId: id, queue: queues.get(id) || [], held: heldQueues.has(id) });
+}
+function forgetQueue(id) {
+	queues.delete(id);
+	heldQueues.delete(id);
+}
+
+// One user message into its conversation and on to Claude Code.
+async function deliverMessage(id, { text, scopes = [] }, { fromQueue = false } = {}) {
+	delivering.add(id);
+	try {
+		const sess = await getOrLoadSessionObj(id);
+		if (!sess) throw new Error('session not found: ' + id);
+		// Format title from first message
+		if (sess.messages.length === 0 || sess.title === '新对话') sess.title = autoTitleOf(text);
+		sess.messages.push({ role: 'user', text, scopes, time: Date.now() });
+		await saveSession(sess);
+		const rt = await ensureRuntime(id);
+		rt.since = Date.now();
+		rt.label = '正在思考';
+		rt.running = true;
+		rt.lastActive = Date.now();
+		broadcast({ type: 'user_echo', sessionId: id, text, session: sess, ...(fromQueue ? { fromQueue: true } : {}) });
+		rt.pushUser(text);
+	} finally {
+		delivering.delete(id);
+	}
+}
+
+// The turn is over: the next in line goes out.
+function drainQueue(id) {
+	const q = queues.get(id);
+	if (!q?.length || heldQueues.has(id) || delivering.has(id) || runtimes.get(id)?.running) return;
+	const item = q.shift();
+	if (!q.length) queues.delete(id);
+	broadcastQueue(id);
+	deliverMessage(id, item, { fromQueue: true }).catch((e) => {
+		// Back in line, and it stays there: retrying by itself could go on for ever.
+		log('[queue] could not send', id.slice(0, 8), e?.message);
+		queues.set(id, [item, ...(queues.get(id) || [])]);
+		heldQueues.add(id);
+		broadcastQueue(id);
+		broadcast({ type: 'error', sessionId: id, message: `排队的消息没能发出：${e?.message || e}` });
+	});
+}
+
+// Ends the turn in progress and any confirmation it is waiting on.
+function interruptTurn(id) {
+	const rt = runtimes.get(id);
+	tell(() => rt?.q?.interrupt?.());
+	for (const [permId, p] of rt?.pending || []) {
+		p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
+		closePermission(id, permId, 'stop');
+	}
+}
+
+// A conversation as the page needs it, with what `messages` doesn't hold yet: the reply or thinking
+// still being written (without it a page opened midway loses everything so far), and what waits.
 function forPage(sess) {
-	const liveText = sess && runtimes.get(sess.id)?.assistantText;
-	return liveText ? { ...sess, liveText } : sess;
+	if (!sess) return sess;
+	const rt = runtimes.get(sess.id);
+	const extra = {};
+	if (rt?.assistantText) extra.liveText = rt.assistantText;
+	if (rt?.thinking?.text) extra.liveThinking = rt.thinking.text;
+	if (queues.get(sess.id)?.length) { extra.queue = queues.get(sess.id); extra.queueHeld = heldQueues.has(sess.id); }
+	return Object.keys(extra).length ? { ...sess, ...extra } : sess;
 }
 
 // Closes a confirmation card, here and in the saved conversation, whoever answered it.
@@ -785,6 +854,7 @@ async function startRuntime(id) {
 		if (runtimes.get(id) !== started) return;
 		if (started.running) broadcast({ type: 'error', sessionId: id, message: 'Claude Code 意外退出了，再发一次就能继续' });
 		teardownRuntime(id);
+		drainQueue(id);
 	}, (e) => {
 		log('session error', id, e?.message || e);
 		// A process stopped on purpose can fail on its way out, after the next one has taken over.
@@ -792,12 +862,21 @@ async function startRuntime(id) {
 		if (runtimes.get(id) !== started) return;
 		broadcast({ type: 'error', sessionId: id, message: String(e?.message || e) });
 		teardownRuntime(id);
+		drainQueue(id);
 	});
 	return rt;
 }
 
 async function consume(id, q, rt) {
 	let sawDelta = false;
+	let sawThinkDelta = false;
+	const endThinking = (sess) => {
+		const t = rt.thinking;
+		rt.thinking = null;
+		const ms = Date.now() - t.start;
+		if (sess && t.text.trim()) { sess.messages.push({ role: 'think', text: t.text, ms, time: Date.now() }); saveSession(sess); }
+		broadcast({ type: 'thinking_end', sessionId: id, ms });
+	};
 	for await (const m of q) {
 		rt.lastActive = Date.now();
 		const sess = sessionCache.get(id);
@@ -827,10 +906,7 @@ async function consume(id, q, rt) {
 				rt.label = '正在思考';
 				broadcast({ type: 'thinking_start', sessionId: id });
 			} else if (ev?.type === 'content_block_stop' && rt.thinking) {
-				const t = rt.thinking; rt.thinking = null;
-				const ms = Date.now() - t.start;
-				if (sess && t.text.trim()) { sess.messages.push({ role: 'think', text: t.text, ms, time: Date.now() }); saveSession(sess); }
-				broadcast({ type: 'thinking_end', sessionId: id, ms });
+				endThinking(sess);
 			} else if (ev?.type === 'content_block_delta') {
 				if (ev.delta?.type === 'text_delta' && ev.delta.text) {
 					sawDelta = true;
@@ -838,6 +914,7 @@ async function consume(id, q, rt) {
 					rt.label = '正在回复';
 					broadcast({ type: 'assistant_delta', sessionId: id, text: ev.delta.text });
 				} else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
+					sawThinkDelta = true;
 					rt.label = '正在思考';
 					if (rt.thinking) rt.thinking.text += ev.delta.thinking;
 					broadcast({ type: 'thinking_delta', sessionId: id, text: ev.delta.thinking });
@@ -870,9 +947,16 @@ async function consume(id, q, rt) {
 						saveSession(sess);
 					}
 					broadcast({ type: 'assistant_text', sessionId: id, text: block.text });
+				} else if (block.type === 'thinking' && block.thinking && !sawThinkDelta) {
+					// Not streamed (Claude Code falling back to a plain request): it arrives whole.
+					if (sess) { sess.messages.push({ role: 'think', text: block.thinking, ms: 0, time: Date.now() }); saveSession(sess); }
+					broadcast({ type: 'thinking_start', sessionId: id });
+					broadcast({ type: 'thinking_delta', sessionId: id, text: block.thinking });
+					broadcast({ type: 'thinking_end', sessionId: id, ms: 0 });
 				}
 			}
 			sawDelta = false;
+			sawThinkDelta = false;
 		} else if (m.type === 'user') {
 			for (const block of m.message?.content || []) {
 				if (block.type === 'tool_result') {
@@ -895,6 +979,7 @@ async function consume(id, q, rt) {
 			rt.label = '';
 			const tookMs = rt.since ? Date.now() - rt.since : (m.duration_ms || 0);
 			rt.since = 0;
+			if (rt.thinking) endThinking(sess); // stopped mid-thought: no block_stop will come
 			if (rt.assistantText && sess) {
 				sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
 				rt.assistantText = '';
@@ -910,6 +995,7 @@ async function consume(id, q, rt) {
 			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype, errors: m.errors });
 			announceSkillDrafts(id).catch((e) => log('[skills] draft scan', e?.message));
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
+			drainQueue(id);
 		}
 	}
 }
@@ -2326,21 +2412,45 @@ const server = createServer(async (req, res) => {
 			const sess = await getOrLoadSessionObj(id);
 			if (!sess) return json(res, { ok: false, error: 'session not found' }, 404);
 
-			// Format title from first message
-			if (sess.messages.length === 0 || sess.title === '新对话') sess.title = autoTitleOf(str);
-
-			// Not the picture itself: this file is rewritten on every event of every turn from now on.
+			// Not the picture itself: the conversation's file is rewritten on every event of every turn.
 			const kept = (Array.isArray(scopes) ? scopes : []).map(({ dataUrl, ...s }) => s);
-			sess.messages.push({ role: 'user', text: str, scopes: kept, time: Date.now() });
-			await saveSession(sess);
+			if (runtimes.get(id)?.running || delivering.has(id)) {
+				const q = queues.get(id) || [];
+				q.push({ id: randomUUID(), text: str, scopes: kept });
+				queues.set(id, q);
+				broadcastQueue(id);
+				return json(res, { ok: true, queued: true });
+			}
+			heldQueues.delete(id); // the owner is back: what waits follows this one
+			await deliverMessage(id, { text: str, scopes: kept });
+			return json(res, { ok: true, queued: false });
+		}
 
-			const rt = await ensureRuntime(id);
-			if (!rt.running) { rt.since = Date.now(); rt.label = '正在思考'; }
-			rt.running = true;
-			rt.lastActive = Date.now();
-			broadcast({ type: 'user_echo', sessionId: id, text: str, session: sess });
-			rt.pushUser(str); // queues even if this conversation is still mid-turn — multiple messages in flight is fine
+		// A message in line goes now: ahead of the others, stopping the turn in progress if there is one.
+		if (req.method === 'POST' && path === '/api/queue/send-now') {
+			const { sessionId, id: itemId } = await body(req);
+			const sid = sessionId || activeSessionId;
+			const q = queues.get(sid);
+			const at = q ? q.findIndex((x) => x.id === itemId) : -1;
+			if (at < 0) return json(res, { ok: false, error: '这条消息已经不在队列里了' }, 404);
+			q.unshift(...q.splice(at, 1));
+			heldQueues.delete(sid);
+			broadcastQueue(sid);
+			if (runtimes.get(sid)?.running) interruptTurn(sid); // its result sends the next in line
+			else drainQueue(sid);
 			return json(res, { ok: true });
+		}
+		// Taken back before it went out. The page puts it in the input box again.
+		if (req.method === 'POST' && path === '/api/queue/remove') {
+			const { sessionId, id: itemId } = await body(req);
+			const sid = sessionId || activeSessionId;
+			const q = queues.get(sid);
+			const at = q ? q.findIndex((x) => x.id === itemId) : -1;
+			if (at < 0) return json(res, { ok: false, error: '这条消息已经发出去了' }, 404);
+			const [item] = q.splice(at, 1);
+			if (!q.length) forgetQueue(sid);
+			broadcastQueue(sid);
+			return json(res, { ok: true, text: item.text, scopes: item.scopes });
 		}
 
 		// Tool permission decision — routed to the specific conversation's own pending map.
@@ -2350,6 +2460,7 @@ const server = createServer(async (req, res) => {
 			const rt = sid && runtimes.get(sid);
 			const p = rt?.pending.get(permId);
 			if (!p) return json(res, { ok: false, error: 'gone' }, 404);
+			if (decision === 'stop' && queues.get(sid)?.length) { heldQueues.add(sid); broadcastQueue(sid); }
 			if (decision === 'allow') p.resolve({ behavior: 'allow', updatedInput: p.input });
 			else p.resolve({ behavior: 'deny', message: '用户拒绝了这个操作', interrupt: decision === 'stop' });
 			closePermission(sid, permId, decision);
@@ -2368,12 +2479,9 @@ const server = createServer(async (req, res) => {
 		if (req.method === 'POST' && path === '/api/stop') {
 			const { sessionId } = await body(req);
 			const sid = sessionId || activeSessionId;
-			const rt = sid && runtimes.get(sid);
-			tell(() => rt?.q?.interrupt?.());
-			for (const [permId, p] of rt?.pending || []) {
-				p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
-				closePermission(sid, permId, 'stop');
-			}
+			// Stop means stop: what waits in line stays there until the owner says otherwise.
+			if (queues.get(sid)?.length) { heldQueues.add(sid); broadcastQueue(sid); }
+			if (sid) interruptTurn(sid);
 			return json(res, { ok: true });
 		}
 
@@ -2457,6 +2565,7 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/sessions/delete' && req.method === 'POST') {
 			const { id } = await body(req);
 			if (!id) return json(res, { ok: false, error: 'no id' }, 400);
+			forgetQueue(id); // first: tearing the runtime down must not send what waits
 			teardownRuntime(id);
 			sessionCache.delete(id);
 			try {
@@ -2478,14 +2587,16 @@ const server = createServer(async (req, res) => {
 					switched = await createNewSession('新对话');
 					activeSessionId = switched.id;
 				}
-				broadcast({ type: 'session_switched', session: switched });
+				broadcast({ type: 'session_switched', session: forPage(switched) });
 			}
 			broadcast({ type: 'sessions_updated', sessions: nextIdx });
-			return json(res, { ok: true, activeSession: switched || (activeSessionId ? sessionCache.get(activeSessionId) : null) });
+			return json(res, { ok: true, activeSession: forPage(switched || (activeSessionId ? sessionCache.get(activeSessionId) : null)) });
 		}
 
 		// Clear ALL history — this is the one case that legitimately ends every open conversation.
 		if (path === '/api/sessions/clear' && req.method === 'POST') {
+			queues.clear();
+			heldQueues.clear();
 			for (const id of [...runtimes.keys()]) teardownRuntime(id);
 			sessionCache.clear();
 			const files = await readdir(SESSIONS_DIR).catch(() => []);
@@ -2510,9 +2621,17 @@ const server = createServer(async (req, res) => {
 			const targetPath = url.searchParams.get('path') || '/sdcard';
 			const q = (url.searchParams.get('q') || '').trim();
 			try {
-				const resolved = resolve(targetPath);
-				const st = await stat(resolved);
-				if (!st.isDirectory()) return json(res, { ok: false, error: 'not a directory' }, 400);
+				let resolved = resolve(targetPath);
+				let st = await stat(resolved).catch(() => null);
+				// A path typed or pasted into the search box: a file shows itself in its folder, and a
+				// name still being typed shows what it could become.
+				let startsWith = null;
+				if (!st?.isDirectory()) {
+					startsWith = basename(resolved).toLowerCase();
+					resolved = dirname(resolved);
+					st = await stat(resolved).catch(() => null);
+					if (!st?.isDirectory()) return json(res, { ok: false, error: '没有这个路径' }, 400);
+				}
 
 				let items;
 				if (q) {
@@ -2521,7 +2640,7 @@ const server = createServer(async (req, res) => {
 					const entries = await readdir(resolved, { withFileTypes: true });
 					items = [];
 					for (const ent of entries) {
-						if (ent.name.startsWith('.')) continue;
+						if (startsWith !== null ? !ent.name.toLowerCase().startsWith(startsWith) : ent.name.startsWith('.')) continue;
 						items.push(await fsItem(join(resolved, ent.name), ent.name));
 					}
 				}
@@ -2534,6 +2653,7 @@ const server = createServer(async (req, res) => {
 					currentPath: resolved,
 					parentPath: dirname(resolved),
 					searched: !!q,
+					filtered: startsWith !== null,
 					items: items.slice(0, 300),
 				});
 			} catch (e) {
@@ -2552,23 +2672,6 @@ const server = createServer(async (req, res) => {
 			const buffer = Buffer.from(matches[2], 'base64');
 			await writeFile(uploadPath, buffer);
 			return json(res, { ok: true, path: uploadPath, filename: filename || basename(uploadPath) });
-		}
-
-		// Screenshot Capture API
-		if (path === '/api/screenshot' && req.method === 'POST') {
-			const shotPath = `/tmp/agent-screen-${randomUUID()}.png`;
-			exec(`droid shot -o ${shotPath}`, { timeout: 8000 }, async (err) => {
-				if (err) {
-					// Fallback to screencap
-					exec(`ashell screencap -p ${shotPath}`, { timeout: 6000 }, (e2) => {
-						if (e2) return json(res, { ok: false, error: 'screenshot failed' }, 500);
-						return json(res, { ok: true, path: shotPath, filename: '当前屏幕截图.png' });
-					});
-				} else {
-					return json(res, { ok: true, path: shotPath, filename: '当前屏幕截图.png' });
-				}
-			});
-			return;
 		}
 
 		// Settings API — these are app-wide, so push live changes to every open conversation, not just one.
@@ -3023,6 +3126,7 @@ const server = createServer(async (req, res) => {
 				c.on('error', () => { clearTimeout(t); resolve(); });
 			});
 			// A running conversation holds the token in memory and would carry on as the old account.
+			for (const id of [...queues.keys()]) { forgetQueue(id); broadcastQueue(id); }
 			for (const id of [...runtimes.keys()]) teardownRuntime(id);
 			usageCache = { t: 0, data: null };
 			broadcast({ type: 'auth', loggedIn: false });

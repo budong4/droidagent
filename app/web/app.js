@@ -138,14 +138,13 @@ $$('[data-page]').forEach((b) => b.addEventListener('click', () => openPage(b.da
 
 /* ---------------- dialog ---------------- */
 let dialogOk = null;
-function showDialog({ title, msg = '', html = false, input: withInput = false, value = '', presets = false, ok = '确定', cancel = '取消', danger = false, onOk }) {
+function showDialog({ title, msg = '', html = false, input: withInput = false, value = '', ok = '确定', cancel = '取消', danger = false, onOk }) {
 	$('#dialog-title').textContent = title;
 	const m = $('#dialog-msg');
 	if (html) m.innerHTML = msg; else m.textContent = msg;
 	const inp = $('#dialog-input');
 	inp.classList.toggle('hidden', !withInput);
 	inp.value = value;
-	$('#dialog-presets').classList.toggle('hidden', !presets);
 	$('#dialog-ok').textContent = ok;
 	$('#dialog-ok').classList.toggle('danger', danger);
 	$('#dialog-cancel').textContent = cancel;
@@ -164,7 +163,6 @@ $('#dialog-ok').addEventListener('click', () => {
 	if (fn) fn(v);
 });
 $('#dialog-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#dialog-ok').click(); } });
-$$('#dialog-presets button').forEach((b) => b.addEventListener('click', () => { $('#dialog-input').value = b.dataset.v; $('#dialog-input').focus(); }));
 
 /* ---------------- toast ---------------- */
 let toastTimer = null;
@@ -577,6 +575,13 @@ const toolEls = new Map();
 
 function atBottom() { return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 140; }
 function scroll(force) { if (force || atBottom()) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; }); }
+// For text that keeps growing. Whether the reader is following is decided before it grows: asked
+// afterwards, one big piece (or a slow phone) looks like they scrolled away, and following stops.
+function growing(change) {
+	const follow = atBottom();
+	change();
+	if (follow) thread.scrollTop = thread.scrollHeight;
+}
 function killWelcome() { const w = $('#welcome'); if (w) w.remove(); }
 
 function addUser(text) {
@@ -587,6 +592,7 @@ function addUser(text) {
 	e.appendChild(b);
 	thread.appendChild(e);
 	scroll(true);
+	return e;
 }
 function ensureAssistant() {
 	if (curAssistant) return curAssistant;
@@ -600,8 +606,8 @@ function ensureAssistant() {
 	scroll(true);
 	return curAssistant;
 }
-function appendAssistant(text) { const a = ensureAssistant(); a.raw += text; a.el.innerHTML = md(a.raw); scroll(); }
-function setAssistant(text) { const a = ensureAssistant(); a.raw = text; a.el.innerHTML = md(a.raw); scroll(); }
+function appendAssistant(text) { const a = ensureAssistant(); a.raw += text; growing(() => { a.el.innerHTML = md(a.raw); }); }
+function setAssistant(text) { const a = ensureAssistant(); a.raw = text; growing(() => { a.el.innerHTML = md(a.raw); }); }
 // "12 秒", "1 分 05 秒"
 function fmtSecs(ms) {
 	const t = Math.max(0, Math.round((ms || 0) / 1000));
@@ -711,9 +717,8 @@ function startThink() {
 }
 function addThinkDelta(text) {
 	const t = startThink();
-	t.body.textContent += text;
-	t.body.scrollTop = t.body.scrollHeight;
-	if (t.card.classList.contains('open')) scroll();
+	if (t.card.classList.contains('open')) growing(() => { t.body.textContent += text; });
+	else t.body.textContent += text;
 }
 function closeThinkCard(card, ms, hasText) {
 	card.classList.remove('live', 'open');
@@ -853,8 +858,40 @@ function renderTranscript(sess) {
 		}
 	}
 	for (const c of thread.children) c.classList.add('static'); // history appears at once, only new messages animate in
-	if (sess?.liveText) appendAssistant(sess.liveText); // opened mid-reply: what is already written
+	// Opened midway: what is already written.
+	if (sess?.liveThinking) addThinkDelta(sess.liveThinking);
+	if (sess?.liveText) appendAssistant(sess.liveText);
+	renderQueue(sess?.queue, sess?.queueHeld);
 	thread.scrollTop = thread.scrollHeight;
+}
+
+/* ---------------- messages waiting for the turn in progress ---------------- */
+function renderQueue(list = [], held = false) {
+	const box = $('#queue-box');
+	box.innerHTML = '';
+	box.classList.toggle('hidden', !list.length);
+	for (const item of list) {
+		const row = el('div', 'queue-row', `<div class="queue-text"><span class="queue-tag">${held ? '已暂停，等你发送' : '排队中'}</span><span class="queue-msg"></span></div><div class="queue-acts"><button class="pill-btn accent queue-now">立即发送</button><button class="pill-btn queue-undo">撤回</button></div>`);
+		$('.queue-msg', row).textContent = typedText(item.text);
+		$('.queue-now', row).addEventListener('click', async (e) => {
+			e.currentTarget.disabled = true;
+			if (running && curSession) stoppedIds.add(curSession.id); // the turn it ends was ended on purpose
+			const r = await api('/api/queue/send-now', { sessionId: curSession?.id, id: item.id });
+			if (!r.ok) toast(r.error || '发送失败');
+		});
+		$('.queue-undo', row).addEventListener('click', async () => {
+			const r = await api('/api/queue/remove', { sessionId: curSession?.id, id: item.id });
+			if (!r.ok) { toast(r.error || '撤回失败'); return; }
+			if (input.value.trim()) { toast('已撤回'); return; } // never over what is being typed
+			input.value = typedText(r.text);
+			attachedScopes = r.scopes || [];
+			renderScopes();
+			autosize();
+			updateSendState();
+			input.focus();
+		});
+		box.appendChild(row);
+	}
 }
 
 /* ---------------- running state & composer ---------------- */
@@ -914,7 +951,7 @@ input.addEventListener('keydown', (e) => {
 });
 
 let attachedScopes = [];
-const SCOPE_ICON = { app: 'i-app', folder: 'i-folder', file: 'i-file', path: 'i-path', image: 'i-image' };
+const SCOPE_ICON = { app: 'i-app', folder: 'i-folder', file: 'i-file', image: 'i-image' };
 function addScope(scope) {
 	if (!attachedScopes.some((s) => s.type === scope.type && (s.path === scope.path && s.package === scope.package))) {
 		attachedScopes.push(scope);
@@ -952,11 +989,14 @@ async function send() {
 	if (attachedScopes.length) {
 		const lines = attachedScopes.map((s) => ({
 			app: `- 手机应用: ${s.name} (${s.package})`, folder: `- 目标文件夹: ${s.path}`, file: `- 目标文件: ${s.path}`,
-			path: `- 自定义路径: ${s.path}`, image: `- 附件图片: ${s.path}`,
+			image: `- 附件图片: ${s.path}`,
 		}[s.type] || '')).filter(Boolean).join('\n');
 		fullPrompt = `【指定操作范围与上下文】\n${lines}\n\n【用户指令】\n${rawText || '请根据上述指定的上下文进行分析或处理。'}`;
 	}
-	addUser(rawText || fullPrompt);
+	// A turn in progress: the server puts it in line and the queue above the input shows it; it joins
+	// the thread when it goes out. The server decides, so the two guesses below get put right.
+	const shown = rawText || fullPrompt;
+	let bubble = running ? null : addUser(shown);
 	input.value = '';
 	autosize();
 	hideSlash();
@@ -964,14 +1004,18 @@ async function send() {
 	const scopes = attachedScopes.map(({ dataUrl, ...s }) => s); // the picture is already on the phone
 	attachedScopes = [];
 	renderScopes();
+	const wasRunning = running;
 	runningIds.add(sid);
 	setRunning(true);
 	if (!activity.on) setActivity('正在思考');
 	const r = await api('/api/send', { text: fullPrompt, scopes, sessionId: sid });
 	if (!r.ok) {
-		runningIds.delete(sid);
-		if (curSession?.id === sid) setRunning(false);
+		if (!wasRunning) { runningIds.delete(sid); if (curSession?.id === sid) setRunning(false); }
 		sysline('发送失败：' + (r.error || '连不上助手服务'));
+	} else if (r.queued && bubble) {
+		bubble.remove(); bubble = null;
+	} else if (!r.queued && !bubble && curSession?.id === sid) {
+		bubble = addUser(shown);
 	}
 	fetchSessions();
 }
@@ -1050,12 +1094,16 @@ function clearInput() { input.value = ''; autosize(); updateSendState(); }
 function chooseSlash(kind, name) {
 	hideSlash();
 	const app = kind === 'app' && appCommand(name);
-	const cc = kind === 'cc' && slashCommands.find((c) => c.name === name);
-	if ((app && app.hint) || (cc && cc.argumentHint)) { input.value = `/${name} `; autosize(); updateSendState(); input.focus(); return; }
-	if (app) { clearInput(); app.run(''); return; }
-	input.value = '/' + name; // a Claude Code command: send it as it is
-	send();
+	// The app's own commands happen here and now. Anything going to Claude waits in the input box:
+	// a skill usually needs a sentence saying what to do with it, and sending is the owner's call.
+	if (app && !app.hint) { clearInput(); app.run(''); return; }
+	input.value = `/${name} `;
+	autosize();
+	updateSendState();
+	input.focus();
 }
+// A tap on the menu keeps the input focused, or the keyboard would drop and come back.
+$('#slash-menu').addEventListener('mousedown', (e) => e.preventDefault());
 // A typed "/status" (etc.) is handled here instead of being sent; true when it was.
 function runAppCommand(text) {
 	const m = /^\/([\w:-]+)(?:\s+([\s\S]*))?$/.exec(text);
@@ -1143,23 +1191,9 @@ $$('#menu-attach .tile').forEach((t) => t.addEventListener('click', () => {
 	const act = t.dataset.act;
 	closeMenu();
 	if (act === 'album') $('#file-image').click();
-	else if (act === 'shot') takeShot();
 	else if (act === 'app') openAppsSheet();
-	else if (act === 'folder') openFsSheet(true);
-	else if (act === 'file') openFsSheet(false);
-	else if (act === 'path') {
-		showDialog({
-			title: '添加路径', msg: '输入手机里的绝对路径：', input: true, value: '/sdcard/', presets: true, ok: '添加',
-			onOk: (v) => { if (v && v.trim()) addScope({ type: 'path', path: v.trim() }); },
-		});
-	}
+	else if (act === 'files') openFsSheet();
 }));
-async function takeShot() {
-	toast('正在截屏…');
-	const r = await api('/api/screenshot');
-	if (r.ok) { addScope({ type: 'image', name: '屏幕截图', path: r.path }); toast('截图已添加'); }
-	else toast('截屏失败：' + (r.error || ''));
-}
 $('#file-image').addEventListener('change', (e) => {
 	const f = e.target.files[0];
 	e.target.value = '';
@@ -1204,14 +1238,13 @@ $('#apps-search').addEventListener('input', (e) => {
 });
 
 /* ---------------- file picker ---------------- */
-let fsFolderMode = true;
+// One place for both: tap a file to pick it, tap a folder to go in, and the button uses the folder
+// you are in. A path pasted into the search box goes straight there.
 let curFsPath = '/sdcard';
 let parentFsPath = '/';
+let fsSeq = 0;
 const FS_ICON = { 图片: 'i-image', APK: 'i-box', 文本: 'i-doc', 代码: 'i-terminal' };
-function openFsSheet(folderMode) {
-	fsFolderMode = folderMode;
-	$('#fs-title').textContent = folderMode ? '选择文件夹' : '选择文件';
-	$('#fs-select-dir').textContent = folderMode ? '选择这个文件夹' : '把这个文件夹作为范围';
+function openFsSheet() {
 	$('#fs-search').value = '';
 	openSheet('sheet-fs');
 	loadFsPath('/sdcard');
@@ -1221,12 +1254,14 @@ async function loadFsPath(p, q) {
 	list.innerHTML = '<div class="empty-state"><span class="spin"></span></div>';
 	let u = `/api/fs?path=${encodeURIComponent(p)}`;
 	if (q) u += `&q=${encodeURIComponent(q)}`;
+	const seq = ++fsSeq;
 	const r = await getJSON(u);
+	if (seq !== fsSeq) return; // typed on meanwhile
 	if (!r.ok) { list.innerHTML = `<div class="empty-state">打不开这个文件夹：${esc(r.error || '')}</div>`; return; }
 	if (!q) { curFsPath = r.currentPath; parentFsPath = r.parentPath; $('#fs-path').textContent = curFsPath; }
 	const items = r.items || [];
 	list.innerHTML = '';
-	if (!items.length) { list.innerHTML = `<div class="empty-state">${q ? '没有匹配的文件' : '这个文件夹是空的'}</div>`; return; }
+	if (!items.length) { list.innerHTML = `<div class="empty-state">${q || r.filtered ? '没有匹配的文件' : '这个文件夹是空的'}</div>`; return; }
 	const frag = document.createDocumentFragment();
 	items.forEach((item) => {
 		const row = el('div', 'pick-row');
@@ -1247,7 +1282,7 @@ let fsSearchTimer = null;
 $('#fs-search').addEventListener('input', (e) => {
 	clearTimeout(fsSearchTimer);
 	const q = e.target.value.trim();
-	fsSearchTimer = setTimeout(() => loadFsPath(curFsPath, q || undefined), 350);
+	fsSearchTimer = setTimeout(() => (q.startsWith('/') ? loadFsPath(q) : loadFsPath(curFsPath, q || undefined)), 350);
 });
 
 /* ================================================================ conversations drawer */
@@ -1699,6 +1734,7 @@ function connect() {
 			case 'sessions_updated': sessionsList = m.sessions || []; renderSidebar(); break;
 			case 'user_echo':
 				if (m.sessionId) runningIds.add(m.sessionId);
+				if (mine && m.fromQueue) addUser(typedText(m.text)); // its turn came: it joins the thread now
 				if (mine) { setRunning(true); if (!activity.on) setActivity('正在思考'); fetchSessions(); } else renderSidebar();
 				break;
 			case 'assistant_delta': if (mine) { appendAssistant(m.text); setActivity('正在回复'); } break;
@@ -1745,6 +1781,7 @@ function connect() {
 				runningIds.clear(); pendingIds.clear();
 				break;
 			case 'settings': applySettings(m.settings); break;
+			case 'queue': if (mine) renderQueue(m.queue, m.held); break;
 			case 'skills_updated': loadSlashCommands(); break;
 			case 'mcp_updated': break;
 			case 'plugins_updated': case 'plugin_job': case 'skill_draft': case 'mcp_login_url': case 'mcp_login_done':
