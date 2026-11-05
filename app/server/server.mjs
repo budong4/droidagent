@@ -339,38 +339,81 @@ const TOOL_CN = {
 	Read: '读取文件', Write: '写入文件', Edit: '修改文件', MultiEdit: '批量修改',
 	NotebookRead: '读取笔记本', NotebookEdit: '编辑笔记本',
 	Glob: '查找文件', Grep: '搜索内容', LS: '列出目录',
-	WebSearch: '联网搜索', WebFetch: '抓取网页',
-	Task: '子任务', TodoWrite: '更新待办', ExitPlanMode: '结束计划',
+	WebSearch: '联网搜索', WebFetch: '打开网页',
+	Task: '子任务', Agent: '子任务', TodoWrite: '更新待办', ExitPlanMode: '提交计划', Skill: '使用技能',
 	AskUserQuestion: '向你提问',
 };
+// What kind of step it is, shown small next to the plain-language title.
+function toolCategory(name) {
+	if (name === 'Bash' || name === 'BashOutput' || name === 'KillShell') return '命令';
+	if (/^(Read|NotebookRead|LS)$/.test(name)) return '读取';
+	if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name)) return '修改文件';
+	if (/^(Glob|Grep)$/.test(name)) return '查找';
+	if (/^(WebSearch|WebFetch)$/.test(name)) return '联网';
+	if (name === 'Skill') return '技能';
+	if (name === 'Task' || name === 'Agent') return '子任务';
+	if (String(name).startsWith('mcp__')) return 'MCP';
+	return '工具';
+}
 
-/** A short, human label for what a Bash command actually does. */
-function bashTitle(cmd) {
-	const c = String(cmd || '').trim();
+// Plain-language names for the commands this agent runs most; the model's own description of a
+// command (asked for in Chinese, see APP_PROMPT) comes first.
+const BASH_WORDS = [
+	[/^droid\s+(shot|screencap)/, '截取手机屏幕'], [/^droid\s+ui/, '读取屏幕上的控件'], [/^droid\s+tap/, '点击屏幕'],
+	[/^droid\s+(swipe|scroll)/, '滑动屏幕'], [/^droid\s+(text|key)/, '输入文字'], [/^droid\s+app/, '打开应用'], [/^droid\b/, '操作屏幕'],
+	[/^pdata\s+sms/, '读取短信'], [/^pdata\s+(contacts?|people)/, '读取通讯录'], [/^pdata\s+(calls?|calllog)/, '读取通话记录'],
+	[/^pdata\s+(photos?|media|images?)/, '读取相册'], [/^pdata\b/, '读取个人数据'], [/^clip\b/, '读写剪贴板'],
+	[/^dumpsys\s+battery/, '查看电池状态'], [/^dumpsys\s+(batterystats|power)/, '查看耗电情况'], [/^dumpsys\s+(meminfo|procstats)/, '查看内存占用'],
+	[/^dumpsys\s+(wifi|connectivity|netstats)/, '查看网络状态'], [/^dumpsys\s+package/, '查看应用信息'], [/^dumpsys\b/, '读取系统服务信息'],
+	[/\/sys\/class\/(thermal|power_supply)|thermal_zone/, '读取温度'], [/\/proc\/meminfo|\bfree\b/, '查看内存'], [/\/proc\/cpuinfo|\/sys\/devices\/system\/cpu/, '查看 CPU 信息'],
+	[/^df\b/, '查看存储空间'], [/^du\b/, '统计文件夹大小'], [/^(ls|tree)\b/, '列出文件'], [/^(cat|head|tail|less|more)\b/, '查看文件内容'],
+	[/^(grep|rg|egrep)\b/, '搜索文本'], [/^find\b/, '查找文件'], [/^pm\s+list\s+packages/, '列出已安装的应用'], [/^pm\s+(uninstall|disable)/, '卸载或停用应用'],
+	[/^pm\s+(clear)/, '清除应用数据'], [/^pm\b|^cmd\s+package/, '管理应用'], [/^am\s+(start|broadcast)/, '打开应用页面'], [/^am\s+(force-stop|kill)/, '停止应用'],
+	[/^getprop\b/, '读取系统属性'], [/^settings\s+get/, '读取系统设置'], [/^settings\s+put/, '修改系统设置'], [/^logcat\b/, '读取系统日志'],
+	[/^(ps|top|pgrep)\b/, '查看运行中的进程'], [/^(kill|pkill|killall)\b/, '结束进程'], [/^ping\b/, '测试网络连通'], [/^(curl|wget)\b/, '访问网址'],
+	[/^(ip|ifconfig|netstat|ss)\b/, '查看网络连接'], [/^(nslookup|dig|host)\b/, '查询域名'], [/^rm\b/, '删除文件'], [/^mv\b/, '移动文件'], [/^cp\b/, '复制文件'],
+	[/^mkdir\b/, '新建文件夹'], [/^(tar|unzip|zip|gzip|7z)\b/, '打包或解压'], [/^(python3?|node|bash|sh)\b/, '运行脚本'], [/^(apt|apt-get|pip3?|npm)\b/, '安装软件'],
+	[/^(aapt2?|apktool|jadx|unzip\s.*\.apk)\b/, '分析安装包'], [/^(stat|file|md5sum|sha256sum)\b/, '查看文件信息'], [/^(uptime|uname|date)\b/, '查看系统信息'],
+	[/^(for|while)\b/, '批量执行'], [/^(echo|printf)\b/, '输出信息'], [/^(reboot|svc\s+power)/, '重启手机'],
+];
+function bashTitle(cmd, description) {
+	const d = String(description || '').trim();
+	if (d) return d.length > 40 ? d.slice(0, 39) + '…' : d;
+	let c = String(cmd || '').trim();
 	if (!c) return '运行命令';
-	if (/^droid\s+(shot|screencap)/.test(c)) return '截取手机屏幕';
-	if (/^droid\s+ui/.test(c)) return '读取屏幕控件';
-	if (/^droid\s+tap/.test(c)) return '点击屏幕';
-	if (/^droid\s+(swipe|scroll)/.test(c)) return '滑动屏幕';
-	if (/^droid\s+(text|key)/.test(c)) return '输入文字';
-	if (/^droid\s+app/.test(c)) return '打开应用';
-	if (/^pdata\b/.test(c)) return '读取个人数据';
-	if (/^clip\b/.test(c)) return '读写剪贴板';
-	if (/^ashell\b/.test(c)) return '执行安卓命令';
-	return `运行 ${firstWords(c, 6)}`;
+	c = c.replace(/^(cd\s+\S+\s*(&&|;)\s*)+/, '').replace(/^(sudo|su\s+-c|env(\s+\w+=\S+)*)\s+/, '').replace(/^ashell\s+(-c\s+)?["']?/, '');
+	for (const [re, label] of BASH_WORDS) if (re.test(c)) return label;
+	return '执行命令';
+}
+
+// Installed skills by id -> their readable name ("手机体检"), for "使用技能「…」" step titles.
+const skillNames = new Map();
+async function refreshSkillNames() {
+	try {
+		for (const sk of await listSkills()) {
+			const m = /^([^。.]{2,10})[。.]/.exec(sk.description || '');
+			skillNames.set(sk.id, m ? m[1] : sk.name);
+		}
+	} catch { /* keep the old names */ }
 }
 
 function toolTitle(name, input) {
-	if (name === 'Bash') return bashTitle(input?.command);
-	if (/^(Write|Edit|MultiEdit)$/.test(name)) return `${name === 'Write' ? '写入' : '修改'} ${base(readPath(input))}`;
-	if (name === 'Read') return `读取 ${base(readPath(input))}`;
-	if (name === 'Glob') return `查找 ${input?.pattern || '文件'}`;
-	if (name === 'Grep') return `搜索 ${input?.pattern || ''}`;
-	if (name === 'WebSearch') return `搜索 ${input?.query || ''}`;
-	if (name === 'WebFetch') return `抓取 ${input?.url || ''}`;
+	if (name === 'Bash') return bashTitle(input?.command, input?.description);
+	if (name === 'Write') return `新建或覆盖 ${base(readPath(input))}`;
+	if (/^(Edit|MultiEdit|NotebookEdit)$/.test(name)) return `修改 ${base(readPath(input))}`;
+	if (name === 'Read' || name === 'NotebookRead') return `查看 ${base(readPath(input))}`;
+	if (name === 'LS') return `列出 ${base(readPath(input)) || '目录'} 里的文件`;
+	if (name === 'Glob') return `查找文件 ${input?.pattern || ''}`.trim();
+	if (name === 'Grep') return `在文件里搜索「${String(input?.pattern || '').slice(0, 24)}」`;
+	if (name === 'WebSearch') return `上网搜索「${String(input?.query || '').slice(0, 30)}」`;
+	if (name === 'WebFetch') { try { return `打开网页 ${new URL(input?.url).hostname}`; } catch { return '打开网页'; } }
 	if (name === 'TodoWrite') return '更新待办清单';
-	if (name === 'Task') return `子任务${input?.subagent_type ? ` · ${input.subagent_type}` : ''}`;
-	if (String(name).startsWith('mcp__')) return `MCP · ${String(name).split('__').slice(1).join(' · ')}`;
+	if (name === 'Skill') {
+		const id = String(input?.skill || input?.command || input?.name || '').replace(/^\//, '');
+		return `使用技能「${skillNames.get(id) || id || '技能'}」`;
+	}
+	if (name === 'Task' || name === 'Agent') return input?.description ? `子任务：${input.description}` : '派出子任务';
+	if (String(name).startsWith('mcp__')) { const [, srv, tool] = String(name).split('__'); return `调用 ${srv} 的 ${tool || '工具'}`; }
 	return TOOL_CN[name] || name;
 }
 function toolDetail(name, input) {
@@ -462,6 +505,17 @@ function getSdkModel(m) {
 }
 
 // ---- Eta-parity config loaders (system prompt / skills / MCP) ----
+// Always appended: the person watching reads the steps, mostly not command lines.
+const APP_PROMPT = `## 在 DroidAgent App 里工作
+- 用户在手机 App 里看着你的每一步，大多数人看不懂命令行。调用 Bash 工具时，description 参数一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「统计下载文件夹大小」「打开微信」，不要把命令本身写进去。
+- 用户用什么语言提问，就用什么语言回答。`;
+// Older models take a fixed budget instead of adaptive thinking.
+function thinkingFor(model) {
+	const m = String(model || '');
+	if (/haiku-4|sonnet-4\.5|opus-4\.[015]\b/.test(m)) return { type: 'enabled', budgetTokens: 8000, display: 'summarized' };
+	return { type: 'adaptive', display: 'summarized' };
+}
+
 function loadSystemPromptAppend() {
 	try {
 		const t = readFileSync(SYSTEM_PROMPT_FILE, 'utf8').trim();
@@ -577,6 +631,7 @@ async function ensureRuntime(id) {
 			return { behavior: 'deny', message: p.reason + '（用户的设置不允许）', interrupt: false };
 		}
 		const permId = randomUUID();
+		if (rt) rt.label = '等你确认';
 		broadcast({ type: 'permission', sessionId: id, id: permId, name: toolName, title: p.title, detail: p.detail, reason: p.reason });
 		sess.messages.push({ role: 'perm', id: permId, name: toolName, title: p.title, detail: p.detail, reason: p.reason, verdict: null, time: Date.now() });
 		saveSession(sess);
@@ -589,13 +644,16 @@ async function ensureRuntime(id) {
 		});
 	};
 
-	const append = loadSystemPromptAppend();
+	const append = [APP_PROMPT, loadSystemPromptAppend()].filter(Boolean).join('\n\n');
 	const skillIds = await enabledSkillIds();
 	const mcpServers = await loadMcpServers();
 	const queryOpts = {
 		cwd: CWD,
 		model: modelFor(chatSpec, settings.model),
 		effort: settings.effort || 'xhigh',
+		// Ask for the thinking text itself (summarized), not just its token count, so the app can
+		// show what Claude is weighing.
+		thinking: thinkingFor(settings.model),
 		fastMode: !!settings.fastMode,
 		permissionMode: settings.mode === 'plan' ? 'plan' : 'default',
 		includePartialMessages: true,
@@ -635,16 +693,36 @@ async function consume(id, q, rt) {
 				saveSession(sess);
 			}
 			broadcast({ type: 'session', sessionId: id, claudeSessionId: m.session_id, model: m.model });
+		} else if (m.type === 'system' && m.subtype === 'local_command_output') {
+			// What a slash command such as /context or /cost printed.
+			const text = String(m.content || '').trim();
+			if (text && sess) { sess.messages.push({ role: 'cmdout', text, time: Date.now() }); saveSession(sess); }
+			if (text) broadcast({ type: 'command_output', sessionId: id, text });
+		} else if (m.type === 'system' && m.subtype === 'compact_boundary') {
+			const md = m.compact_metadata || {};
+			const text = `对话已压缩${md.pre_tokens ? `（${Math.round(md.pre_tokens / 1000)}k${md.post_tokens ? ` → ${Math.round(md.post_tokens / 1000)}k` : ''} tokens）` : ''}`;
+			if (sess) { sess.messages.push({ role: 'sys', text, time: Date.now() }); saveSession(sess); }
+			broadcast({ type: 'notice', sessionId: id, text });
 		} else if (m.type === 'stream_event') {
 			const ev = m.event;
-			if (ev?.type === 'content_block_delta') {
+			if (ev?.type === 'content_block_start' && ev.content_block?.type === 'thinking') {
+				rt.thinking = { text: '', start: Date.now() };
+				rt.label = '正在思考';
+				broadcast({ type: 'thinking_start', sessionId: id });
+			} else if (ev?.type === 'content_block_stop' && rt.thinking) {
+				const t = rt.thinking; rt.thinking = null;
+				const ms = Date.now() - t.start;
+				if (sess && t.text.trim()) { sess.messages.push({ role: 'think', text: t.text, ms, time: Date.now() }); saveSession(sess); }
+				broadcast({ type: 'thinking_end', sessionId: id, ms });
+			} else if (ev?.type === 'content_block_delta') {
 				if (ev.delta?.type === 'text_delta' && ev.delta.text) {
 					sawDelta = true;
 					rt.assistantText += ev.delta.text;
 					rt.label = '正在回复';
 					broadcast({ type: 'assistant_delta', sessionId: id, text: ev.delta.text });
 				} else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
-					rt.label = '思考中';
+					rt.label = '正在思考';
+					if (rt.thinking) rt.thinking.text += ev.delta.thinking;
 					broadcast({ type: 'thinking_delta', sessionId: id, text: ev.delta.thinking });
 				}
 			} else if (ev?.type === 'message_stop') {
@@ -664,11 +742,11 @@ async function consume(id, q, rt) {
 					const isTodo = block.name === 'TodoWrite';
 					const todos = isTodo ? (block.input?.todos || []) : undefined;
 					if (sess) {
-						sess.messages.push({ role: 'tool', id: block.id, name: block.name, title, detail, state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}) });
+						sess.messages.push({ role: 'tool', id: block.id, name: block.name, title, detail, category: toolCategory(block.name), state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}) });
 						saveSession(sess);
 					}
 					rt.label = title;
-					broadcast({ type: 'tool_use', sessionId: id, id: block.id, name: block.name, title, detail, ...(isTodo ? { kind: 'todo', todos } : {}) });
+					broadcast({ type: 'tool_use', sessionId: id, id: block.id, name: block.name, title, detail, category: toolCategory(block.name), ...(isTodo ? { kind: 'todo', todos } : {}) });
 				} else if (block.type === 'text' && !sawDelta && block.text) {
 					if (sess) {
 						sess.messages.push({ role: 'assistant', text: block.text, time: Date.now() });
@@ -692,18 +770,79 @@ async function consume(id, q, rt) {
 						}
 					}
 					broadcast({ type: 'tool_result', sessionId: id, id: block.tool_use_id, ok: !block.is_error, summary: txt.slice(0, 4000) });
+					rt.label = '正在思考';
 				}
 			}
 		} else if (m.type === 'result') {
 			rt.running = false;
 			rt.label = '';
+			const tookMs = rt.since ? Date.now() - rt.since : (m.duration_ms || 0);
+			rt.since = 0;
 			if (rt.assistantText && sess) {
 				sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
 				rt.assistantText = '';
-				saveSession(sess);
 			}
-			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: m.duration_ms || 0, subtype: m.subtype });
+			if (sess) {
+				// How long this turn took, shown under its last reply.
+				for (let i = sess.messages.length - 1; i >= 0 && sess.messages[i].role !== 'user'; i--) {
+					if (sess.messages[i].role === 'assistant') { sess.messages[i].tookMs = tookMs; break; }
+				}
+				saveSession(sess);
+				maybeTitle(id); // name the conversation once it has its first answer
+			}
+			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype });
 		}
+	}
+}
+
+// ---------------------------------------------------------------- conversation titles
+// The first message gives a stand-in title; once the conversation has its first answer, a quick
+// one-off Haiku call names it. A title the owner typed is never replaced.
+const autoTitleOf = (text) => String(text || '').replace(/【.*?】/g, '').trim().slice(0, 24).replace(/\n/g, ' ') || '新对话';
+const TITLE_DIR = join(homedir(), '.claude', 'agent-titles');
+const titling = new Set();
+const cleanTitle = (t) => (String(t || '').split('\n').map((l) => l.trim()).find(Boolean) || '')
+	.replace(/^标题[:：]\s*/, '').replace(/[「」"“”'‘’《》#*`]/g, '').replace(/[。.!！?？,，、；;:：\s]+$/, '').slice(0, 20);
+async function generateTitle(userText, replyText) {
+	const runtime = await claudeRuntime();
+	if (!runtime.chat) return '';
+	const { query } = await loadSdkFor(runtime.chat);
+	await mkdir(TITLE_DIR, { recursive: true });
+	const clip = (t, n) => String(t || '').replace(/【指定操作范围与上下文】[\s\S]*?【用户指令】/, '').trim().slice(0, n);
+	const prompt = `给下面这段对话起一个标题：不超过 12 个汉字，概括用户想做的事；不要标点、引号、表情和解释，只输出标题本身。\n\n用户：${clip(userText, 800)}\n\n助手：${clip(replyText, 800)}`;
+	const q = query({
+		prompt,
+		options: {
+			cwd: TITLE_DIR, model: modelFor(runtime.chat, 'haiku'), maxTurns: 1, tools: [], settingSources: [],
+			systemPrompt: '你只负责给对话起简短的中文标题。', thinking: { type: 'disabled' },
+			...queryRuntimeOptions(runtime.chat),
+		},
+	});
+	const timer = setTimeout(() => { try { q.interrupt?.(); } catch { /* */ } }, 60000);
+	let out = '';
+	try { for await (const m of q) if (m.type === 'result') out = m.result || ''; } finally { clearTimeout(timer); }
+	return cleanTitle(out);
+}
+async function maybeTitle(id) {
+	const sess = sessionCache.get(id);
+	if (!sess || sess.titleSource || titling.has(id)) return;
+	const firstUser = sess.messages.find((m) => m.role === 'user');
+	const firstReply = sess.messages.find((m) => m.role === 'assistant');
+	if (!firstUser || !firstReply) return;
+	if (sess.title !== autoTitleOf(firstUser.text)) { sess.titleSource = 'user'; return; } // renamed by hand before
+	titling.add(id);
+	try {
+		const title = await generateTitle(firstUser.text, firstReply.text);
+		if (!title || sess.titleSource) return; // nothing usable, or renamed meanwhile
+		sess.title = title;
+		sess.titleSource = 'ai';
+		await saveSession(sess);
+		broadcast({ type: 'title', sessionId: id, title });
+		broadcast({ type: 'sessions_updated', sessions: await loadSessionsIndex() });
+	} catch (e) {
+		log('[title]', id.slice(0, 8), e?.message || e);
+	} finally {
+		titling.delete(id);
 	}
 }
 
@@ -1711,15 +1850,13 @@ const server = createServer(async (req, res) => {
 			if (!sess) return json(res, { ok: false, error: 'session not found' }, 404);
 
 			// Format title from first message
-			if (sess.messages.length === 0 || sess.title === '新对话') {
-				let cleanTitle = str.replace(/【.*?】/g, '').trim().slice(0, 24).replace(/\n/g, ' ') || '新对话';
-				sess.title = cleanTitle;
-			}
+			if (sess.messages.length === 0 || sess.title === '新对话') sess.title = autoTitleOf(str);
 
 			sess.messages.push({ role: 'user', text: str, scopes: scopes || [], time: Date.now() });
 			await saveSession(sess);
 
 			const rt = await ensureRuntime(id);
+			if (!rt.running) { rt.since = Date.now(); rt.label = '正在思考'; }
 			rt.running = true;
 			rt.lastActive = Date.now();
 			broadcast({ type: 'user_echo', sessionId: id, text: str, session: sess });
@@ -1783,7 +1920,10 @@ const server = createServer(async (req, res) => {
 			const idx = await loadSessionsIndex();
 			const runningIds = [...runtimes.entries()].filter(([, rt]) => rt.running).map(([sid]) => sid);
 			const pendingIds = [...runtimes.entries()].filter(([, rt]) => rt.pending.size > 0).map(([sid]) => sid);
+			// What each running conversation is doing and since when, so a reopened page can show it.
+			const activity = Object.fromEntries([...runtimes.entries()].filter(([, rt]) => rt.running).map(([sid, rt]) => [sid, { since: rt.since || 0, label: rt.label || '' }]));
 			return json(res, {
+				activity,
 				ok: true,
 				sessions: idx,
 				activeId: activeSessionId,
@@ -1832,6 +1972,7 @@ const server = createServer(async (req, res) => {
 			const s = await getOrLoadSessionObj(id);
 			if (!s) return json(res, { ok: false, error: 'not found' }, 404);
 			s.title = title.trim();
+			s.titleSource = 'user'; // never replaced by a generated one
 			await saveSession(s);
 			const idx = await loadSessionsIndex();
 			broadcast({ type: 'sessions_updated', sessions: idx });
@@ -2001,7 +2142,7 @@ const server = createServer(async (req, res) => {
 			try {
 				await installSkill(src);
 				for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-				broadcast({ type: 'skills_updated' });
+				broadcast({ type: 'skills_updated' }); refreshSkillNames();
 				return json(res, { ok: true, skills: await listSkills() });
 			} catch (e) {
 				return json(res, { ok: false, error: e?.message || '安装失败' }, 500);
@@ -2014,7 +2155,7 @@ const server = createServer(async (req, res) => {
 			if (enabled) state.enabled.push(id);
 			await writeSkillsState(state);
 			for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-			broadcast({ type: 'skills_updated' });
+			broadcast({ type: 'skills_updated' }); refreshSkillNames();
 			return json(res, { ok: true, skills: await listSkills() });
 		}
 		if (path === '/api/skills/delete' && req.method === 'POST') {
@@ -2025,7 +2166,7 @@ const server = createServer(async (req, res) => {
 			state.enabled = (state.enabled || []).filter((x) => x !== id);
 			await writeSkillsState(state);
 			for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-			broadcast({ type: 'skills_updated' });
+			broadcast({ type: 'skills_updated' }); refreshSkillNames();
 			return json(res, { ok: true, skills: await listSkills() });
 		}
 
@@ -2150,7 +2291,7 @@ const server = createServer(async (req, res) => {
 		// ---- Which program runs Claude Code here (diagnostics) ----
 		if (path === '/api/runtime' && req.method === 'GET') {
 			const r = await claudeRuntime();
-			return json(res, { ok: !!r.chat, chat: r.chat ? { label: r.chat.label, version: r.chat.version, env: r.chat.env } : null, tried: r.tried });
+			return json(res, { ok: !!r.chat, chat: r.chat ? { label: r.chat.label, version: r.chat.version, env: r.chat.env } : null, tried: r.tried, cwd: CWD, node: process.version });
 		}
 
 		// ---- Network proxy ----
@@ -2244,6 +2385,7 @@ const server = createServer(async (req, res) => {
 
 await initSessions();
 await seedBuiltinSkills().catch((e) => log('[skills] seeding failed', e?.message));
+await refreshSkillNames();
 server.listen(PORT, HOST, () => {
 	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
 	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks

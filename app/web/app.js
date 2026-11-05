@@ -602,12 +602,18 @@ function ensureAssistant() {
 }
 function appendAssistant(text) { const a = ensureAssistant(); a.raw += text; a.el.innerHTML = md(a.raw); scroll(); }
 function setAssistant(text) { const a = ensureAssistant(); a.raw = text; a.el.innerHTML = md(a.raw); scroll(); }
-function addMsgActions(wrap, raw) {
+// "12 秒", "1 分 05 秒"
+function fmtSecs(ms) {
+	const t = Math.max(0, Math.round((ms || 0) / 1000));
+	return t < 60 ? `${t} 秒` : `${Math.floor(t / 60)} 分 ${String(t % 60).padStart(2, '0')} 秒`;
+}
+function addMsgActions(wrap, raw, tookMs) {
 	if (!raw || !raw.trim()) return;
 	const acts = el('div', 'msg-acts');
 	const copy = el('button', 'msg-act', `${ic('i-copy')}<span>复制</span>`);
 	copy.addEventListener('click', () => copyText(raw));
 	acts.appendChild(copy);
+	if (tookMs) acts.appendChild(el('span', 'msg-meta', `用时 ${fmtSecs(tookMs)}`));
 	wrap.appendChild(acts);
 }
 function endAssistant() {
@@ -618,38 +624,58 @@ function endAssistant() {
 	}
 	endThink();
 }
-function addAssistantStatic(text) {
+function addAssistantStatic(text, tookMs) {
 	const wrap = el('div', 'msg assistant');
 	const body = el('div', 'md');
 	body.innerHTML = md(text || '');
 	wrap.appendChild(body);
-	addMsgActions(wrap, text);
+	addMsgActions(wrap, text, tookMs);
 	thread.appendChild(wrap);
 }
-
-function toolIcon(name, detail) {
-	const d = detail || '';
-	if (name === 'Bash') {
-		if (/droid (shot|ui|top)|screencap|uiautomator/.test(d)) return ic('i-shot');
-		if (/droid (tap|swipe|text|key|app)/.test(d)) return ic('i-tap');
-		return ic('i-terminal');
+// The turn's total time goes under its last reply.
+function markTurnTime(ms) {
+	if (!ms) return;
+	const kids = [...thread.children];
+	for (let i = kids.length - 1; i >= 0 && !kids[i].classList.contains('user'); i--) {
+		if (kids[i].classList.contains('assistant')) {
+			const acts = $('.msg-acts', kids[i]);
+			if (acts && !$('.msg-meta', acts)) acts.appendChild(el('span', 'msg-meta', `用时 ${fmtSecs(ms)}`));
+			return;
+		}
 	}
-	if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name)) return ic('i-pen');
-	if (name === 'Read' || name === 'NotebookRead') return ic('i-file');
-	if (/Glob|Grep|LS/.test(name)) return ic('i-search');
-	if (name === 'WebSearch' || name === 'WebFetch') return ic('i-globe');
-	if (name === 'Task' || name === 'Skill') return ic('i-layers');
-	if (name === 'TodoWrite') return ic('i-list');
-	return ic('i-spark');
 }
-function addTool(id, name, title, detail, replay) {
+
+/* ---------------- tool steps ---------------- */
+// Each step reads as what it does ("查看电池状态"); the command and its output are one tap away.
+function toolCategory(name) {
+	if (/^(Bash|BashOutput|KillShell)$/.test(name)) return '命令';
+	if (/^(Read|NotebookRead|LS)$/.test(name)) return '读取';
+	if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(name)) return '修改文件';
+	if (/^(Glob|Grep)$/.test(name)) return '查找';
+	if (/^(WebSearch|WebFetch)$/.test(name)) return '联网';
+	if (name === 'Skill') return '技能';
+	if (name === 'Task' || name === 'Agent') return '子任务';
+	if (String(name).startsWith('mcp__')) return 'MCP';
+	return '工具';
+}
+const CATEGORY_ICON = { 命令: 'i-terminal', 读取: 'i-file', 修改文件: 'i-pen', 查找: 'i-search', 联网: 'i-globe', 技能: 'i-layers', 子任务: 'i-layers', MCP: 'i-plug' };
+function toolIcon(name, detail, category) {
+	const d = detail || '';
+	if (name === 'Bash' && /droid (shot|ui|top)|screencap|uiautomator/.test(d)) return ic('i-shot');
+	if (name === 'Bash' && /droid (tap|swipe|text|key|app)/.test(d)) return ic('i-tap');
+	if (name === 'TodoWrite') return ic('i-list');
+	return ic(CATEGORY_ICON[category] || 'i-spark');
+}
+const DETAIL_LABEL = (name) => (name === 'Bash' ? '命令' : /^(Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead)$/.test(name) ? '文件' : '内容');
+function addTool(id, name, title, detail, replay, category) {
 	if (!replay) endAssistant();
 	killWelcome();
-	const bash = name === 'Bash' && !/droid (shot|ui|top|tap|swipe|text|key|app)|screencap|uiautomator/.test(detail || '');
-	const card = el('div', 'tool' + (replay ? '' : ' open') + (bash ? ' bash' : ''));
-	card.innerHTML = `<div class="tool-head"><div class="tool-ic">${bash ? '<span class="tool-prompt">#</span>' : toolIcon(name, detail)}</div><div class="tool-title"></div><div class="tool-state"><span class="spin"></span></div>${ic('i-chev', 'chev')}</div><div class="tool-body"><pre></pre></div>`;
+	const cat = category || toolCategory(name);
+	const card = el('div', 'tool');
+	card.innerHTML = `<div class="tool-head"><div class="tool-ic">${toolIcon(name, detail, cat)}</div><div class="tool-title"></div><span class="tool-cat">${esc(cat)}</span><div class="tool-state"><span class="spin"></span></div>${ic('i-chev', 'chev')}</div>`
+		+ `<div class="tool-body"><div class="tool-inner"><div class="tool-sec${detail ? '' : ' hidden'}"><div class="tool-sec-h">${DETAIL_LABEL(name)}</div><pre class="tool-detail"></pre></div><div class="tool-sec res hidden"><div class="tool-sec-h">结果</div><pre class="tool-result"></pre></div></div></div>`;
 	$('.tool-title', card).textContent = title || name;
-	if (detail) $('.tool-body pre', card).textContent = detail;
+	if (detail) $('.tool-detail', card).textContent = detail;
 	$('.tool-head', card).addEventListener('click', () => card.classList.toggle('open'));
 	thread.appendChild(card);
 	if (id) toolEls.set(id, card);
@@ -661,33 +687,71 @@ function finishTool(id, ok, summary) {
 	const st = $('.tool-state', card);
 	st.innerHTML = ok ? ic('i-check') : '出错';
 	st.className = 'tool-state ' + (ok ? 'ok' : 'err');
+	card.classList.toggle('failed', !ok);
 	if (summary && summary.trim()) {
-		const pre = $('.tool-body pre', card);
-		pre.textContent = (pre.textContent ? pre.textContent + '\n\n' : '') + summary.trim();
+		$('.tool-result', card).textContent = summary.trim();
+		$('.tool-sec.res', card).classList.remove('hidden');
 	}
-	card.classList.toggle('open', !ok); // errors stay open: the one case you always want to read
 	scroll();
 }
-function addThinkDelta(text) {
-	if (!curThink) {
-		killWelcome();
-		const card = el('div', 'think live');
-		card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div></div></div>`;
-		$('.think-head', card).addEventListener('click', () => card.classList.toggle('open'));
-		thread.appendChild(card);
-		curThink = { card, body: $('.think-body > div', card) };
-		scroll();
-	}
-	curThink.body.textContent += text;
-	if (curThink.card.classList.contains('open')) scroll();
+
+/* ---------------- thinking ---------------- */
+// Open while Claude is thinking, so the reasoning can be followed as it comes; folds into
+// "思考了 N 秒" afterwards (tap to read it again).
+function startThink() {
+	if (curThink) return curThink;
+	killWelcome();
+	const card = el('div', 'think live open');
+	card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span><span class="think-time">0 秒</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div></div></div>`;
+	$('.think-head', card).addEventListener('click', () => card.classList.toggle('open'));
+	thread.appendChild(card);
+	curThink = { card, body: $('.think-body > div', card), start: Date.now() };
+	scroll();
+	return curThink;
 }
-function endThink() {
+function addThinkDelta(text) {
+	const t = startThink();
+	t.body.textContent += text;
+	t.body.scrollTop = t.body.scrollHeight;
+	if (t.card.classList.contains('open')) scroll();
+}
+function closeThinkCard(card, ms, hasText) {
+	card.classList.remove('live', 'open');
+	$('.think-label', card).textContent = '思考了';
+	$('.think-time', card).textContent = fmtSecs(Math.max(ms, 1000));
+	card.classList.toggle('empty', !hasText);
+}
+function endThink(ms) {
 	if (!curThink) return;
-	curThink.card.classList.remove('live');
-	$('.think-label', curThink.card).textContent = '思考过程';
+	const t = curThink; curThink = null;
+	closeThinkCard(t.card, ms ?? Date.now() - t.start, !!t.body.textContent.trim());
+}
+function addThinkStatic(text, ms) {
+	const t = startThink();
+	t.body.textContent = text || '';
 	curThink = null;
+	closeThinkCard(t.card, ms || 0, !!(text || '').trim());
 }
 function sysline(t) { const e = el('div', 'sysline'); e.textContent = t; thread.appendChild(e); scroll(); }
+// What a Claude Code command such as /context printed.
+function addCmdOut(text) {
+	killWelcome();
+	const c = el('div', 'cmd-out');
+	c.innerHTML = `<div class="cmd-out-h">${ic('i-terminal')}<span>命令输出</span></div><pre></pre>`;
+	$('pre', c).textContent = text;
+	thread.appendChild(c);
+	scroll(true);
+}
+// App-side command results (/status, /usage, /doctor, /help): shown here, not saved.
+function infoCard(title, icon, html) {
+	killWelcome();
+	const c = el('div', 'info-card');
+	c.innerHTML = `<div class="info-h">${ic(icon)}<span>${esc(title)}</span></div><div class="info-b">${html}</div>`;
+	thread.appendChild(c);
+	scroll(true);
+	return c;
+}
+const kvRow = (k, v) => (v == null || v === '' ? '' : `<div class="kv-row"><span>${esc(k)}</span><span>${esc(String(v))}</span></div>`);
 
 function upsertTodo(todos) {
 	if (!curTodoEl) { curTodoEl = el('div', 'todo-block'); thread.appendChild(curTodoEl); }
@@ -759,6 +823,7 @@ function buildWelcome() {
 /* ---------------- transcript ---------------- */
 let curSession = null;
 function renderTranscript(sess) {
+	stopActivity(); // whichever conversation is now on screen reports its own (fetchSessions)
 	thread.innerHTML = '';
 	toolEls.clear();
 	curAssistant = null; curThink = null; curTodoEl = null;
@@ -767,12 +832,14 @@ function renderTranscript(sess) {
 	else {
 		for (const m of sess.messages) {
 			if (m.role === 'user') addUser(m.text);
-			else if (m.role === 'assistant') { endAssistant(); addAssistantStatic(m.text); }
+			else if (m.role === 'assistant') { endAssistant(); addAssistantStatic(m.text, m.tookMs); }
 			else if (m.role === 'tool') {
 				if (m.kind === 'todo') { upsertTodo(m.todos || []); continue; }
-				addTool(m.id, m.name, m.title, m.detail, true);
+				addTool(m.id, m.name, m.title, m.detail, true, m.category);
 				if (m.state && m.state !== 'running') finishTool(m.id, m.ok !== false, m.summary);
-			} else if (m.role === 'perm') addPermission({ ...m, sessionId: sess.id });
+			} else if (m.role === 'think') addThinkStatic(m.text, m.ms);
+			else if (m.role === 'cmdout') addCmdOut(m.text);
+			else if (m.role === 'perm') addPermission({ ...m, sessionId: sess.id });
 			else if (m.role === 'sys') sysline(m.text);
 		}
 	}
@@ -783,8 +850,33 @@ function renderTranscript(sess) {
 /* ---------------- running state & composer ---------------- */
 function setRunning(v) {
 	running = v;
+	if (!v) stopActivity();
 	updateSendState();
 }
+
+// What the conversation on screen is doing right now and for how long, just above the input:
+// "正在思考 · 8 秒", "正在查看电池状态 · 15 秒", "等你确认 · 20 秒".
+const activity = { on: false, since: 0, label: '' };
+function setActivity(label, since) {
+	if (!activity.on) { activity.on = true; activity.since = since || Date.now(); }
+	else if (since) activity.since = since;
+	if (label) activity.label = label;
+	renderActivity();
+}
+function stopActivity() { activity.on = false; renderActivity(); }
+function renderActivity() {
+	const box = $('#activity');
+	box.classList.toggle('hidden', !activity.on);
+	if (!activity.on) return;
+	$('#act-label').textContent = activity.label || '正在思考';
+	$('#act-time').textContent = fmtSecs(Date.now() - activity.since);
+	box.classList.toggle('waiting', activity.label === '等你确认');
+}
+const doing = (title) => (/^(正在|等你)/.test(title) ? title : '正在' + title);
+setInterval(() => {
+	if (activity.on) renderActivity();
+	if (curThink) $('.think-time', curThink.card).textContent = fmtSecs(Date.now() - curThink.start);
+}, 1000);
 function updateSendState() {
 	const has = !!input.value.trim() || attachedScopes.length > 0;
 	const showStop = running && !has;
@@ -840,6 +932,7 @@ const pendingIds = new Set();
 async function send() {
 	const rawText = input.value.trim();
 	if (!rawText && !attachedScopes.length) return;
+	if (!attachedScopes.length && runAppCommand(rawText)) return;
 	// Allowed while a turn is running: the server queues it, like typing ahead in the terminal.
 	let fullPrompt = rawText;
 	if (attachedScopes.length) {
@@ -859,6 +952,7 @@ async function send() {
 	renderScopes();
 	runningIds.add(sid);
 	setRunning(true);
+	if (!activity.on) setActivity('正在思考');
 	const r = await api('/api/send', { text: fullPrompt, scopes, sessionId: sid });
 	if (!r.ok) {
 		runningIds.delete(sid);
@@ -876,30 +970,144 @@ $('#btn-stop').addEventListener('click', () => {
 });
 
 /* ---------------- slash commands ---------------- */
+// Two kinds: the app's own (what Claude Code's terminal shows in its own interface, such as
+// /status, has no headless equivalent, so the app answers those itself), and everything Claude
+// Code itself supports here (/compact, /context, custom commands, skills), sent through as is.
+const APP_COMMANDS = [
+	{ name: 'status', desc: '查看版本、模型、账号、MCP 等运行状态', run: () => cmdStatus() },
+	{ name: 'usage', desc: '查看用量与额度', run: () => cmdUsage() },
+	{ name: 'model', desc: '切换模型和思考强度', run: () => $('#btn-model').click() },
+	{ name: 'mode', aliases: ['permissions'], desc: '切换执行模式（Ask / Accept edits / Plan / Auto / Full access）', run: () => $('#btn-mode').click() },
+	{ name: 'clear', aliases: ['new', 'reset'], desc: '开始一个新对话', run: () => createNewChat() },
+	{ name: 'rename', hint: '<新标题>', desc: '重命名当前对话', run: (a) => renameCurrent(a) },
+	{ name: 'resume', desc: '打开对话列表', run: () => openDrawer() },
+	{ name: 'export', desc: '把整段对话复制成 Markdown', run: () => cmdExport() },
+	{ name: 'doctor', desc: '检查 Claude Code 运行方式、网络和登录', run: () => cmdDoctor() },
+	{ name: 'mcp', desc: '管理 MCP 服务器', run: () => openPage('page-mcp') },
+	{ name: 'skills', desc: '管理技能', run: () => openPage('page-skills') },
+	{ name: 'memory', desc: '编辑系统提示词', run: () => openPage('page-prompt') },
+	{ name: 'config', aliases: ['settings'], desc: '打开设置', run: () => openPage('page-settings') },
+	{ name: 'theme', desc: '更换主题', run: () => openPage('page-theme') },
+	{ name: 'release-notes', aliases: ['version', 'changelog'], desc: '版本与更新记录', run: () => openPage('page-version') },
+	{ name: 'login', desc: '登录或切换 Claude 账号', run: () => showLogin() },
+	{ name: 'logout', desc: '退出登录', run: () => confirmLogout() },
+	{ name: 'help', desc: '列出所有命令', run: () => cmdHelp() },
+];
+// Chinese descriptions for Claude Code's own commands (it reports them in English).
+const CC_DESC = {
+	compact: '压缩对话，释放上下文空间', context: '查看上下文占用了多少', cost: '查看这次对话的花费和用时', init: '为当前目录生成 CLAUDE.md',
+	review: '审查代码改动', 'security-review': '对当前改动做安全审查', 'pr-comments': '查看 Pull Request 的评论', todos: '查看待办清单',
+	'release-notes': 'Claude Code 的更新说明', insights: '分析你的使用习惯', 'extra-usage': '额外用量设置', heapdump: '导出内存快照（排查问题用）',
+};
+const appCommand = (name) => APP_COMMANDS.find((c) => c.name === name || (c.aliases || []).includes(name));
 let slashCommands = [];
 async function loadSlashCommands() {
 	const r = await getJSON(`/api/commands?sessionId=${encodeURIComponent(curSession?.id || '')}`);
-	if (r.ok) slashCommands = r.commands || [];
+	if (r.ok) slashCommands = (r.commands || []).filter((c) => !appCommand(c.name));
 }
 function hideSlash() { $('#slash-menu').classList.add('hidden'); }
 function checkSlashInput() {
 	const m = input.value.match(/^\/(\S*)$/);
 	if (!m) return hideSlash();
 	const q = m[1].toLowerCase();
-	const matches = slashCommands.filter((c) => c.name.toLowerCase().startsWith(q) || (c.aliases || []).some((a) => a.toLowerCase().startsWith(q))).slice(0, 6);
+	const hit = (name, aliases, desc) => !q || name.toLowerCase().startsWith(q) || (aliases || []).some((a) => a.startsWith(q)) || (q.length > 1 && String(desc || '').toLowerCase().includes(q));
+	const app = APP_COMMANDS.filter((c) => hit(c.name, c.aliases, c.desc)).map((c) => ({ kind: 'app', name: c.name, hint: c.hint || '', desc: c.desc }));
+	const cc = slashCommands.filter((c) => hit(c.name, c.aliases, c.description)).map((c) => ({ kind: 'cc', name: c.name, hint: c.argumentHint || '', desc: CC_DESC[c.name] || c.description || '' }));
 	const menu = $('#slash-menu');
-	if (!matches.length) return hideSlash();
-	menu.innerHTML = matches.map((c, i) => `<button class="slash-item" data-i="${i}"><span class="slash-name">/${esc(c.name)}${c.argumentHint ? ` <span class="slash-hint">${esc(c.argumentHint)}</span>` : ''}</span><span class="slash-desc">${esc(c.description || '')}</span></button>`).join('');
+	if (!app.length && !cc.length) return hideSlash();
+	const row = (c) => `<button class="slash-item" data-kind="${c.kind}" data-name="${esc(c.name)}"><span class="slash-name">/${esc(c.name)}${c.hint ? ` <span class="slash-hint">${esc(c.hint)}</span>` : ''}</span><span class="slash-desc">${esc(c.desc)}</span></button>`;
+	menu.innerHTML = (app.length ? `<div class="slash-group">App</div>${app.map(row).join('')}` : '') + (cc.length ? `<div class="slash-group">Claude Code</div>${cc.map(row).join('')}` : '');
 	menu.classList.remove('hidden');
-	$$('.slash-item', menu).forEach((b, i) => b.addEventListener('click', () => chooseSlash(matches[i])));
+	menu.scrollTop = 0;
+	$$('.slash-item', menu).forEach((b) => b.addEventListener('click', () => chooseSlash(b.dataset.kind, b.dataset.name)));
 }
-function chooseSlash(cmd) {
+function clearInput() { input.value = ''; autosize(); updateSendState(); }
+function chooseSlash(kind, name) {
 	hideSlash();
-	if (cmd.name === 'model') { input.value = ''; autosize(); updateSendState(); $('#btn-model').click(); return; }
-	if (cmd.name === 'clear') { input.value = ''; autosize(); updateSendState(); createNewChat(); return; }
-	input.value = '/' + cmd.name + ' ';
-	autosize(); updateSendState();
-	input.focus();
+	const app = kind === 'app' && appCommand(name);
+	const cc = kind === 'cc' && slashCommands.find((c) => c.name === name);
+	if ((app && app.hint) || (cc && cc.argumentHint)) { input.value = `/${name} `; autosize(); updateSendState(); input.focus(); return; }
+	if (app) { clearInput(); app.run(''); return; }
+	input.value = '/' + name; // a Claude Code command: send it as it is
+	send();
+}
+// A typed "/status" (etc.) is handled here instead of being sent; true when it was.
+function runAppCommand(text) {
+	const m = /^\/([\w:-]+)(?:\s+([\s\S]*))?$/.exec(text);
+	const cmd = m && appCommand(m[1]);
+	if (!cmd) return false;
+	clearInput();
+	hideSlash();
+	cmd.run((m[2] || '').trim());
+	return true;
+}
+
+async function cmdStatus() {
+	const card = infoCard('状态', 'i-info', '<div class="empty-state"><span class="spin"></span></div>');
+	const [rt, acct, upd, mcp, sk, px] = await Promise.all(['/api/runtime', '/api/account', '/api/update', '/api/mcp', '/api/skills', '/api/proxy'].map(getJSON));
+	const a = acct.ok && acct.account;
+	const mcpNames = Object.keys(mcp.servers || {});
+	const mcpOn = (mcp.status || []).filter((x) => x.status === 'connected').length;
+	const mode = MODES.find((x) => x.id === SETTINGS.mode);
+	const effort = (EFFORTS.find(([id]) => id === SETTINGS.effort) || [])[1];
+	$('.info-b', card).innerHTML = kvRow('DroidAgent', upd.ok && upd.update.current ? `版本 ${upd.update.current}` : '')
+		+ kvRow('Claude Code', rt.chat ? `${rt.chat.version}（${rt.chat.label}）` : '没有能运行的 Claude Code')
+		+ kvRow('模型', `${SETTINGS.modelName || SETTINGS.model}，思考强度 ${effort || SETTINGS.effort}${SETTINGS.fastMode ? '，快速模式' : ''}`)
+		+ kvRow('执行模式', mode ? mode.label : SETTINGS.mode)
+		+ kvRow('账号', a ? `${a.email || ''}${SUBSCRIPTION_LABEL[a.subscriptionType] ? `（Claude ${SUBSCRIPTION_LABEL[a.subscriptionType]}）` : ''}` : '未登录')
+		+ kvRow('工作目录', rt.cwd)
+		+ kvRow('MCP 服务器', mcpNames.length ? `${mcpNames.length} 个，已连接 ${mcpOn} 个` : '没有')
+		+ kvRow('技能', sk.ok ? `已启用 ${sk.skills.filter((x) => x.enabled).length} 个` : '')
+		+ kvRow('网络代理', px.ok ? (px.proxy || '直连') : '')
+		+ kvRow('对话', curSession?.claudeSessionId ? `Claude 会话 ${curSession.claudeSessionId.slice(0, 8)}` : '还没开始');
+}
+async function cmdUsage() {
+	const card = infoCard('用量与额度', 'i-pulse', '<div class="empty-state"><span class="spin"></span></div>');
+	const r = await loadUsage(true);
+	const b = $('.info-b', card);
+	if (!r.ok) { b.innerHTML = `<div class="empty-state">${esc(r.error || '读取用量失败')}</div>`; return; }
+	const rl = r.rate_limits || {};
+	b.innerHTML = (usageBar('5 小时', rl.five_hour) + usageBar('本周', rl.seven_day) + usageBar('本周 Opus', rl.seven_day_opus) + usageBar('本周 Sonnet', rl.seven_day_sonnet)) || '<div class="empty-state">这个账号没有用量窗口</div>';
+}
+async function cmdDoctor() {
+	const card = infoCard('环境检查', 'i-pulse', '<div class="empty-state"><span class="spin"></span>正在检查</div>');
+	const [rt, net, acct, upd] = await Promise.all(['/api/runtime', '/api/netcheck', '/api/account', '/api/update'].map(getJSON));
+	const tried = (rt.tried || []).map((t) => `${t.ok ? '✓' : '✗'} ${t.label}：${t.detail}`).join('\n');
+	$('.info-b', card).innerHTML = kvRow('Claude Code', rt.chat ? `用 ${rt.chat.label}（${rt.chat.version}）` : '没有能运行的')
+		+ (tried ? `<pre class="info-pre">${esc(tried)}</pre>` : '')
+		+ kvRow('连接 Claude', net.ok ? `正常${net.proxy ? `（经代理 ${net.proxy}）` : '（直连）'}` : `连不上：${net.summary || ''}`)
+		+ kvRow('登录', acct.ok && acct.account ? `已登录 ${acct.account.email || ''}` : '未登录')
+		+ kvRow('自动更新', upd.ok ? (upd.update.error || (upd.update.available ? `有新版本 ${upd.update.latest}` : `已是最新 ${upd.update.current || ''}`)) : '')
+		+ kvRow('Node.js', rt.node);
+}
+function cmdHelp() {
+	const row = (n, h, d) => `<div class="help-row"><code>/${esc(n)}${h ? ' ' + esc(h) : ''}</code><span>${esc(d)}</span></div>`;
+	infoCard('命令', 'i-terminal', `<div class="help-group">App</div>${APP_COMMANDS.map((c) => row(c.name, c.hint, c.desc + ((c.aliases || []).length ? `（也可以用 /${c.aliases.join('、/')}）` : ''))).join('')}`
+		+ (slashCommands.length ? `<div class="help-group">Claude Code</div>${slashCommands.map((c) => row(c.name, c.argumentHint, CC_DESC[c.name] || c.description || '')).join('')}` : ''));
+}
+async function cmdExport() {
+	const r = await getJSON('/api/sessions');
+	const sess = r.activeSession && r.activeSession.id === curSession?.id ? r.activeSession : curSession;
+	if (!sess || !(sess.messages || []).length) { toast('这个对话还是空的'); return; }
+	const out = [`# ${sess.title || '对话'}`, ''];
+	for (const m of sess.messages) {
+		if (m.role === 'user') out.push('## 我', '', m.text, '');
+		else if (m.role === 'assistant') out.push('## Claude', '', m.text, '');
+		else if (m.role === 'tool' && m.kind !== 'todo') out.push(`- ${m.state === 'err' ? '✗' : '✓'} ${m.title}`, '');
+	}
+	copyText(out.join('\n').replace(/\n{3,}/g, '\n\n'), '已复制整段对话');
+}
+async function renameCurrent(title) {
+	if (!curSession) return;
+	if (!title) { promptRename(curSession); return; }
+	const r = await api('/api/sessions/rename', { id: curSession.id, title });
+	if (r.ok) { curSession.title = title; chatTitle.textContent = title; fetchSessions(); toast('已重命名'); }
+}
+function confirmLogout() {
+	showDialog({
+		title: '退出登录？', msg: '退出后要重新登录才能继续对话。', ok: '退出登录', danger: true,
+		onOk: async () => { await api('/api/account/logout'); closeAll(); refreshAccount(); },
+	});
 }
 
 /* ---------------- attach menu ---------------- */
@@ -1043,6 +1251,8 @@ async function fetchSessions() {
 	// Opened while this conversation is mid-turn: offer Stop. (Never clears it here: right after
 	// sending, the server may not list the turn yet; the turn's own result event clears it.)
 	if (curSession && runningIds.has(curSession.id) && !running) setRunning(true);
+	const act = curSession && r.activity && r.activity[curSession.id];
+	if (act && runningIds.has(curSession.id)) setActivity(act.label || '正在思考', act.since || undefined);
 	renderSidebar();
 }
 function groupOf(ts) {
@@ -1116,7 +1326,7 @@ async function switchSession(id) {
 		renderTranscript(curSession);
 		setRunning(runningIds.has(id));
 		closeDrawer();
-		renderSidebar();
+		fetchSessions();
 		loadSlashCommands();
 	}
 }
@@ -1554,32 +1764,40 @@ function connect() {
 			case 'sessions_updated': sessionsList = m.sessions || []; renderSidebar(); break;
 			case 'user_echo':
 				if (m.sessionId) runningIds.add(m.sessionId);
-				if (mine) { setRunning(true); fetchSessions(); } else renderSidebar();
+				if (mine) { setRunning(true); if (!activity.on) setActivity('正在思考'); fetchSessions(); } else renderSidebar();
 				break;
-			case 'assistant_delta': if (mine) appendAssistant(m.text); break;
+			case 'assistant_delta': if (mine) { appendAssistant(m.text); setActivity('正在回复'); } break;
 			case 'assistant_text': if (mine) setAssistant(m.text); break;
 			case 'assistant_end': if (mine) endAssistant(); break;
-			case 'thinking_delta': if (mine) addThinkDelta(m.text); break;
+			case 'thinking_start': if (mine) { startThink(); setActivity('正在思考'); } break;
+			case 'thinking_delta': if (mine) { addThinkDelta(m.text); setActivity('正在思考'); } break;
+			case 'thinking_end': if (mine) endThink(m.ms); break;
 			case 'tool_use':
 				if (!mine) break;
-				if (m.kind === 'todo') { endAssistant(); upsertTodo(m.todos); }
-				else addTool(m.id, m.name, m.title, m.detail);
+				if (m.kind === 'todo') { endAssistant(); upsertTodo(m.todos); setActivity('正在更新待办清单'); }
+				else { addTool(m.id, m.name, m.title, m.detail, false, m.category); setActivity(doing(m.title || '执行操作')); }
 				break;
-			case 'tool_result': if (mine) finishTool(m.id, m.ok, m.summary); break;
+			case 'tool_result': if (mine) { finishTool(m.id, m.ok, m.summary); setActivity('正在思考'); } break;
+			case 'command_output': if (mine) addCmdOut(m.text); break;
+			case 'notice': if (mine) sysline(m.text); break;
+			case 'title':
+				if (curSession && m.sessionId === curSession.id) { curSession.title = m.title; chatTitle.textContent = m.title; }
+				break;
 			case 'tool_denied': if (mine) sysline(`已拒绝：${m.title}（${m.reason}）`); break;
 			case 'permission':
 				if (m.sessionId) pendingIds.add(m.sessionId);
-				if (mine) addPermission(m); else renderSidebar();
+				if (mine) { addPermission(m); setActivity('等你确认'); } else renderSidebar();
 				break;
 			case 'permission_resolved':
 				if (m.sessionId) pendingIds.delete(m.sessionId);
-				if (!mine) renderSidebar();
+				if (mine) setActivity('正在思考'); else renderSidebar();
 				break;
 			case 'result':
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) {
 					endAssistant();
 					setRunning(false);
+					markTurnTime(m.durationMs);
 					if (m.subtype && m.subtype !== 'success') sysline(`本轮结束：${m.subtype}`);
 					fetchSessions();
 				} else renderSidebar();
