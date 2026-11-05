@@ -11,6 +11,10 @@ import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
+import {
+	OFFICIAL_MARKETPLACES, safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
+	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, connectorName, buildMcpEntry, inspectPluginDir,
+} from './market.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..', 'web');
@@ -20,6 +24,8 @@ const CWD = process.env.AGENT_CWD || '/root';
 
 // Never let an API key leak in — this app runs on the subscription login only.
 delete process.env.ANTHROPIC_API_KEY;
+// A private repository must fail, not sit waiting for a password nobody can type.
+process.env.GIT_TERMINAL_PROMPT = '0';
 
 // Login is done via `claude auth login` (see login_pty.py), which saves credentials into
 // claude's own native store under this same $HOME — nothing to read or inject here. Do NOT set
@@ -58,6 +64,10 @@ const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoU
 // Config files for the Eta-parity features.
 const SYSTEM_PROMPT_FILE = join(homedir(), '.claude', 'agent-system-prompt.md');
 const SKILLS_DIR = join(homedir(), '.claude', 'skills');
+// A disabled skill is moved here, where Claude Code doesn't look. The SDK's `skills` filter can't
+// do this job: Claude Code 2.1.112 has no such option, and it would also hide plugin skills.
+const SKILLS_OFF_DIR = join(homedir(), '.claude', 'skills-disabled');
+const SKILL_DRAFTS_DIR = join(homedir(), '.claude', 'skill-drafts');
 const SKILLS_STATE_FILE = join(homedir(), '.claude', 'agent-skills.json');
 const MCP_FILE = join(homedir(), '.claude', 'agent-mcp.json');
 
@@ -527,32 +537,51 @@ async function readSkillsState() {
 	try { return JSON.parse(await readFile(SKILLS_STATE_FILE, 'utf8')); } catch { return { enabled: [] }; }
 }
 
-// List installed skills (dirs under SKILLS_DIR with a SKILL.md), with name/description from frontmatter.
+const dirNames = async (dir) => {
+	try { return (await readdir(dir, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return []; }
+};
+
+// List installed skills, with name/description from frontmatter. Where a skill sits says whether it is on.
 async function listSkills() {
-	const state = await readSkillsState();
-	let dirs = [];
-	try { dirs = (await readdir(SKILLS_DIR, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name); } catch { /* none */ }
 	const out = [];
-	for (const id of dirs) {
-		let name = id, description = '';
-		try {
-			const md = await readFile(join(SKILLS_DIR, id, 'SKILL.md'), 'utf8');
-			const fm = md.match(/^---\n([\s\S]*?)\n---/);
-			if (fm) {
-				const nm = fm[1].match(/^name:\s*(.+)$/m); if (nm) name = nm[1].trim().replace(/^["']|["']$/g, '');
-				const ds = fm[1].match(/^description:\s*(.+)$/m); if (ds) description = ds[1].trim().replace(/^["']|["']$/g, '');
-			}
-		} catch { /* no SKILL.md */ }
-		const builtin = existsSync(join(SKILLS_DIR, id, '.builtin'));
-		out.push({ id, name, description, enabled: state.enabled.includes(id), builtin });
+	for (const [dir, enabled] of [[SKILLS_DIR, true], [SKILLS_OFF_DIR, false]]) {
+		for (const id of await dirNames(dir)) {
+			let name = id, description = '';
+			try {
+				const fm = parseFrontmatter(await readFile(join(dir, id, 'SKILL.md'), 'utf8'));
+				if (fm?.name) name = fm.name;
+				if (fm?.description) description = fm.description;
+			} catch { /* no SKILL.md */ }
+			out.push({ id, name, description, enabled, builtin: existsSync(join(dir, id, '.builtin')) });
+		}
 	}
 	return out;
 }
 
-async function enabledSkillIds() {
+// Turn a skill on or off by moving its directory. A rename, so nothing is copied or deleted.
+async function setSkillEnabled(id, enabled) {
+	if (!safeId(id)) throw new Error('技能名称无效');
+	const [from, to] = enabled ? [SKILLS_OFF_DIR, SKILLS_DIR] : [SKILLS_DIR, SKILLS_OFF_DIR];
+	if (!existsSync(join(from, id))) return;
+	if (existsSync(join(to, id))) throw new Error('已经有一个同名技能');
+	await mkdir(to, { recursive: true });
+	await rename(join(from, id), join(to, id));
+}
+
+// Once, on the first start of a version that moves directories: what the old enabled list had off
+// goes to the disabled directory. An empty list meant no filter at all, so everything stays on.
+async function migrateSkillState() {
 	const state = await readSkillsState();
-	const all = await listSkills();
-	return all.filter((s) => state.enabled.includes(s.id)).map((s) => s.id);
+	if (state.dirsMigrated) return;
+	if (state.enabled?.length) {
+		for (const id of await dirNames(SKILLS_DIR)) {
+			if (!state.enabled.includes(id) && safeId(id) && existsSync(join(SKILLS_DIR, id, 'SKILL.md'))) {
+				await setSkillEnabled(id, false).catch((e) => log('[skills] migrate', id, e?.message));
+			}
+		}
+	}
+	state.dirsMigrated = true;
+	await writeSkillsState(state);
 }
 
 async function loadMcpServers() {
@@ -568,8 +597,12 @@ async function loadMcpServers() {
 }
 
 function toMcpConfig(s) {
-	if (s.type === 'http') { const c = { type: 'http', url: s.url }; if (s.bearer) c.headers = { Authorization: `Bearer ${s.bearer}` }; return c; }
-	if (s.type === 'sse') { const c = { type: 'sse', url: s.url }; if (s.bearer) c.headers = { Authorization: `Bearer ${s.bearer}` }; return c; }
+	if (s.type === 'http' || s.type === 'sse') {
+		const c = { type: s.type, url: s.url };
+		const headers = { ...(s.headers || {}), ...(s.bearer ? { Authorization: `Bearer ${s.bearer}` } : {}) };
+		if (Object.keys(headers).length) c.headers = headers;
+		return c;
+	}
 	return { type: 'stdio', command: s.command, args: s.args || [], env: s.env || {} };
 }
 
@@ -596,7 +629,9 @@ let usageCache = { t: 0, data: null };
 
 async function ensureRuntime(id) {
 	let rt = runtimes.get(id);
+	if (rt && rt.restartWhenIdle && !rt.running && rt.pending.size === 0) { teardownRuntime(id); rt = null; }
 	if (rt) return rt;
+	await pluginGate; // a plugin being downloaded is enabled for a moment; don't start a session in that window
 	const sess = await getOrLoadSessionObj(id);
 	if (!sess) throw new Error('session not found: ' + id);
 	const runtime = await claudeRuntime();
@@ -645,7 +680,6 @@ async function ensureRuntime(id) {
 	};
 
 	const append = [APP_PROMPT, loadSystemPromptAppend()].filter(Boolean).join('\n\n');
-	const skillIds = await enabledSkillIds();
 	const mcpServers = await loadMcpServers();
 	const queryOpts = {
 		cwd: CWD,
@@ -662,7 +696,6 @@ async function ensureRuntime(id) {
 		canUseTool,
 		stderr: (d) => log('[claude]', `[${id.slice(0, 8)}]`, String(d).trim().slice(0, 300)),
 	};
-	if (skillIds.length) queryOpts.skills = skillIds;
 	if (Object.keys(mcpServers).length) queryOpts.mcpServers = mcpServers;
 	if (sess.claudeSessionId) queryOpts.resume = sess.claudeSessionId;
 	Object.assign(queryOpts, queryRuntimeOptions(chatSpec));
@@ -791,6 +824,7 @@ async function consume(id, q, rt) {
 				maybeTitle(id); // name the conversation once it has its first answer
 			}
 			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype });
+			announceSkillDrafts(id).catch((e) => log('[skills] draft scan', e?.message));
 		}
 	}
 }
@@ -984,43 +1018,265 @@ function run(cmd, args, opts = {}) {
 		});
 	});
 }
-const sanitizeId = (s) => s.replace(/[^\w.-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'skill';
 
-// Install one or more skills from a GitHub repo, a local directory, or a local .zip.
-// A skill is any directory that contains a SKILL.md; the repo may hold one at its root or several in subdirs.
-async function installSkill(src) {
+// Put a checked skill directory in place as `id`, enabled. `overwrite` replaces an earlier copy of
+// the owner's; a built-in skill of that name is never replaced.
+async function placeSkill(srcDir, id, { move = false, overwrite = true } = {}) {
+	if (!safeId(id)) throw new Error(`技能名称无效：${id}`);
+	const escaping = await findEscapingSymlinks(srcDir);
+	if (escaping.length) throw new Error(`技能里有指向外部的符号链接（${escaping[0]}），已拒绝`);
+	const dest = join(SKILLS_DIR, id);
+	const off = join(SKILLS_OFF_DIR, id);
+	for (const p of [dest, off]) {
+		if (!existsSync(p)) continue;
+		if (existsSync(join(p, '.builtin'))) throw new Error(`「${id}」是内置技能，不能覆盖`);
+		if (!overwrite) throw new Error(`已经有一个叫「${id}」的技能`);
+	}
+	// Stage next to the destination, so a failed copy never costs the working copy.
+	await mkdir(SKILLS_DIR, { recursive: true });
+	const stage = join(homedir(), '.claude', `.skill-stage-${randomUUID()}`);
+	try {
+		if (move) await rename(srcDir, stage);
+		else await run('cp', ['-a', '--', srcDir, stage]);
+		await rm(join(stage, '.git'), { recursive: true, force: true });
+		for (const p of [dest, off]) await rm(p, { recursive: true, force: true });
+		await rename(stage, dest);
+	} finally {
+		await rm(stage, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
+// Install one or more skills from a GitHub repo (or one directory in it), a local directory, or a
+// local .zip. Returns the ids installed. Only the skill directories themselves are ever copied.
+async function installSkill(input) {
+	const src = parseSkillSource(input);
+	if (!src) throw new Error('只支持 GitHub 仓库地址（可以指向子目录）或手机里的绝对路径');
 	const tmp = join(homedir(), '.claude', `.skill-tmp-${randomUUID()}`);
 	await mkdir(tmp, { recursive: true });
 	try {
-		if (src.startsWith('/')) {
-			if (src.toLowerCase().endsWith('.zip')) await run('unzip', ['-q', '-o', src, '-d', tmp]);
-			else await run('cp', ['-a', src + '/.', tmp]);
-		} else {
-			await run('git', ['clone', '--depth', '1', src, tmp]);
-			await rm(join(tmp, '.git'), { recursive: true, force: true });
-		}
-		// Gather skill directories.
-		const roots = [];
-		if (existsSync(join(tmp, 'SKILL.md'))) {
-			roots.push({ dir: tmp, id: sanitizeId(src.replace(/\.git$/, '').split('/').pop()) });
-		} else {
-			for (const d of await readdir(tmp, { withFileTypes: true })) {
-				if (d.isDirectory() && existsSync(join(tmp, d.name, 'SKILL.md'))) roots.push({ dir: join(tmp, d.name), id: sanitizeId(d.name) });
+		let base;
+		let fallbackId;
+		if (src.kind === 'path') {
+			if (src.path.toLowerCase().endsWith('.zip')) {
+				await run('unzip', ['-q', '-o', src.path, '-d', tmp]);
+				base = tmp;
+			} else {
+				base = src.path;
 			}
+			fallbackId = basename(src.path).replace(/\.zip$/i, '');
+		} else {
+			await run('git', ['clone', '--depth', '1', ...(src.ref ? ['--branch', src.ref] : []), '--', src.cloneUrl, tmp], { timeout: 300000 });
+			base = src.subdir ? join(tmp, ...src.subdir.split('/')) : tmp;
+			fallbackId = src.subdir ? src.subdir.split('/').pop() : src.repo;
 		}
-		if (roots.length === 0) throw new Error('没找到 SKILL.md（不是有效的 skill 仓库）');
+		const roots = await findSkillRoots(base);
+		if (roots.length === 0) throw new Error('没找到 SKILL.md（不是有效的技能）');
+		const ids = [];
 		for (const r of roots) {
-			const dest = join(SKILLS_DIR, r.id);
-			await rm(dest, { recursive: true, force: true });
-			await run('cp', ['-a', r.dir, dest]);
+			const id = r.id || fallbackId;
+			await placeSkill(r.dir, id);
+			ids.push(id);
 		}
-		// Newly installed skills start enabled.
-		const state = await readSkillsState();
-		for (const r of roots) if (!state.enabled.includes(r.id)) state.enabled.push(r.id);
-		await writeSkillsState(state);
+		return ids;
 	} finally {
 		await rm(tmp, { recursive: true, force: true }).catch(() => {});
 	}
+}
+
+// Live conversations pick up changed skills and plugins: Claude Code's own reload where it works.
+// 2.1.112's reloadPlugins answers with the previous state, so those conversations restart instead,
+// which is invisible: the next message resumes the same conversation. A busy one waits until idle.
+async function refreshRuntimes() {
+	for (const [id, rt] of runtimes) {
+		let reloaded = false;
+		if (rt.chatSpec?.kind !== 'legacy' && rt.q?.reloadPlugins) {
+			try {
+				await rt.q.reloadPlugins();
+				if (rt.q.reloadSkills) await rt.q.reloadSkills();
+				reloaded = true;
+			} catch (e) { log('[market] reload failed', id.slice(0, 8), e?.message); }
+		}
+		if (reloaded) continue;
+		if (!rt.running && rt.pending.size === 0) teardownRuntime(id);
+		else rt.restartWhenIdle = true;
+	}
+}
+
+async function afterSkillChange() {
+	await refreshRuntimes();
+	broadcast({ type: 'skills_updated' });
+	refreshSkillNames();
+}
+
+// ---------------------------------------------------------------- skill drafts
+// What "create a skill with Claude" writes. It only becomes a skill when the owner saves it here.
+async function listSkillDrafts() {
+	const out = [];
+	for (const id of await dirNames(SKILL_DRAFTS_DIR)) {
+		if (!safeId(id)) continue;
+		const file = join(SKILL_DRAFTS_DIR, id, 'SKILL.md');
+		try {
+			const st = await lstat(file);
+			if (!st.isFile() || st.size > 256 * 1024) continue;
+			const text = await readFile(file, 'utf8');
+			const fm = parseFrontmatter(text);
+			out.push({ id, name: fm?.name || id, description: fm?.description || '', text, errors: validateSkillText(text, id), mtime: st.mtimeMs });
+		} catch { /* not a draft */ }
+	}
+	return out;
+}
+
+const draftsSeen = new Map();
+async function announceSkillDrafts(sessionId) {
+	for (const d of await listSkillDrafts()) {
+		if (draftsSeen.get(d.id) === d.mtime) continue;
+		draftsSeen.set(d.id, d.mtime);
+		broadcast({ type: 'skill_draft', sessionId, id: d.id, name: d.name, ok: !d.errors.length });
+	}
+}
+
+// ---------------------------------------------------------------- plugins (official CLI)
+async function claudeCli(args, { timeout = 120000 } = {}) {
+	const rt = await claudeRuntime();
+	if (!rt.chat) throw new Error(noRuntimeMessage(rt));
+	// Output goes through a file, not a pipe: Claude Code 2.1.112 exits before a pipe has drained,
+	// which cuts long JSON short at an arbitrary point. stdin is closed or it would wait on it.
+	const outPath = join(homedir(), '.claude', `.cli-out-${randomUUID()}`);
+	const outFile = await open(outPath, 'w');
+	try {
+		const { code, err, timedOut } = await new Promise((resolve, reject) => {
+			const c = runClaude(rt.chat, args, { stdio: ['ignore', outFile.fd, 'pipe'], cwd: homedir() });
+			let err = '';
+			let timedOut = false;
+			const timer = setTimeout(() => { timedOut = true; try { c.kill('SIGKILL'); } catch { /* */ } }, timeout);
+			c.stderr.on('data', (d) => { if (err.length < 1e5) err += d; });
+			c.on('error', (e) => { clearTimeout(timer); reject(e); });
+			c.on('close', (exit) => { clearTimeout(timer); resolve({ code: exit, err, timedOut }); });
+		});
+		if (timedOut) throw new Error('超时，请检查网络或代理后重试');
+		const out = await readFile(outPath, 'utf8');
+		if (code === 0) return out;
+		const lines = `${err}\n${out}`.replace(/\x1b\[[0-9;]*m/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+		const why = lines.find((l) => /^[✘✖]|Failed|Error:/.test(l)) || lines.at(-1) || `退出码 ${code}`;
+		throw new Error(why.replace(/^[✘✖]\s*/, '').slice(0, 300));
+	} finally {
+		await outFile.close().catch(() => {});
+		await unlink(outPath).catch(() => {});
+	}
+}
+const cliJson = async (args, opts) => JSON.parse(await claudeCli(args, opts));
+
+let pluginGate = Promise.resolve();
+let officialMarkets = null;
+function ensureOfficialMarkets() {
+	officialMarkets ||= (async () => {
+		const have = await cliJson(['plugin', 'marketplace', 'list', '--json']);
+		for (const m of OFFICIAL_MARKETPLACES) {
+			if (!have.some((x) => x.name === m.name)) await claudeCli(['plugin', 'marketplace', 'add', m.url], { timeout: 300000 });
+		}
+	})().catch((e) => { officialMarkets = null; throw e; });
+	return officialMarkets;
+}
+
+const CATALOG_TTL = 10 * 60 * 1000;
+let pluginCatalog = { t: 0, available: [], installed: [] };
+async function loadPluginCatalog({ force = false } = {}) {
+	if (!force && Date.now() - pluginCatalog.t < CATALOG_TTL) return pluginCatalog;
+	await ensureOfficialMarkets();
+	const j = await cliJson(['plugin', 'list', '--available', '--json'], { timeout: 180000 });
+	pluginCatalog = { t: Date.now(), available: j.available || [], installed: j.installed || [] };
+	return pluginCatalog;
+}
+async function installedPlugin(id) {
+	const list = await cliJson(['plugin', 'list', '--json']);
+	return list.find((p) => p.id === id) || null;
+}
+async function inspectInstalled(id) {
+	const p = await installedPlugin(id);
+	if (!p) throw new Error('这个插件没有安装');
+	return { id, enabled: !!p.enabled, version: p.version || '', contents: p.installPath ? await inspectPluginDir(p.installPath) : null };
+}
+// Downloaded, but not enabled: its hooks and servers run as root, so the owner reads what it holds
+// first. The gate holds back new conversations between `install` (which enables) and `disable`.
+async function downloadPlugin(id) {
+	if (await installedPlugin(id)) throw new Error('这个插件已经装好了');
+	const work = (async () => {
+		await claudeCli(['plugin', 'install', id], { timeout: 300000 });
+		try {
+			await claudeCli(['plugin', 'disable', id]);
+		} catch (e) {
+			await claudeCli(['plugin', 'uninstall', id]).catch(() => {});
+			throw e;
+		}
+	})();
+	pluginGate = work.catch(() => {});
+	await work;
+	pluginCatalog.t = 0;
+	return inspectInstalled(id);
+}
+async function pluginCommand(args) {
+	await claudeCli(args);
+	pluginCatalog.t = 0;
+	await refreshRuntimes();
+	broadcast({ type: 'plugins_updated' });
+	broadcast({ type: 'skills_updated' });
+	broadcast({ type: 'mcp_updated' });
+}
+
+// ---------------------------------------------------------------- connector catalog
+const readCatalog = async (file) => JSON.parse(await readFile(join(HERE, '..', 'catalog', file), 'utf8'));
+// Results of recent registry searches. Adding one uses this copy, not whatever the page sends back.
+const registrySeen = new Map();
+async function searchRegistry(q) {
+	const params = new URLSearchParams({ limit: '30', version: 'latest', search: q });
+	const r = await fetchUrl(`https://registry.modelcontextprotocol.io/v0.1/servers?${params}`, { timeout: 20000 });
+	const found = normalizeRegistry(JSON.parse(r.body));
+	for (const c of found) registrySeen.set(c.id, c);
+	return found;
+}
+
+// ---------------------------------------------------------------- connector sign-in (pty)
+let mcpLogin = null;
+function cancelMcpLogin() {
+	if (!mcpLogin) return;
+	mcpLogin.cancelled = true;
+	try { mcpLogin.kill('SIGKILL'); } catch { /* */ }
+	mcpLogin = null;
+}
+// `claude mcp login` only knows servers in its own config, so the connector is registered there too.
+async function startMcpLogin(name, entry) {
+	cancelMcpLogin();
+	const rt = await claudeRuntime();
+	if (!rt.chat) throw new Error(noRuntimeMessage(rt));
+	await claudeCli(['mcp', 'remove', '--scope', 'user', name]).catch(() => {});
+	await claudeCli(['mcp', 'add-json', '--scope', 'user', name, JSON.stringify(toMcpConfig(entry))]);
+	const child = spawn('python3', [join(HERE, 'mcp_login_pty.py'), name], {
+		stdio: ['pipe', 'pipe', 'pipe'],
+		env: { ...process.env, CLAUDE_CLI_SPEC: JSON.stringify({ cmd: rt.chat.cmd, env: rt.chat.env }) },
+	});
+	mcpLogin = child;
+	let buf = '';
+	let done = false;
+	const finish = async (ok, message) => {
+		if (done || child.cancelled) return;
+		done = true;
+		if (mcpLogin === child) mcpLogin = null;
+		if (ok) for (const r of runtimes.values()) { try { await r.q.reconnectMcpServer?.(name); } catch { /* picked up by the next conversation */ } }
+		broadcast({ type: 'mcp_login_done', name, ok, message });
+		broadcast({ type: 'mcp_updated' });
+	};
+	child.stdout.on('data', (d) => {
+		buf += d;
+		let i;
+		while ((i = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, i); buf = buf.slice(i + 1);
+			if (line.startsWith('URL ')) broadcast({ type: 'mcp_login_url', name, url: line.slice(4).trim() });
+			else if (line.startsWith('DONE ')) finish(line.startsWith('DONE ok'), line.replace(/^DONE (ok|fail)\s*/, ''));
+		}
+	});
+	child.stderr.on('data', (d) => log('[mcp-login]', String(d).trim().slice(0, 300)));
+	child.on('error', (e) => finish(false, `无法运行授权脚本（python3）：${e?.message || e}`));
+	child.on('close', (c, s) => finish(false, `授权进程意外退出（${s || c}）`));
 }
 
 // ---------------------------------------------------------------- network proxy
@@ -1274,12 +1530,12 @@ async function seedBuiltinSkills() {
 	let ids = [];
 	try { ids = (await readdir(BUILTIN_SKILLS_DIR, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return; }
 	const state = await readSkillsState();
-	state.enabled ||= [];
 	state.seeded ||= [];
 	const hash = (t) => createHash('sha256').update(t).digest('hex');
 	for (const id of ids) {
 		const src = join(BUILTIN_SKILLS_DIR, id);
-		const dst = join(SKILLS_DIR, id);
+		// A built-in the owner turned off gets its updates where it sits, and stays off.
+		const dst = existsSync(join(SKILLS_OFF_DIR, id)) ? join(SKILLS_OFF_DIR, id) : join(SKILLS_DIR, id);
 		let srcText;
 		try { srcText = await readFile(join(src, 'SKILL.md'), 'utf8'); } catch { continue; }
 		let write = !existsSync(dst);
@@ -1296,10 +1552,7 @@ async function seedBuiltinSkills() {
 			await writeFile(join(dst, '.builtin'), hash(srcText));
 			log('[skills] installed built-in', id);
 		}
-		if (!state.seeded.includes(id)) {
-			state.seeded.push(id);
-			if (!state.enabled.includes(id)) state.enabled.push(id);
-		}
+		if (!state.seeded.includes(id)) state.seeded.push(id);
 	}
 	await writeSkillsState(state);
 }
@@ -2134,40 +2387,164 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/api/skills/install' && req.method === 'POST') {
 			const { source } = await body(req);
-			const src = String(source || '').trim();
-			if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+/.test(src) && !src.startsWith('/')) {
-				return json(res, { ok: false, error: '只支持 https://github.com/… 仓库或本机绝对路径（ZIP/目录）' }, 400);
-			}
-			await mkdir(SKILLS_DIR, { recursive: true });
 			try {
-				await installSkill(src);
-				for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-				broadcast({ type: 'skills_updated' }); refreshSkillNames();
-				return json(res, { ok: true, skills: await listSkills() });
+				const installed = await installSkill(String(source || '').trim());
+				await afterSkillChange();
+				return json(res, { ok: true, installed, skills: await listSkills() });
 			} catch (e) {
 				return json(res, { ok: false, error: e?.message || '安装失败' }, 500);
 			}
 		}
 		if (path === '/api/skills/toggle' && req.method === 'POST') {
 			const { id, enabled } = await body(req);
-			const state = await readSkillsState();
-			state.enabled = (state.enabled || []).filter((x) => x !== id);
-			if (enabled) state.enabled.push(id);
-			await writeSkillsState(state);
-			for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-			broadcast({ type: 'skills_updated' }); refreshSkillNames();
+			try { await setSkillEnabled(id, !!enabled); }
+			catch (e) { return json(res, { ok: false, error: e?.message }, 400); }
+			await afterSkillChange();
 			return json(res, { ok: true, skills: await listSkills() });
 		}
 		if (path === '/api/skills/delete' && req.method === 'POST') {
 			const { id } = await body(req);
-			if (!id || /[/\\]/.test(id)) return json(res, { ok: false, error: 'bad id' }, 400);
-			try { await rm(join(SKILLS_DIR, id), { recursive: true, force: true }); } catch { /* */ }
-			const state = await readSkillsState();
-			state.enabled = (state.enabled || []).filter((x) => x !== id);
-			await writeSkillsState(state);
-			for (const rt of runtimes.values()) { if (rt.q?.reloadSkills) { try { await rt.q.reloadSkills(); } catch { /* */ } } }
-			broadcast({ type: 'skills_updated' }); refreshSkillNames();
+			if (!safeId(id)) return json(res, { ok: false, error: '技能名称无效' }, 400);
+			for (const dir of [SKILLS_DIR, SKILLS_OFF_DIR]) {
+				try { await rm(join(dir, id), { recursive: true, force: true }); } catch { /* */ }
+			}
+			await afterSkillChange();
 			return json(res, { ok: true, skills: await listSkills() });
+		}
+		if (path === '/api/skills/drafts' && req.method === 'GET') {
+			return json(res, { ok: true, drafts: await listSkillDrafts() });
+		}
+		if (path === '/api/skills/drafts/publish' && req.method === 'POST') {
+			const { id, overwrite } = await body(req);
+			if (!safeId(id)) return json(res, { ok: false, error: '草稿名称无效' }, 400);
+			const draft = (await listSkillDrafts()).find((d) => d.id === id);
+			if (!draft) return json(res, { ok: false, error: '草稿不存在' }, 404);
+			if (draft.errors.length) return json(res, { ok: false, error: draft.errors.join('；') }, 400);
+			try {
+				await placeSkill(join(SKILL_DRAFTS_DIR, id), id, { move: true, overwrite: !!overwrite });
+			} catch (e) {
+				return json(res, { ok: false, error: e?.message, exists: /已经有一个/.test(e?.message || '') }, 400);
+			}
+			draftsSeen.delete(id);
+			await afterSkillChange();
+			return json(res, { ok: true, skills: await listSkills() });
+		}
+		if (path === '/api/skills/drafts/discard' && req.method === 'POST') {
+			const { id } = await body(req);
+			if (!safeId(id)) return json(res, { ok: false, error: '草稿名称无效' }, 400);
+			await rm(join(SKILL_DRAFTS_DIR, id), { recursive: true, force: true });
+			draftsSeen.delete(id);
+			broadcast({ type: 'skills_updated' });
+			return json(res, { ok: true });
+		}
+
+		// ---- Extension market ----
+		if (path === '/api/market/skills' && req.method === 'GET') {
+			const skills = await listSkills();
+			const items = (await readCatalog('skills.json')).map((c) => {
+				const have = skills.find((s) => s.id === c.id);
+				return { ...c, installed: !!have, enabled: !!have?.enabled };
+			});
+			return json(res, { ok: true, items });
+		}
+		if (path === '/api/market/connectors' && req.method === 'GET') {
+			const q = String(url.searchParams.get('q') || '').trim().slice(0, 80);
+			const { servers = {} } = await readMcpFile();
+			const mark = (c, source) => {
+				const name = connectorName(c.id);
+				return { ...c, name, source, added: !!servers[name] };
+			};
+			const needle = q.toLowerCase();
+			const curated = (await readCatalog('connectors.json'))
+				.filter((c) => !needle || `${c.id} ${c.title} ${c.description}`.toLowerCase().includes(needle))
+				.map((c) => mark(c, 'curated'));
+			let registry = [];
+			let registryError = '';
+			if (q) {
+				try { registry = (await searchRegistry(q)).map((c) => mark(c, 'registry')); }
+				catch (e) { registryError = e?.message || '搜索失败'; }
+			}
+			return json(res, { ok: true, curated, registry, registryError });
+		}
+		if (path === '/api/market/connectors/add' && req.method === 'POST') {
+			const { id, source, values, confirmed, overwrite } = await body(req);
+			const known = source === 'curated' ? (await readCatalog('connectors.json')).find((c) => c.id === id) : registrySeen.get(id);
+			if (!known) return json(res, { ok: false, error: '找不到这个连接器，请重新搜索' }, 404);
+			const name = connectorName(known.id);
+			if (!name) return json(res, { ok: false, error: '连接器名称无效' }, 400);
+			if (known.type === 'stdio' && !confirmed) return json(res, { ok: false, error: '本地命令需要确认' }, 400);
+			let entry;
+			try { entry = buildMcpEntry(known, values || {}); }
+			catch (e) { return json(res, { ok: false, error: e?.message }, 400); }
+			const cfg = await readMcpFile();
+			cfg.servers ||= {};
+			if (cfg.servers[name] && !overwrite) return json(res, { ok: false, error: `已经有一个叫「${name}」的连接器`, exists: true }, 400);
+			cfg.servers[name] = { ...entry, ...(known.auth ? { auth: known.auth } : {}), origin: source };
+			await writeMcpFile(cfg);
+			await applyMcpToAllRuntimes();
+			broadcast({ type: 'mcp_updated' });
+			return json(res, { ok: true, name });
+		}
+		if (path === '/api/market/plugins' && req.method === 'GET') {
+			try {
+				const cat = await loadPluginCatalog({ force: url.searchParams.get('refresh') === '1' });
+				const list = mergePlugins(cat.available, cat.installed, {
+					q: url.searchParams.get('q') || '',
+					offset: Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0),
+					limit: 40,
+				});
+				for (const p of list.items) {
+					// The CLI's available list leaves out installed plugins, and their description with them.
+					if (p.installed && !p.description && p.installPath) p.description = (await inspectPluginDir(p.installPath).catch(() => null))?.description || '';
+					delete p.installPath;
+				}
+				return json(res, { ok: true, ...list });
+			} catch (e) {
+				return json(res, { ok: false, error: e?.message || '读取插件目录失败' }, 502);
+			}
+		}
+		if (path === '/api/market/plugins/inspect' && req.method === 'GET') {
+			const id = url.searchParams.get('id');
+			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
+			try { return json(res, { ok: true, ...(await inspectInstalled(id)) }); }
+			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/market/plugins/download' && req.method === 'POST') {
+			const { id } = await body(req);
+			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
+			try { return json(res, { ok: true, ...(await downloadPlugin(id)) }); }
+			catch (e) { return json(res, { ok: false, error: e?.message || '下载失败' }, 500); }
+		}
+		const pluginAct = { '/api/market/plugins/enable': 'enable', '/api/market/plugins/disable': 'disable', '/api/market/plugins/uninstall': 'uninstall' }[path];
+		if (pluginAct && req.method === 'POST') {
+			const { id } = await body(req);
+			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
+			try { await pluginCommand(['plugin', pluginAct, id]); return json(res, { ok: true }); }
+			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/market/marketplaces' && req.method === 'GET') {
+			try {
+				const list = await cliJson(['plugin', 'marketplace', 'list', '--json']);
+				const official = new Set(OFFICIAL_MARKETPLACES.map((m) => m.name));
+				return json(res, { ok: true, marketplaces: list.map((m) => ({ name: m.name, url: m.url || m.repo || '', official: official.has(m.name) })) });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/market/marketplaces/add' && req.method === 'POST') {
+			const { source } = await body(req);
+			const src = normalizeMarketplaceSource(source);
+			if (!src) return json(res, { ok: false, error: '只支持 https 地址或 GitHub 的 owner/repo' }, 400);
+			try {
+				await claudeCli(['plugin', 'marketplace', 'add', src], { timeout: 300000 });
+				pluginCatalog.t = 0;
+				return json(res, { ok: true });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/market/marketplaces/remove' && req.method === 'POST') {
+			const { name } = await body(req);
+			if (!safeId(name)) return json(res, { ok: false, error: '名称无效' }, 400);
+			if (OFFICIAL_MARKETPLACES.some((m) => m.name === name)) return json(res, { ok: false, error: '官方市场不能移除' }, 400);
+			try { await pluginCommand(['plugin', 'marketplace', 'remove', name]); return json(res, { ok: true }); }
+			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
 
 		// ---- MCP ----
@@ -2201,6 +2578,8 @@ const server = createServer(async (req, res) => {
 			if (!cfg.servers?.[name]) return json(res, { ok: false, error: 'not found' }, 404);
 			cfg.servers[name].disabled = !enabled;
 			await writeMcpFile(cfg);
+			// A copy registered for sign-in would otherwise keep it connected while switched off.
+			if (!enabled && cfg.servers[name].loginRegistered) await claudeCli(['mcp', 'remove', '--scope', 'user', name]).catch(() => {});
 			await applyMcpToAllRuntimes();
 			broadcast({ type: 'mcp_updated' });
 			return json(res, { ok: true });
@@ -2208,12 +2587,34 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/mcp/remove' && req.method === 'POST') {
 			const { name } = await body(req);
 			const cfg = await readMcpFile();
+			const was = cfg.servers?.[name];
 			if (cfg.servers) delete cfg.servers[name];
 			await writeMcpFile(cfg);
+			if (was?.loginRegistered) await claudeCli(['mcp', 'remove', '--scope', 'user', name]).catch(() => {});
 			await applyMcpToAllRuntimes();
 			broadcast({ type: 'mcp_updated' });
 			return json(res, { ok: true });
 		}
+		// Sign in to a connector that uses OAuth. Claude Code 2.1.112 has no `mcp login`: there the
+		// page falls back to asking Claude to call the server's own authenticate tool in a chat.
+		if (path === '/api/mcp/login' && req.method === 'POST') {
+			const { name } = await body(req);
+			const cfg = await readMcpFile();
+			const entry = cfg.servers?.[name];
+			if (!entry) return json(res, { ok: false, error: '找不到这个连接器' }, 404);
+			if (entry.type === 'stdio') return json(res, { ok: false, error: '本地命令型连接器不需要授权' }, 400);
+			try {
+				// `mcp login --help` succeeds even without that command, so read the command list.
+				if (!/^\s*login\b/m.test(await claudeCli(['mcp', '--help'], { timeout: 45000 }))) return json(res, { ok: true, fallback: 'chat' });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+			try {
+				await startMcpLogin(name, entry);
+				entry.loginRegistered = true;
+				await writeMcpFile(cfg);
+				return json(res, { ok: true });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/mcp/login/cancel' && req.method === 'POST') { cancelMcpLogin(); return json(res, { ok: true }); }
 		if (path === '/api/mcp/reconnect' && req.method === 'POST') {
 			const { name } = await body(req);
 			const rt = anyRuntime();
@@ -2384,7 +2785,9 @@ const server = createServer(async (req, res) => {
 });
 
 await initSessions();
+await migrateSkillState().catch((e) => log('[skills] migration failed', e?.message));
 await seedBuiltinSkills().catch((e) => log('[skills] seeding failed', e?.message));
+for (const d of await listSkillDrafts().catch(() => [])) draftsSeen.set(d.id, d.mtime); // only announce new ones
 await refreshSkillNames();
 server.listen(PORT, HOST, () => {
 	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);

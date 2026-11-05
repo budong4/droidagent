@@ -1,0 +1,12 @@
+[
+	{ "id": "context7", "title": "Context7", "description": "查询各种编程库的最新官方文档，写代码时不再靠过时的记忆。", "type": "http", "url": "https://mcp.context7.com/mcp", "auth": "none", "tags": ["开发"], "inputs": [] },
+	{ "id": "deepwiki", "title": "DeepWiki", "description": "就任意公开的 GitHub 仓库提问，读它的文档和结构。", "type": "http", "url": "https://mcp.deepwiki.com/mcp", "auth": "none", "tags": ["开发"], "inputs": [] },
+	{ "id": "cloudflare-docs", "title": "Cloudflare 文档", "description": "搜索 Cloudflare 的官方开发者文档。", "type": "http", "url": "https://docs.mcp.cloudflare.com/mcp", "auth": "none", "tags": ["开发"], "inputs": [] },
+	{ "id": "linear", "title": "Linear", "description": "查看和管理 Linear 里的任务与项目。", "type": "http", "url": "https://mcp.linear.app/mcp", "auth": "oauth", "tags": ["效率"], "inputs": [] },
+	{ "id": "notion", "title": "Notion", "description": "搜索和编辑 Notion 页面与数据库。", "type": "http", "url": "https://mcp.notion.com/mcp", "auth": "oauth", "tags": ["效率"], "inputs": [] },
+	{ "id": "atlassian", "title": "Jira 和 Confluence", "description": "查询和更新 Jira 工单、Confluence 文档。", "type": "sse", "url": "https://mcp.atlassian.com/v1/sse", "auth": "oauth", "tags": ["效率"], "inputs": [] },
+	{ "id": "sentry", "title": "Sentry", "description": "查看线上错误和崩溃报告。", "type": "http", "url": "https://mcp.sentry.dev/mcp", "auth": "oauth", "tags": ["开发"], "inputs": [] },
+	{ "id": "vercel", "title": "Vercel", "description": "查看部署、日志和项目状态。", "type": "http", "url": "https://mcp.vercel.com", "auth": "oauth", "tags": ["开发"], "inputs": [] },
+	{ "id": "stripe", "title": "Stripe", "description": "查询 Stripe 的客户、订单等业务数据。", "type": "http", "url": "https://mcp.stripe.com", "auth": "oauth", "tags": ["业务"], "inputs": [] },
+	{ "id": "github", "title": "GitHub", "description": "管理仓库、Issue 和 Pull Request。需要一个 GitHub 个人访问令牌。", "type": "http", "url": "https://api.githubcopilot.com/mcp/", "auth": "token", "tags": ["开发"], "inputs": [{ "key": "Authorization", "kind": "header", "label": "GitHub 个人访问令牌", "secret": true, "required": true, "template": "Bearer {token}" }] }
+]

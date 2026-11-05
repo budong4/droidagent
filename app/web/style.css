@@ -897,3 +897,25 @@ div.row:active { transform: none; }
 @media (min-width: 720px) {
 	.suggest { grid-template-columns: repeat(4, 1fr); }
 }
+
+/* ---------------- extension market ---------------- */
+.market-seg { margin: 4px auto 10px; }
+.market-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px auto 12px; }
+.market-row { align-items: center; }
+.market-row .row-text { min-width: 0; }
+.market-meta { display: block; margin-top: 3px; color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }
+.market-row .badge:empty { display: none; }
+.market-card { display: flex; align-items: center; gap: 12px; margin: 12px auto 0; padding: 14px 16px; background: var(--surface); border-radius: 16px; }
+.market-card-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.market-card-text span { color: var(--muted); font-size: 13px; }
+.market-more { display: block; margin: 12px auto 0; }
+.market-wait { margin-top: 10px; color: var(--muted); font-size: 13px; }
+.market-warn, .dialog .market-warn { color: var(--danger); font-size: 14px; }
+.market-pre { max-height: 34vh; margin: 8px 0; padding: 10px 12px; overflow: auto; background: var(--surface2); border-radius: 8px; color: var(--text); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.market-field { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; font-size: 14px; }
+.market-field input { height: 42px; padding: 0 12px; border: 1px solid var(--border, var(--surface2)); border-radius: 10px; background: var(--surface2); color: var(--text); font-size: 15px; outline: 0; }
+.market-link { display: inline-flex; align-items: center; color: var(--primary-ink); text-decoration: none; }
+.market-uninstall { display: block; margin-top: 12px; }
+#dialog-msg { max-height: 62vh; overflow-y: auto; }
+#dialog-msg p { margin: 8px 0; }
+.mcp-auth { margin-right: 8px; }

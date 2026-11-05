@@ -1,0 +1,17 @@
+[
+	{ "id": "skill-creator", "name": "技能创建器（官方完整版）", "description": "Anthropic 官方的技能开发工具，能写技能、跑评测、优化触发描述。比内置的「创建技能」更完整，也更耗时。", "source": "https://github.com/anthropics/skills/tree/main/skills/skill-creator", "tags": ["开发"], "needs": "评测功能需要 Python" },
+	{ "id": "pdf", "name": "PDF 处理", "description": "读取、合并、拆分 PDF，提取文字和表格，填写表单。", "source": "https://github.com/anthropics/skills/tree/main/skills/pdf", "tags": ["文档"], "needs": "需要 Python 库，首次使用时助手会安装" },
+	{ "id": "docx", "name": "Word 文档", "description": "创建和编辑 .docx 文件，支持修订、批注和排版。", "source": "https://github.com/anthropics/skills/tree/main/skills/docx", "tags": ["文档"], "needs": "需要额外工具，首次使用时助手会安装" },
+	{ "id": "xlsx", "name": "Excel 表格", "description": "创建和分析电子表格，支持公式、格式和图表。", "source": "https://github.com/anthropics/skills/tree/main/skills/xlsx", "tags": ["文档"], "needs": "需要 Python 库，首次使用时助手会安装" },
+	{ "id": "pptx", "name": "PPT 演示文稿", "description": "创建和修改 .pptx 演示文稿。", "source": "https://github.com/anthropics/skills/tree/main/skills/pptx", "tags": ["文档"], "needs": "需要额外工具，首次使用时助手会安装" },
+	{ "id": "doc-coauthoring", "name": "文档共创", "description": "按步骤和你一起写提案、技术方案、决策文档。", "source": "https://github.com/anthropics/skills/tree/main/skills/doc-coauthoring", "tags": ["写作"] },
+	{ "id": "internal-comms", "name": "内部沟通", "description": "写状态报告、项目周报、公司内部通知等常见内部文稿。", "source": "https://github.com/anthropics/skills/tree/main/skills/internal-comms", "tags": ["写作"] },
+	{ "id": "mcp-builder", "name": "MCP 服务器开发", "description": "指导你从零做一个高质量的 MCP 服务器，也就是自己的连接器。", "source": "https://github.com/anthropics/skills/tree/main/skills/mcp-builder", "tags": ["开发"] },
+	{ "id": "frontend-design", "name": "前端设计", "description": "做有设计感的网页和界面，避免千篇一律的 AI 风格。", "source": "https://github.com/anthropics/skills/tree/main/skills/frontend-design", "tags": ["开发", "设计"] },
+	{ "id": "web-artifacts-builder", "name": "复杂网页制作", "description": "用 React 和 Tailwind 做多组件的单文件网页。", "source": "https://github.com/anthropics/skills/tree/main/skills/web-artifacts-builder", "tags": ["开发"] },
+	{ "id": "claude-api", "name": "Claude API 开发", "description": "用 Claude API 和 SDK 开发应用时的参考资料。", "source": "https://github.com/anthropics/skills/tree/main/skills/claude-api", "tags": ["开发"] },
+	{ "id": "canvas-design", "name": "海报与视觉设计", "description": "按设计理念生成 PNG 或 PDF 格式的海报和静态作品。", "source": "https://github.com/anthropics/skills/tree/main/skills/canvas-design", "tags": ["设计"] },
+	{ "id": "algorithmic-art", "name": "算法艺术", "description": "用 p5.js 生成带随机种子、可调参数的生成艺术。", "source": "https://github.com/anthropics/skills/tree/main/skills/algorithmic-art", "tags": ["设计"] },
+	{ "id": "theme-factory", "name": "主题工厂", "description": "给幻灯片、文档和网页套用成套的配色与字体主题。", "source": "https://github.com/anthropics/skills/tree/main/skills/theme-factory", "tags": ["设计"] },
+	{ "id": "slack-gif-creator", "name": "动图制作", "description": "制作尺寸和体积都适合 Slack 的 GIF 动图。", "source": "https://github.com/anthropics/skills/tree/main/skills/slack-gif-creator", "tags": ["设计"] }
+]

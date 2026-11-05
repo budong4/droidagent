@@ -983,7 +983,8 @@ const APP_COMMANDS = [
 	{ name: 'resume', desc: '打开对话列表', run: () => openDrawer() },
 	{ name: 'export', desc: '把整段对话复制成 Markdown', run: () => cmdExport() },
 	{ name: 'doctor', desc: '检查 Claude Code 运行方式、网络和登录', run: () => cmdDoctor() },
-	{ name: 'mcp', desc: '管理 MCP 服务器', run: () => openPage('page-mcp') },
+	{ name: 'market', aliases: ['plugin', 'plugins'], desc: '打开扩展市场：技能、连接器和插件', run: () => openPage('page-market') },
+	{ name: 'mcp', desc: '管理连接器（MCP）', run: () => openPage('page-mcp') },
 	{ name: 'skills', desc: '管理技能', run: () => openPage('page-skills') },
 	{ name: 'memory', desc: '编辑系统提示词', run: () => openPage('page-prompt') },
 	{ name: 'config', aliases: ['settings'], desc: '打开设置', run: () => openPage('page-settings') },
@@ -1478,7 +1479,10 @@ async function loadSkills() {
 		const title = dm ? dm[1] : s.name, sub = dm ? dm[2] : (s.description || s.id);
 		const row = el('div', 'row');
 		row.innerHTML = `<span class="row-text"><span>${esc(title)}${s.builtin ? '<span class="badge builtin">内置</span>' : ''}</span><span class="item-sub">${esc(sub)}</span></span><label class="sw"><input type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="启用"><i></i></label>${s.builtin ? '' : `<button class="item-del" aria-label="删除">${ic('i-trash')}</button>`}`;
-		$('input', row).addEventListener('change', (e) => api('/api/skills/toggle', { id: s.id, enabled: e.target.checked }));
+		$('input', row).addEventListener('change', async (e) => {
+			const r = await api('/api/skills/toggle', { id: s.id, enabled: e.target.checked });
+			if (!r.ok) { toast(r.error || '操作失败'); loadSkills(); }
+		});
 		const del = $('.item-del', row);
 		if (del) del.addEventListener('click', () => showDialog({
 			title: '删除技能？', msg: `「${s.name}」会被删除。`, ok: '删除', danger: true,
@@ -1487,7 +1491,7 @@ async function loadSkills() {
 		list.appendChild(row);
 	});
 }
-PAGE_OPEN['page-skills'] = () => { $('#skill-msg').textContent = ''; loadSkills(); };
+PAGE_OPEN['page-skills'] = () => { $('#skill-msg').textContent = ''; loadSkills(); loadSkillDrafts(); };
 $('#skill-install').addEventListener('click', async () => {
 	const src = $('#skill-src').value.trim(); if (!src) return;
 	const msg = $('#skill-msg');
@@ -1515,22 +1519,36 @@ async function loadMcp() {
 	const r = await getJSON('/api/mcp');
 	if (!r.ok) { list.innerHTML = '<div class="empty-state">读取失败</div>'; return; }
 	const names = Object.keys(r.servers || {});
-	if (!names.length) { list.innerHTML = '<div class="empty-state">还没有 MCP 服务器，可以在下方添加。</div>'; return; }
 	const status = {};
 	(r.status || []).forEach((s) => { status[s.name] = s; });
-	list.innerHTML = '';
+	if (!names.length) list.innerHTML = '<div class="empty-state">还没有连接器，可以去市场看看，或在下方手动添加。</div>';
+	else list.innerHTML = '';
 	names.forEach((name) => {
 		const cfg = r.servers[name], st = status[name];
 		const key = cfg.disabled ? 'disabled' : (st ? st.status : 'pending');
 		const tools = st && st.tools ? `，${st.tools.length} 个工具` : '';
+		// Before any conversation has run there is no live status, so go by what the catalog says.
+		const needsAuth = !cfg.disabled && (key === 'needs-auth' || (!st && cfg.auth === 'oauth')) && cfg.type !== 'stdio';
 		const row = el('div', 'row');
-		row.innerHTML = `<span class="row-text"><span>${esc(name)}<span class="badge ${esc(key)}">${esc(MCP_STATUS[key] || key)}</span></span><span class="item-sub">${esc(cfg.url || cfg.command || cfg.type)}${esc(tools)}</span></span><label class="sw"><input type="checkbox" ${cfg.disabled ? '' : 'checked'} aria-label="启用"><i></i></label><button class="item-del" aria-label="删除">${ic('i-trash')}</button>`;
+		row.innerHTML = `<span class="row-text"><span>${esc(name)}<span class="badge ${esc(key)}">${esc(MCP_STATUS[key] || key)}</span></span><span class="item-sub">${esc(cfg.url || cfg.command || cfg.type)}${esc(tools)}</span></span>${needsAuth ? '<button class="pill-btn accent mcp-auth">授权</button>' : ''}<label class="sw"><input type="checkbox" ${cfg.disabled ? '' : 'checked'} aria-label="启用"><i></i></label><button class="item-del" aria-label="删除">${ic('i-trash')}</button>`;
+		if (needsAuth) $('.mcp-auth', row).addEventListener('click', () => authorizeConnector(name));
 		$('input', row).addEventListener('change', (e) => api('/api/mcp/toggle', { name, enabled: e.target.checked }).then(() => setTimeout(loadMcp, 800)));
 		$('.item-del', row).addEventListener('click', () => showDialog({
-			title: '删除 MCP 服务器？', msg: `「${name}」会被移除。`, ok: '删除', danger: true,
+			title: '删除连接器？', msg: `「${name}」会被移除。`, ok: '删除', danger: true,
 			onOk: async () => { await api('/api/mcp/remove', { name }); loadMcp(); },
 		}));
 		list.appendChild(row);
+	});
+	// Connectors from the Claude account and from plugins show up in the live status only.
+	const others = (r.status || []).filter((s) => !r.servers?.[s.name]);
+	$('#mcp-external-group').classList.toggle('hidden', !others.length);
+	const ext = $('#mcp-external');
+	ext.innerHTML = '';
+	others.forEach((s) => {
+		const row = el('div', 'row');
+		const tools = s.tools ? `${s.tools.length} 个工具` : '';
+		row.innerHTML = `<span class="row-text"><span>${esc(s.name)}<span class="badge ${esc(s.status)}">${esc(MCP_STATUS[s.status] || s.status)}</span></span><span class="item-sub">${esc(tools)}</span></span>`;
+		ext.appendChild(row);
 	});
 }
 PAGE_OPEN['page-mcp'] = () => { $('#mcp-msg').textContent = ''; renderMcpType(); loadMcp(); };
@@ -1809,10 +1827,13 @@ function connect() {
 				break;
 			case 'settings': applySettings(m.settings); break;
 			case 'skills_updated':
-				if (pageStack.includes('page-skills')) loadSkills();
+				if (pageStack.includes('page-skills')) { loadSkills(); loadSkillDrafts(); }
 				loadSlashCommands();
 				break;
 			case 'mcp_updated': if (pageStack.includes('page-mcp')) loadMcp(); break;
+			case 'plugins_updated': case 'skill_draft': case 'mcp_login_url': case 'mcp_login_done':
+				marketEvent(m);
+				break;
 			case 'error':
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) { endAssistant(); setRunning(false); sysline('出错了：' + m.message); } else renderSidebar();

@@ -189,9 +189,10 @@
 
 			<h2 class="group-label">助手</h2>
 			<div class="list">
+				<button class="row" data-page="page-market"><svg class="ic row-ic"><use href="#i-box"/></svg><span class="row-text">扩展市场<small>技能、连接器和插件</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 				<button class="row" data-page="page-prompt"><svg class="ic row-ic"><use href="#i-doc"/></svg><span class="row-text">系统提示词</span><span id="val-prompt" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 				<button class="row" data-page="page-skills"><svg class="ic row-ic"><use href="#i-layers"/></svg><span class="row-text">技能</span><span id="val-skills" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row" data-page="page-mcp"><svg class="ic row-ic"><use href="#i-plug"/></svg><span class="row-text">MCP 服务器</span><span id="val-mcp" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				<button class="row" data-page="page-mcp"><svg class="ic row-ic"><use href="#i-plug"/></svg><span class="row-text">连接器（MCP）</span><span id="val-mcp" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 			</div>
 
 			<h2 class="group-label">通用</h2>
@@ -272,6 +273,15 @@
 		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>技能</h1></header>
 		<div class="page-body">
 			<p class="hint">技能是写好的做事方法，助手遇到相关任务时会自动用上。</p>
+			<div class="market-actions">
+				<button id="skill-create" class="pill-btn accent">和 Claude 一起创建</button>
+				<button class="pill-btn" data-market-tab="skills">去市场看看</button>
+			</div>
+			<div id="skill-drafts-group" class="hidden">
+				<h2 class="group-label">等你确认的草稿</h2>
+				<div id="skill-drafts" class="list items"></div>
+			</div>
+			<h2 class="group-label">已安装</h2>
 			<div id="skills-list" class="list items"></div>
 			<h2 class="group-label">安装新技能</h2>
 			<div class="inline-form">
@@ -282,10 +292,28 @@
 		</div>
 	</section>
 
-	<section id="page-mcp" class="page hidden" aria-label="MCP 服务器">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>MCP 服务器</h1></header>
+	<section id="page-market" class="page hidden" aria-label="扩展市场">
+		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>扩展市场</h1></header>
 		<div class="page-body">
+			<div class="seg market-seg" id="market-seg"><button data-v="skills" class="sel">技能</button><button data-v="connectors">连接器</button><button data-v="plugins">插件</button></div>
+			<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="market-search" type="search" placeholder="搜索" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+			<div id="market-intro"></div>
+			<div id="market-results"></div>
+			<button id="market-more" class="pill-btn market-more hidden">加载更多</button>
+			<div id="market-foot"></div>
+		</div>
+	</section>
+
+	<section id="page-mcp" class="page hidden" aria-label="连接器">
+		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>连接器（MCP）</h1></header>
+		<div class="page-body">
+			<p class="hint">连接器让助手能用其他服务的数据和操作。</p>
+			<div class="market-actions"><button class="pill-btn accent" data-market-tab="connectors">去市场看看</button></div>
 			<div id="mcp-list" class="list items"></div>
+			<div id="mcp-external-group" class="hidden">
+				<h2 class="group-label">来自 Claude 账号或插件</h2>
+				<div id="mcp-external" class="list items"></div>
+			</div>
 			<h2 class="group-label">添加服务器</h2>
 			<div class="form-card">
 				<input id="mcp-name" type="text" placeholder="名称（字母、数字、. _ -）" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -371,6 +399,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=8"></script>
+	<script src="app.js?v=9"></script>
+	<script src="market.js?v=1"></script>
 </body>
 </html>

@@ -227,6 +227,10 @@ def forward_callback(port, code, state, out):
 
 
 def spawn(spec, extra_env=None):
+    return spawn_with_args(spec, ["auth", "login", "--claudeai"], extra_env)
+
+
+def spawn_with_args(spec, args, extra_env=None):
     cmd = list(spec["cmd"])
     pid, fd = pty.fork()
     if pid == 0:
@@ -237,7 +241,7 @@ def spawn(spec, extra_env=None):
         os.environ["LINES"] = "40"
         os.environ.pop("ANTHROPIC_API_KEY", None)  # subscription only, never an API key
         try:
-            os.execvp(cmd[0], cmd + ["auth", "login", "--claudeai"])
+            os.execvp(cmd[0], cmd + list(args))
         except OSError as e:
             # Lands in the pty, so the parent can report it instead of "no link".
             os.write(1, f"cannot run {cmd[0]}: {e.strerror or e}\r\n".encode())
