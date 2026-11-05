@@ -1178,53 +1178,110 @@ function ensureOfficialMarkets() {
 	return officialMarkets;
 }
 
-const CATALOG_TTL = 10 * 60 * 1000;
-let pluginCatalog = { t: 0, available: [], installed: [] };
-async function loadPluginCatalog({ force = false } = {}) {
-	if (!force && Date.now() - pluginCatalog.t < CATALOG_TTL) return pluginCatalog;
-	await ensureOfficialMarkets();
-	const j = await cliJson(['plugin', 'list', '--available', '--json'], { timeout: 180000 });
-	pluginCatalog = { t: Date.now(), available: j.available || [], installed: j.installed || [] };
-	return pluginCatalog;
+// One plugin operation at a time. They all rewrite the same settings file, and each runs a CLI that
+// takes seconds on a phone. `installed` is only ever replaced inside the queue, so a slow catalog
+// load can never put back a state from before an enable or disable that finished while it ran.
+const plugins = { known: new Map(), installed: [], loadedAt: 0, loading: null, jobs: new Map(), descriptions: new Map() };
+let pluginQueue = Promise.resolve();
+function pluginTask(fn) {
+	const run = pluginQueue.then(fn, fn);
+	pluginQueue = run.catch(() => {});
+	return run;
 }
-async function installedPlugin(id) {
-	const list = await cliJson(['plugin', 'list', '--json']);
-	return list.find((p) => p.id === id) || null;
+const refreshInstalledPlugins = async () => { plugins.installed = await cliJson(['plugin', 'list', '--json']); };
+
+const CATALOG_TTL = 30 * 60 * 1000;
+function loadPluginCatalog({ force = false } = {}) {
+	if (plugins.loading) return plugins.loading;
+	if (!force && Date.now() - plugins.loadedAt < CATALOG_TTL) return Promise.resolve();
+	plugins.loading = pluginTask(async () => {
+		await ensureOfficialMarkets();
+		const j = await cliJson(['plugin', 'list', '--available', '--json'], { timeout: 180000 });
+		// The CLI leaves installed plugins out of `available`, so an entry seen once is kept:
+		// uninstalling a plugin must bring it back to the list without another slow load.
+		for (const p of j.available || []) if (p?.pluginId) plugins.known.set(p.pluginId, p);
+		plugins.installed = j.installed || [];
+		plugins.loadedAt = Date.now();
+	}).finally(() => { plugins.loading = null; });
+	return plugins.loading;
+}
+
+async function pluginDescription(p) {
+	const key = `${p.id}@${p.version}`;
+	if (!plugins.descriptions.has(key)) {
+		const c = p.installPath ? await inspectPluginDir(p.installPath).catch(() => null) : null;
+		plugins.descriptions.set(key, c?.description || '');
+	}
+	return plugins.descriptions.get(key);
 }
 async function inspectInstalled(id) {
-	const p = await installedPlugin(id);
+	const p = plugins.installed.find((x) => x.id === id);
 	if (!p) throw new Error('这个插件没有安装');
 	return { id, enabled: !!p.enabled, version: p.version || '', contents: p.installPath ? await inspectPluginDir(p.installPath) : null };
 }
-// Downloaded, but not enabled: its hooks and servers run as root, so the owner reads what it holds
-// first. The gate holds back new conversations between `install` (which enables) and `disable`.
-async function downloadPlugin(id) {
-	if (await installedPlugin(id)) throw new Error('这个插件已经装好了');
-	const work = (async () => {
-		await claudeCli(['plugin', 'install', id], { timeout: 300000 });
-		try {
-			await claudeCli(['plugin', 'disable', id]);
-		} catch (e) {
-			await claudeCli(['plugin', 'uninstall', id]).catch(() => {});
-			throw e;
-		}
-	})();
-	pluginGate = work.catch(() => {});
-	await work;
-	pluginCatalog.t = 0;
-	return inspectInstalled(id);
+function pluginsChanged() {
+	broadcast({ type: 'plugins_updated', installed: plugins.installed.length });
+	// Not awaited: the page shouldn't wait for every open conversation before showing the new state.
+	refreshRuntimes().catch((e) => log('[market] refresh', e?.message)).finally(() => {
+		broadcast({ type: 'skills_updated' });
+		broadcast({ type: 'mcp_updated' });
+	});
 }
-async function pluginCommand(args) {
-	await claudeCli(args);
-	pluginCatalog.t = 0;
-	await refreshRuntimes();
-	broadcast({ type: 'plugins_updated' });
-	broadcast({ type: 'skills_updated' });
-	broadcast({ type: 'mcp_updated' });
+
+// Downloading runs in the background and reports its stage, so the list stays usable and the page
+// can be left. The result is installed but not enabled: its hooks and servers run as root, so the
+// owner reads what it holds first. The gate holds back new conversations between `install` (which
+// enables) and `disable`.
+function startPluginDownload(id) {
+	if (plugins.jobs.has(id)) return;
+	const job = { id, stage: 'queued', startedAt: Date.now() };
+	plugins.jobs.set(id, job);
+	const report = (stage, extra = {}) => { job.stage = stage; broadcast({ type: 'plugin_job', ...job, ...extra }); };
+	report('queued');
+	pluginTask(async () => {
+		await refreshInstalledPlugins();
+		if (plugins.installed.some((p) => p.id === id)) throw new Error('这个插件已经装好了');
+		report('downloading');
+		const work = (async () => {
+			await claudeCli(['plugin', 'install', id], { timeout: 300000 });
+			report('checking');
+			try {
+				await claudeCli(['plugin', 'disable', id]);
+			} catch (e) {
+				await claudeCli(['plugin', 'uninstall', id]).catch(() => {});
+				throw e;
+			}
+		})();
+		pluginGate = work.catch(() => {});
+		await work;
+		await refreshInstalledPlugins();
+		return inspectInstalled(id);
+	}).then((r) => {
+		plugins.jobs.delete(id);
+		report('ready', { contents: r.contents });
+		broadcast({ type: 'plugins_updated', installed: plugins.installed.length });
+	}, (e) => {
+		plugins.jobs.delete(id);
+		report('error', { error: e?.message || '下载失败' });
+	});
+}
+
+// Sets the state rather than flipping it, so a repeated or stale request changes nothing.
+function setPluginEnabled(id, enabled) {
+	return pluginTask(async () => {
+		await refreshInstalledPlugins();
+		const cur = plugins.installed.find((p) => p.id === id);
+		if (!cur) throw new Error('这个插件没有安装');
+		if (!!cur.enabled !== enabled) {
+			await claudeCli(['plugin', enabled ? 'enable' : 'disable', id]);
+			await refreshInstalledPlugins();
+		}
+		return !!plugins.installed.find((p) => p.id === id)?.enabled;
+	});
 }
 
 // ---------------------------------------------------------------- connector catalog
-const readCatalog = async (file) => JSON.parse(await readFile(join(HERE, '..', 'catalog', file), 'utf8'));
+const readCatalog = async (file) => JSON.parse(await readFile(join(HERE, 'catalog', file), 'utf8'));
 // Results of recent registry searches. Adding one uses this copy, not whatever the page sends back.
 const registrySeen = new Map();
 async function searchRegistry(q) {
@@ -2487,18 +2544,18 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/api/market/plugins' && req.method === 'GET') {
 			try {
-				const cat = await loadPluginCatalog({ force: url.searchParams.get('refresh') === '1' });
-				const list = mergePlugins(cat.available, cat.installed, {
-					q: url.searchParams.get('q') || '',
-					offset: Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0),
-					limit: 40,
-				});
-				for (const p of list.items) {
-					// The CLI's available list leaves out installed plugins, and their description with them.
-					if (p.installed && !p.description && p.installPath) p.description = (await inspectPluginDir(p.installPath).catch(() => null))?.description || '';
+				// Only the first load waits. After that the list answers at once and refreshes behind it.
+				if (!plugins.loadedAt) await loadPluginCatalog();
+				else loadPluginCatalog().catch((e) => log('[market] catalog refresh', e?.message));
+				const q = url.searchParams.get('q') || '';
+				const known = [...plugins.known.values()];
+				const installed = mergePlugins(known, plugins.installed, { q, view: 'installed', limit: 1000 });
+				for (const p of installed.items) {
+					if (!p.description) p.description = await pluginDescription(p);
 					delete p.installPath;
 				}
-				return json(res, { ok: true, ...list });
+				const discover = mergePlugins(known, plugins.installed, { q, view: 'discover', limit: 40, offset: Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0) });
+				return json(res, { ok: true, installed: installed.items, installedCount: plugins.installed.length, items: discover.items, total: discover.total, jobs: [...plugins.jobs.values()] });
 			} catch (e) {
 				return json(res, { ok: false, error: e?.message || '读取插件目录失败' }, 502);
 			}
@@ -2512,15 +2569,26 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/market/plugins/download' && req.method === 'POST') {
 			const { id } = await body(req);
 			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
-			try { return json(res, { ok: true, ...(await downloadPlugin(id)) }); }
-			catch (e) { return json(res, { ok: false, error: e?.message || '下载失败' }, 500); }
+			startPluginDownload(id);
+			return json(res, { ok: true });
 		}
-		const pluginAct = { '/api/market/plugins/enable': 'enable', '/api/market/plugins/disable': 'disable', '/api/market/plugins/uninstall': 'uninstall' }[path];
-		if (pluginAct && req.method === 'POST') {
+		if (path === '/api/market/plugins/set' && req.method === 'POST') {
+			const { id, enabled } = await body(req);
+			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
+			try {
+				const now = await setPluginEnabled(id, !!enabled);
+				pluginsChanged();
+				return json(res, { ok: true, enabled: now });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+		if (path === '/api/market/plugins/uninstall' && req.method === 'POST') {
 			const { id } = await body(req);
 			if (!isPluginId(id)) return json(res, { ok: false, error: '插件名称无效' }, 400);
-			try { await pluginCommand(['plugin', pluginAct, id]); return json(res, { ok: true }); }
-			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+			try {
+				await pluginTask(async () => { await claudeCli(['plugin', 'uninstall', id]); await refreshInstalledPlugins(); });
+				pluginsChanged();
+				return json(res, { ok: true });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
 		if (path === '/api/market/marketplaces' && req.method === 'GET') {
 			try {
@@ -2534,8 +2602,8 @@ const server = createServer(async (req, res) => {
 			const src = normalizeMarketplaceSource(source);
 			if (!src) return json(res, { ok: false, error: '只支持 https 地址或 GitHub 的 owner/repo' }, 400);
 			try {
-				await claudeCli(['plugin', 'marketplace', 'add', src], { timeout: 300000 });
-				pluginCatalog.t = 0;
+				await pluginTask(() => claudeCli(['plugin', 'marketplace', 'add', src], { timeout: 300000 }));
+				await loadPluginCatalog({ force: true });
 				return json(res, { ok: true });
 			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
@@ -2543,8 +2611,13 @@ const server = createServer(async (req, res) => {
 			const { name } = await body(req);
 			if (!safeId(name)) return json(res, { ok: false, error: '名称无效' }, 400);
 			if (OFFICIAL_MARKETPLACES.some((m) => m.name === name)) return json(res, { ok: false, error: '官方市场不能移除' }, 400);
-			try { await pluginCommand(['plugin', 'marketplace', 'remove', name]); return json(res, { ok: true }); }
-			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+			try {
+				await pluginTask(() => claudeCli(['plugin', 'marketplace', 'remove', name]));
+				plugins.known.clear();
+				await loadPluginCatalog({ force: true });
+				pluginsChanged();
+				return json(res, { ok: true });
+			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
 
 		// ---- MCP ----

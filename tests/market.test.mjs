@@ -1,7 +1,7 @@
 // Run: node --test tests/market.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, symlink, rm, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -141,6 +141,34 @@ test('mergePlugins: search, ranking, installed state, official flag, paging', ()
 	const page = mergePlugins(available, [], { limit: 1, offset: 1 });
 	assert.equal(page.total, 3);
 	assert.deepEqual(page.items.map((p) => p.id), ['b@claude-plugins-official']);
+});
+
+test('mergePlugins can list installed and not-installed separately', () => {
+	const available = [{ pluginId: 'a@m', name: 'a', description: 'x' }, { pluginId: 'b@m', name: 'b', description: 'y' }];
+	const installed = [{ id: 'b@m', enabled: true }];
+	assert.deepEqual(mergePlugins(available, installed, { view: 'installed' }).items.map((p) => p.id), ['b@m']);
+	const d = mergePlugins(available, installed, { view: 'discover' });
+	assert.deepEqual(d.items.map((p) => p.id), ['a@m']);
+	assert.equal(d.total, 1);
+});
+
+// The launcher installs only these from the bundle (see "sync" in phone/debian): anything else
+// under app/ ships in the package and then silently never reaches the phone.
+test('app/ holds only the directories the launcher installs', async () => {
+	const dirs = (await readdir(new URL('../app/', import.meta.url), { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+	assert.deepEqual(dirs, ['server', 'skills', 'web']);
+	const launcher = await readFile(new URL('../phone/debian', import.meta.url), 'utf8');
+	for (const d of dirs) assert.ok(launcher.includes(`$tmp/${d}`), `launcher does not install ${d}`);
+});
+
+test('the catalogs the server reads are valid and inside server/', async () => {
+	for (const [file, n] of [['skills.json', 15], ['connectors.json', 10]]) {
+		const list = JSON.parse(await readFile(new URL(`../app/server/catalog/${file}`, import.meta.url), 'utf8'));
+		assert.equal(list.length, n);
+		assert.equal(new Set(list.map((x) => x.id)).size, n);
+		if (file === 'skills.json') for (const s of list) assert.ok(parseSkillSource(s.source), s.id);
+		else for (const c of list) assert.doesNotThrow(() => buildMcpEntry(c, Object.fromEntries((c.inputs || []).map((i) => [i.key, 'v']))), c.id);
+	}
 });
 
 test('normalizeRegistry keeps the latest active version and usable transports', () => {

@@ -143,7 +143,7 @@ debian retools                               装逆向分析工具链
 - **执行模式**（输入框左下角）：Ask（只读操作直接做，其余逐步确认）、Accept edits（自动改文件和跑常规命令，有风险的先问，默认）、Plan（只读分析，先出计划，同意后执行）、Auto（只有刷机、重启、格式化等高危操作才问）、Full access（不再询问，切换时确认一次）。
 - **系统提示词 / 技能 / MCP**：在 App 的设置里管理，下一条消息生效。内置 8 个安卓常用技能（手机体检、存储清理、应用管理、屏幕自动化、日志诊断、网络诊断、APK 分析、备份与恢复），首次启动自动启用；关掉或改过的不会被更新覆盖。
 - **外观**：设置 → 外观 里选主题、字体和聊天背景。背景有 14 张预设（原创动漫风场景和渐变、歌川广重浮世绘、梵高名画、NASA 极光照片，均为原创或公有领域，来源见 `tools/background_photos.py`），也可以用自己的图片，都带可调遮罩。输入框是液态玻璃效果。字体第一次使用时按需下载用到的字，之后缓存在 `~/.claude/fonts`。
-- **扩展市场**：设置 → 助手 → 扩展市场（或 `/market`）。技能和连接器的精选目录在 `app/catalog/`；插件通过官方 `claude plugin` 命令安装，下载后默认不启用，列出内容经确认才启用，因为插件的 hooks 和本地命令会以 root 运行。关闭的技能放在 `~/.claude/skills-disabled/`，和 Claude 一起创建的技能草稿放在 `~/.claude/skill-drafts/`。市场逻辑的测试：`node --test tests/market.test.mjs`。
+- **扩展市场**：设置 → 助手 → 扩展市场（或 `/market`）。技能和连接器的精选目录在 `app/server/catalog/`（`app/` 下只有 `server`、`web`、`skills` 会同步到手机）；插件通过官方 `claude plugin` 命令安装，下载后默认不启用，列出内容经确认才启用，因为插件的 hooks 和本地命令会以 root 运行。关闭的技能放在 `~/.claude/skills-disabled/`，和 Claude 一起创建的技能草稿放在 `~/.claude/skill-drafts/`。市场逻辑的测试：`node --test tests/market.test.mjs`。
 - **斜杠命令**：输入 `/` 列出全部命令。Claude Code 终端界面里才有的 `/status`、`/usage`、`/doctor` 等由 App 自己实现；`/compact`、`/context`、`/cost`、`/init` 和自定义命令、技能交给 Claude Code，输出显示在对话里。
 - **对话标题**：第一次回复之后，用一次 Haiku 调用根据对话内容生成标题；手动改过名的不会被覆盖。
 - **版本与更新**：设置 → 通用 → 版本与更新，列出每个版本的更新内容（来自 `CHANGELOG.md`，随 App 一起打包）。

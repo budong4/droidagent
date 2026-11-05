@@ -983,9 +983,9 @@ const APP_COMMANDS = [
 	{ name: 'resume', desc: '打开对话列表', run: () => openDrawer() },
 	{ name: 'export', desc: '把整段对话复制成 Markdown', run: () => cmdExport() },
 	{ name: 'doctor', desc: '检查 Claude Code 运行方式、网络和登录', run: () => cmdDoctor() },
-	{ name: 'market', aliases: ['plugin', 'plugins'], desc: '打开扩展市场：技能、连接器和插件', run: () => openPage('page-market') },
-	{ name: 'mcp', desc: '管理连接器（MCP）', run: () => openPage('page-mcp') },
-	{ name: 'skills', desc: '管理技能', run: () => openPage('page-skills') },
+	{ name: 'market', aliases: ['plugin', 'plugins'], desc: '打开扩展市场：技能、连接器和插件', run: () => openMarket('skills') },
+	{ name: 'mcp', desc: '管理连接器（MCP）', run: () => openMarket('connectors', 'installed') },
+	{ name: 'skills', desc: '管理技能', run: () => openMarket('skills', 'installed') },
 	{ name: 'memory', desc: '编辑系统提示词', run: () => openPage('page-prompt') },
 	{ name: 'config', aliases: ['settings'], desc: '打开设置', run: () => openPage('page-settings') },
 	{ name: 'theme', desc: '更换主题', run: () => openPage('page-theme') },
@@ -1442,10 +1442,8 @@ PAGE_OPEN['page-settings'] = async () => {
 	updateLookValues();
 	refreshAccount();
 	loadUpdate();
-	const [sp, sk, mc] = await Promise.all([getJSON('/api/systemprompt'), getJSON('/api/skills'), getJSON('/api/mcp')]);
+	const sp = await getJSON('/api/systemprompt');
 	$('#val-prompt').textContent = sp.ok && sp.text && sp.text.trim() ? '已设置' : '未设置';
-	if (sk.ok) $('#val-skills').textContent = `已启用 ${sk.skills.filter((s) => s.enabled).length} 个`;
-	if (mc.ok) { const n = Object.keys(mc.servers || {}).length; $('#val-mcp').textContent = n ? `${n} 个` : '未添加'; }
 };
 $('#t-autoupdate').addEventListener('change', (e) => pushSettings({ autoUpdate: e.target.checked }));
 
@@ -1462,114 +1460,6 @@ $('#prompt-save').addEventListener('click', async () => {
 	$('#val-prompt').textContent = text.trim() ? '已设置' : '未设置';
 	closePage('page-prompt');
 	toast('已保存，从下一条消息起生效');
-});
-
-/* ---------------- skills ---------------- */
-async function loadSkills() {
-	const list = $('#skills-list');
-	list.innerHTML = '<div class="empty-state"><span class="spin"></span></div>';
-	const r = await getJSON('/api/skills');
-	if (!r.ok) { list.innerHTML = '<div class="empty-state">读取失败</div>'; return; }
-	if (!r.skills.length) { list.innerHTML = '<div class="empty-state">还没有技能。可以在下方从 GitHub 安装。</div>'; return; }
-	list.innerHTML = '';
-	r.skills.sort((a, b) => (b.builtin - a.builtin) || a.name.localeCompare(b.name)).forEach((s) => {
-		// Skill names are ids (phone-health); a description that opens with a short phrase
-		// ("手机体检。…") gives the readable title.
-		const dm = /^([^。.]{2,10})[。.]\s*(.+)$/s.exec(s.description || '');
-		const title = dm ? dm[1] : s.name, sub = dm ? dm[2] : (s.description || s.id);
-		const row = el('div', 'row');
-		row.innerHTML = `<span class="row-text"><span>${esc(title)}${s.builtin ? '<span class="badge builtin">内置</span>' : ''}</span><span class="item-sub">${esc(sub)}</span></span><label class="sw"><input type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="启用"><i></i></label>${s.builtin ? '' : `<button class="item-del" aria-label="删除">${ic('i-trash')}</button>`}`;
-		$('input', row).addEventListener('change', async (e) => {
-			const r = await api('/api/skills/toggle', { id: s.id, enabled: e.target.checked });
-			if (!r.ok) { toast(r.error || '操作失败'); loadSkills(); }
-		});
-		const del = $('.item-del', row);
-		if (del) del.addEventListener('click', () => showDialog({
-			title: '删除技能？', msg: `「${s.name}」会被删除。`, ok: '删除', danger: true,
-			onOk: async () => { await api('/api/skills/delete', { id: s.id }); loadSkills(); },
-		}));
-		list.appendChild(row);
-	});
-}
-PAGE_OPEN['page-skills'] = () => { $('#skill-msg').textContent = ''; loadSkills(); loadSkillDrafts(); };
-$('#skill-install').addEventListener('click', async () => {
-	const src = $('#skill-src').value.trim(); if (!src) return;
-	const msg = $('#skill-msg');
-	msg.className = 'form-msg'; msg.textContent = '正在安装…';
-	$('#skill-install').disabled = true;
-	const r = await api('/api/skills/install', { source: src });
-	$('#skill-install').disabled = false;
-	if (r.ok) { msg.className = 'form-msg ok'; msg.textContent = '安装好了'; $('#skill-src').value = ''; loadSkills(); }
-	else { msg.className = 'form-msg err'; msg.textContent = '安装失败：' + (r.error || ''); }
-});
-
-/* ---------------- MCP ---------------- */
-let mcpType = 'http';
-function renderMcpType() {
-	$$('#mcp-type-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.v === mcpType));
-	const net = mcpType !== 'stdio';
-	['#mcp-url', '#mcp-bearer'].forEach((s) => $(s).classList.toggle('hidden', !net));
-	['#mcp-command', '#mcp-args'].forEach((s) => $(s).classList.toggle('hidden', net));
-}
-$$('#mcp-type-seg button').forEach((b) => b.addEventListener('click', () => { mcpType = b.dataset.v; renderMcpType(); }));
-const MCP_STATUS = { connected: '已连接', failed: '连接失败', 'needs-auth': '待授权', pending: '连接中', disabled: '已停用' };
-async function loadMcp() {
-	const list = $('#mcp-list');
-	list.innerHTML = '<div class="empty-state"><span class="spin"></span></div>';
-	const r = await getJSON('/api/mcp');
-	if (!r.ok) { list.innerHTML = '<div class="empty-state">读取失败</div>'; return; }
-	const names = Object.keys(r.servers || {});
-	const status = {};
-	(r.status || []).forEach((s) => { status[s.name] = s; });
-	if (!names.length) list.innerHTML = '<div class="empty-state">还没有连接器，可以去市场看看，或在下方手动添加。</div>';
-	else list.innerHTML = '';
-	names.forEach((name) => {
-		const cfg = r.servers[name], st = status[name];
-		const key = cfg.disabled ? 'disabled' : (st ? st.status : 'pending');
-		const tools = st && st.tools ? `，${st.tools.length} 个工具` : '';
-		// Before any conversation has run there is no live status, so go by what the catalog says.
-		const needsAuth = !cfg.disabled && (key === 'needs-auth' || (!st && cfg.auth === 'oauth')) && cfg.type !== 'stdio';
-		const row = el('div', 'row');
-		row.innerHTML = `<span class="row-text"><span>${esc(name)}<span class="badge ${esc(key)}">${esc(MCP_STATUS[key] || key)}</span></span><span class="item-sub">${esc(cfg.url || cfg.command || cfg.type)}${esc(tools)}</span></span>${needsAuth ? '<button class="pill-btn accent mcp-auth">授权</button>' : ''}<label class="sw"><input type="checkbox" ${cfg.disabled ? '' : 'checked'} aria-label="启用"><i></i></label><button class="item-del" aria-label="删除">${ic('i-trash')}</button>`;
-		if (needsAuth) $('.mcp-auth', row).addEventListener('click', () => authorizeConnector(name));
-		$('input', row).addEventListener('change', (e) => api('/api/mcp/toggle', { name, enabled: e.target.checked }).then(() => setTimeout(loadMcp, 800)));
-		$('.item-del', row).addEventListener('click', () => showDialog({
-			title: '删除连接器？', msg: `「${name}」会被移除。`, ok: '删除', danger: true,
-			onOk: async () => { await api('/api/mcp/remove', { name }); loadMcp(); },
-		}));
-		list.appendChild(row);
-	});
-	// Connectors from the Claude account and from plugins show up in the live status only.
-	const others = (r.status || []).filter((s) => !r.servers?.[s.name]);
-	$('#mcp-external-group').classList.toggle('hidden', !others.length);
-	const ext = $('#mcp-external');
-	ext.innerHTML = '';
-	others.forEach((s) => {
-		const row = el('div', 'row');
-		const tools = s.tools ? `${s.tools.length} 个工具` : '';
-		row.innerHTML = `<span class="row-text"><span>${esc(s.name)}<span class="badge ${esc(s.status)}">${esc(MCP_STATUS[s.status] || s.status)}</span></span><span class="item-sub">${esc(tools)}</span></span>`;
-		ext.appendChild(row);
-	});
-}
-PAGE_OPEN['page-mcp'] = () => { $('#mcp-msg').textContent = ''; renderMcpType(); loadMcp(); };
-$('#mcp-add').addEventListener('click', async () => {
-	const payload = { name: $('#mcp-name').value.trim(), type: mcpType };
-	if (mcpType === 'stdio') {
-		payload.command = $('#mcp-command').value.trim();
-		const args = $('#mcp-args').value.trim();
-		payload.args = args ? args.split(/\s+/) : [];
-	} else {
-		payload.url = $('#mcp-url').value.trim();
-		if ($('#mcp-bearer').value.trim()) payload.bearer = $('#mcp-bearer').value.trim();
-	}
-	const msg = $('#mcp-msg');
-	msg.className = 'form-msg'; msg.textContent = '正在添加…';
-	const r = await api('/api/mcp/add', payload);
-	if (r.ok) {
-		msg.className = 'form-msg ok'; msg.textContent = '已添加';
-		['#mcp-name', '#mcp-url', '#mcp-bearer', '#mcp-command', '#mcp-args'].forEach((s) => { $(s).value = ''; });
-		setTimeout(loadMcp, 1000);
-	} else { msg.className = 'form-msg err'; msg.textContent = '添加失败：' + (r.error || ''); }
 });
 
 /* ---------------- self-update ---------------- */
@@ -1826,12 +1716,9 @@ function connect() {
 				runningIds.clear(); pendingIds.clear();
 				break;
 			case 'settings': applySettings(m.settings); break;
-			case 'skills_updated':
-				if (pageStack.includes('page-skills')) { loadSkills(); loadSkillDrafts(); }
-				loadSlashCommands();
-				break;
-			case 'mcp_updated': if (pageStack.includes('page-mcp')) loadMcp(); break;
-			case 'plugins_updated': case 'skill_draft': case 'mcp_login_url': case 'mcp_login_done':
+			case 'skills_updated': loadSlashCommands(); break;
+			case 'mcp_updated': break;
+			case 'plugins_updated': case 'plugin_job': case 'skill_draft': case 'mcp_login_url': case 'mcp_login_done':
 				marketEvent(m);
 				break;
 			case 'error':

@@ -138,7 +138,7 @@ export async function findEscapingSymlinks(root) {
 
 // Catalog + what is installed -> one searchable, paged list. Installed first, then official, then
 // by popularity, so the first screen is the useful part of thousands of entries.
-export function mergePlugins(available, installed, { q = '', limit = 50, offset = 0 } = {}) {
+export function mergePlugins(available, installed, { q = '', limit = 50, offset = 0, view = 'all' } = {}) {
 	const byId = new Map();
 	for (const p of available || []) {
 		if (!p?.pluginId || byId.has(p.pluginId)) continue;
@@ -158,6 +158,7 @@ export function mergePlugins(available, installed, { q = '', limit = 50, offset 
 	const needle = String(q).trim().toLowerCase();
 	const all = [...byId.values()]
 		.map((p) => ({ ...p, official: OFFICIAL_NAMES.has(p.marketplace) }))
+		.filter((p) => view === 'all' || (view === 'installed') === p.installed)
 		.filter((p) => !needle || p.name.toLowerCase().includes(needle) || p.description.toLowerCase().includes(needle))
 		.sort((a, b) => (b.installed - a.installed) || (b.official - a.official) || (b.installCount - a.installCount) || a.name.localeCompare(b.name));
 	return { total: all.length, items: all.slice(offset, offset + limit) };

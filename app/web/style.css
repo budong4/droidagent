@@ -899,7 +899,10 @@ div.row:active { transform: none; }
 }
 
 /* ---------------- extension market ---------------- */
-.market-seg { margin: 4px auto 10px; }
+.market-seg { margin: 4px auto 8px; }
+.market-view { margin: 10px auto 10px; background: none; padding: 0; }
+.market-view button { height: 30px; font-size: 13px; }
+.market-view button.sel { background: var(--surface2); box-shadow: none; }
 .market-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px auto 12px; }
 .market-row { align-items: center; }
 .market-row .row-text { min-width: 0; }
@@ -919,3 +922,20 @@ div.row:active { transform: none; }
 #dialog-msg { max-height: 62vh; overflow-y: auto; }
 #dialog-msg p { margin: 8px 0; }
 .mcp-auth { margin-right: 8px; }
+.market-actions:empty { display: none; }
+.market-row .sw { flex: none; }
+.market-row .market-act { margin-right: 6px; }
+.market-row .item-del { flex: none; }
+.market-busy { opacity: .5; pointer-events: none; }
+.market-tap { cursor: pointer; }
+.market-retry { display: block; margin: 12px auto 0; }
+.pill-btn .spin.sm { width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }
+.market-manual { margin-top: 18px; }
+.market-manual summary { padding: 8px 4px; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; }
+.job { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 6px; color: var(--accent); font-size: 12.5px; }
+.job-time { color: var(--muted); }
+.job-bar { position: relative; flex: 1 0 100%; height: 3px; overflow: hidden; border-radius: 2px; background: var(--surface2); }
+.job-bar::after { content: ''; position: absolute; top: 0; bottom: 0; left: -40%; width: 40%; border-radius: 2px; background: var(--accent); animation: job-slide 1.3s ease-in-out infinite; }
+@keyframes job-slide { to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .job-bar::after { animation: none; left: 0; width: 100%; opacity: .5; } }
+.market-row .sw:last-child { margin-right: 42px; }
