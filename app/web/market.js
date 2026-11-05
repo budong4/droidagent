@@ -214,12 +214,17 @@ const AUTH_BADGE = { none: ['connected', '免登录'], oauth: ['needs-auth', '�
 async function loadConnectorsTab() {
 	const installedView = curView() === 'installed';
 	const { seq, box } = start(!installedView && mk.q ? '正在搜索 MCP 注册表' : '');
-	const [mine, cat] = await Promise.all([getJSON('/api/mcp'), installedView ? null : getJSON('/api/market/connectors' + (mk.q ? `?q=${encodeURIComponent(mk.q)}` : ''))]);
+	const [mine, cat] = await Promise.all([getJSON(installedView ? `/api/mcp?probe=${encodeURIComponent(curSession?.id || '1')}` : '/api/mcp'), installedView ? null : getJSON('/api/market/connectors' + (mk.q ? `?q=${encodeURIComponent(mk.q)}` : ''))]);
 	if (seq !== mk.seq) return;
 	box.innerHTML = '';
 	if (!mine.ok || (cat && !cat.ok)) { box.appendChild(emptyMsg('读取失败，请稍后重试')); return; }
 	setInstalledCount(Object.keys(mine.servers || {}).length);
-	if (installedView) { renderMyConnectors(box, mine); return; }
+	if (installedView) {
+		renderMyConnectors(box, mine);
+		$('#market-foot').appendChild(manualConnectorForm());
+		watchConnectors(mine, seq);
+		return;
+	}
 	const curated = cat.curated.filter((c) => !c.added);
 	if (curated.length) {
 		box.appendChild(groupLabel('精选'));
@@ -245,30 +250,107 @@ function renderMyConnectors(box, r) {
 	else box.appendChild(emptyMsg(mk.q ? '没有符合的连接器' : '还没有添加连接器'));
 	// Connectors from the Claude account and from plugins show up in the live status only.
 	const others = (r.status || []).filter((s) => !r.servers?.[s.name] && (!needle || s.name.toLowerCase().includes(needle)));
-	if (others.length) {
-		box.appendChild(groupLabel('来自 Claude 账号或插件'));
-		box.appendChild(listOf(others.map((s) => marketRow({
-			title: s.name, sub: s.tools ? `${s.tools.length} 个工具` : '', badges: [[s.status, MCP_STATUS[s.status] || s.status]],
-		}))));
+	for (const [label, match] of EXTERNAL_GROUPS) {
+		const rows = others.filter(match);
+		if (rows.length) {
+			box.appendChild(groupLabel(label));
+			box.appendChild(listOf(rows.map(externalConnectorRow)));
+		}
 	}
-	$('#market-foot').appendChild(manualConnectorForm());
+	if (!r.live && !needle) box.appendChild(el('p', 'foot-note', '来自 Claude 账号和插件的连接器，要开始一段对话后才会显示。'));
+}
+
+const isAccountConnector = (s) => s.name.startsWith('claude.ai ') || s.scope === 'claudeai';
+const isPluginConnector = (s) => s.name.startsWith('plugin:') || s.source === 'plugin';
+const EXTERNAL_GROUPS = [
+	['来自 Claude 账号', isAccountConnector],
+	['来自插件', (s) => !isAccountConnector(s) && isPluginConnector(s)],
+	['其他配置', (s) => !isAccountConnector(s) && !isPluginConnector(s)],
+];
+function externalTitle(s) {
+	if (s.name.startsWith('claude.ai ')) return s.name.slice('claude.ai '.length);
+	const p = s.name.split(':');
+	return p[0] === 'plugin' && p.length >= 3 ? (p[1] === p[2] ? p[2] : `${p[2]}（${p[1]}）`) : s.name;
+}
+function addErrorLine(row, error) {
+	if (error) $('.row-text', row).appendChild(el('span', 'market-error', esc(error)));
+}
+
+function externalConnectorRow(s) {
+	const needsAuth = s.status === 'needs-auth';
+	const broken = s.status === 'failed';
+	const row = marketRow({
+		title: externalTitle(s), badges: [[s.status, MCP_STATUS[s.status] || s.status]],
+		sub: s.tools?.length ? `${s.tools.length} 个工具` : '',
+		action: (needsAuth ? actionBtn('授权') : broken ? actionBtn('重试', '') : '') + toggleHtml(s.status !== 'disabled'),
+	});
+	addErrorLine(row, s.error);
+	const act = $('.market-act', row);
+	if (act) act.addEventListener('click', (e) => (needsAuth ? authorizeConnector(s.name) : reconnectConnector(s.name, e.currentTarget)));
+	$('input', row).addEventListener('change', async (e) => {
+		const sw = e.target;
+		const on = sw.checked;
+		sw.disabled = true;
+		const r = await api('/api/mcp/external-toggle', { name: s.name, enabled: on });
+		sw.disabled = false;
+		// Turning on a server that then can't connect reports an error, yet it is on now: only the
+		// refreshed list says which state it ended in.
+		if (!r.ok) failed(on ? '没能连接' : '操作失败', r.error);
+		else toast(on ? '已开启' : '已关闭');
+		refreshConnectors();
+	});
+	return row;
+}
+
+async function reconnectConnector(name, btn) {
+	const reset = btn ? busyButton(btn, '连接中') : null;
+	const r = await api('/api/mcp/reconnect', { name });
+	reset?.();
+	if (!r.ok) failed('连接失败', r.error);
+	else toast('已重新连接');
+	refreshConnectors();
+}
+
+// The list again in place, leaving a half-filled manual form below it alone.
+async function refreshConnectors() {
+	if (!onMarket() || mk.tab !== 'connectors' || curView() !== 'installed') return null;
+	const seq = mk.seq;
+	const r = await getJSON('/api/mcp');
+	if (seq !== mk.seq || !r.ok) return null;
+	const box = $('#market-results');
+	box.innerHTML = '';
+	setInstalledCount(Object.keys(r.servers || {}).length);
+	renderMyConnectors(box, r);
+	return r;
+}
+// Servers take a few seconds to connect after the page opens; show them arriving.
+async function watchConnectors(r, seq) {
+	for (let i = 0; i < 6 && seq === mk.seq && (!r || !r.live || (r.status || []).some((s) => s.status === 'pending')); i++) {
+		await new Promise((done) => { setTimeout(done, 3000); });
+		if (seq !== mk.seq) return;
+		r = await refreshConnectors();
+	}
 }
 
 function myConnectorRow(name, cfg, st) {
 	const key = cfg.disabled ? 'disabled' : (st ? st.status : 'idle');
 	// Before any conversation has run there is no live status, so go by what the catalog says.
 	const needsAuth = !cfg.disabled && cfg.type !== 'stdio' && (key === 'needs-auth' || (!st && cfg.auth === 'oauth'));
+	const broken = !cfg.disabled && key === 'failed';
 	const row = marketRow({
 		title: name, badges: [[key, MCP_STATUS[key] || key]],
 		sub: `${cfg.url || [cfg.command, ...(cfg.args || [])].join(' ') || cfg.type}${st?.tools ? `，${st.tools.length} 个工具` : ''}`,
-		action: (needsAuth ? actionBtn('授权') : '') + toggleHtml(!cfg.disabled) + delHtml('删除'),
+		action: (needsAuth ? actionBtn('授权') : broken ? actionBtn('重试', '') : '') + toggleHtml(!cfg.disabled) + delHtml('删除'),
 	});
 	if (needsAuth) $('.market-act', row).addEventListener('click', () => authorizeConnector(name));
+	if (broken) $('.market-act', row).addEventListener('click', (e) => reconnectConnector(name, e.currentTarget));
+	addErrorLine(row, st?.error);
 	$('input', row).addEventListener('change', async (e) => {
 		e.target.disabled = true;
 		const r = await api('/api/mcp/toggle', { name, enabled: e.target.checked });
 		e.target.disabled = false;
-		if (!r.ok) { e.target.checked = !e.target.checked; toast(r.error || '操作失败'); }
+		if (!r.ok) { e.target.checked = !e.target.checked; toast(r.error || '操作失败'); return; }
+		refreshConnectors();
 	});
 	$('.item-del', row).addEventListener('click', () => showDialog({
 		title: '删除连接器？', msg: `「${name}」会被移除。`, ok: '删除', danger: true,
@@ -365,11 +447,21 @@ async function authorizeConnector(name) {
 	toast('正在准备授权');
 	const r = await api('/api/mcp/login', { name });
 	if (!r.ok) { failed('授权失败', r.error); return; }
+	if (r.url) {
+		// An account connector is authorized on claude.ai; this device's connection then needs renewing.
+		if (!/^https:\/\//.test(r.url)) return;
+		showDialog({
+			title: `授权「${externalTitle({ name })}」`, html: true,
+			msg: `<p>在 claude.ai 上完成授权，然后回到这里。</p><p><a class="pill-btn accent market-link" href="${esc(r.url)}" target="_blank" rel="noopener">打开授权页面</a></p>`,
+			ok: '我已完成', cancel: '稍后', onOk: () => reconnectConnector(name, null),
+		});
+		return;
+	}
 	if (r.fallback === 'chat') {
 		// Claude Code 2.1.112 has no `mcp login`; the server exposes an authenticate tool instead.
 		closeAll();
 		await createNewChat();
-		input.value = `请调用 mcp__${name}__authenticate 工具，把授权链接发给我。`;
+		input.value = `请帮我授权 MCP 连接器「${name}」：调用它的 authenticate 工具，把授权链接发给我。`;
 		send();
 	}
 }
@@ -633,13 +725,13 @@ function marketEvent(m) {
 	} else if (m.type === 'mcp_login_url') {
 		if (!/^https:\/\//.test(m.url || '')) return;
 		showDialog({
-			title: `授权「${m.name}」`, html: true,
+			title: `授权「${externalTitle(m)}」`, html: true,
 			msg: `<p>打开下面的页面并允许访问，完成后回到这里。</p><p><a class="pill-btn accent market-link" href="${esc(m.url)}" target="_blank" rel="noopener">打开授权页面</a></p>`,
 			ok: '关闭', cancel: '',
 		});
 	} else if (m.type === 'mcp_login_done') {
-		if (m.ok) toast(`「${m.name}」授权成功`);
+		if (m.ok) toast(`「${externalTitle(m)}」授权成功`);
 		else failed('授权没有完成', m.message);
-		if (onMarket() && mk.tab === 'connectors' && curView() === 'installed') loadMarket();
+		refreshConnectors();
 	}
 }

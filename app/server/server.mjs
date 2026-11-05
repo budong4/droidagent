@@ -619,6 +619,17 @@ async function applyMcpToAllRuntimes() {
 	}
 }
 
+const CLAUDE_CONNECTORS_URL = 'https://claude.ai/customize/connectors';
+function withTimeout(promise, ms, message) {
+	let timer;
+	return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]).finally(() => clearTimeout(timer));
+}
+async function liveMcpStatus(rt) {
+	if (!rt?.q?.mcpServerStatus) return [];
+	try { return await withTimeout(rt.q.mcpServerStatus(), 20000, 'timeout'); }
+	catch (e) { log('mcpServerStatus failed', e?.message); return []; }
+}
+
 // An existing runtime to borrow for account-level queries (MCP status, usage) that aren't tied
 // to one specific conversation — prefer whichever one the screen is currently showing.
 function anyRuntime() {
@@ -1136,7 +1147,7 @@ async function announceSkillDrafts(sessionId) {
 }
 
 // ---------------------------------------------------------------- plugins (official CLI)
-async function claudeCli(args, { timeout = 120000 } = {}) {
+async function claudeCli(args, { timeout = 120000, raw = false } = {}) {
 	const rt = await claudeRuntime();
 	if (!rt.chat) throw new Error(noRuntimeMessage(rt));
 	// Output goes through a file, not a pipe: Claude Code 2.1.112 exits before a pipe has drained,
@@ -1155,6 +1166,7 @@ async function claudeCli(args, { timeout = 120000 } = {}) {
 		});
 		if (timedOut) throw new Error('超时，请检查网络或代理后重试');
 		const out = await readFile(outPath, 'utf8');
+		if (raw) return { code, out, err };
 		if (code === 0) return out;
 		const lines = `${err}\n${out}`.replace(/\x1b\[[0-9;]*m/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
 		const why = lines.find((l) => /^[✘✖]|Failed|Error:/.test(l)) || lines.at(-1) || `退出码 ${code}`;
@@ -1300,13 +1312,16 @@ function cancelMcpLogin() {
 	try { mcpLogin.kill('SIGKILL'); } catch { /* */ }
 	mcpLogin = null;
 }
-// `claude mcp login` only knows servers in its own config, so the connector is registered there too.
+// `claude mcp login` only knows servers in its own config, so a connector of ours is registered
+// there too. One from a plugin (no entry here) is already known to it.
 async function startMcpLogin(name, entry) {
 	cancelMcpLogin();
 	const rt = await claudeRuntime();
 	if (!rt.chat) throw new Error(noRuntimeMessage(rt));
-	await claudeCli(['mcp', 'remove', '--scope', 'user', name]).catch(() => {});
-	await claudeCli(['mcp', 'add-json', '--scope', 'user', name, JSON.stringify(toMcpConfig(entry))]);
+	if (entry) {
+		await claudeCli(['mcp', 'remove', '--scope', 'user', name]).catch(() => {});
+		await claudeCli(['mcp', 'add-json', '--scope', 'user', name, JSON.stringify(toMcpConfig(entry))]);
+	}
 	const child = spawn('python3', [join(HERE, 'mcp_login_pty.py'), name], {
 		stdio: ['pipe', 'pipe', 'pipe'],
 		env: { ...process.env, CLAUDE_CLI_SPEC: JSON.stringify({ cmd: rt.chat.cmd, env: rt.chat.env }) },
@@ -2625,10 +2640,17 @@ const server = createServer(async (req, res) => {
 		// is inherently per-conversation — show whichever one the screen is currently on.
 		if (path === '/api/mcp' && req.method === 'GET') {
 			const cfg = await readMcpFile();
-			let status = [];
-			const rt = anyRuntime();
-			if (rt?.q?.mcpServerStatus) { try { status = await rt.q.mcpServerStatus(); } catch (e) { log('mcpServerStatus failed', e?.message); } }
-			return json(res, { ok: true, servers: cfg.servers || {}, status });
+			// Connectors from the account and plugins exist only in a running Claude Code. With none
+			// running, start the visible conversation's: it connects its servers but sends nothing to
+			// the model, and the idle reaper frees it again.
+			let rt = anyRuntime();
+			// The page says which: after a restart the server has no current conversation of its own.
+			const probe = url.searchParams.get('probe');
+			const probeId = probe === '1' ? activeSessionId : probe;
+			if (!rt && probeId) {
+				try { rt = await ensureRuntime(probeId); } catch (e) { log('[mcp] probe', e?.message); }
+			}
+			return json(res, { ok: true, servers: cfg.servers || {}, status: await liveMcpStatus(rt), live: !!rt });
 		}
 		if (path === '/api/mcp/add' && req.method === 'POST') {
 			const s = await body(req);
@@ -2674,26 +2696,52 @@ const server = createServer(async (req, res) => {
 			const { name } = await body(req);
 			const cfg = await readMcpFile();
 			const entry = cfg.servers?.[name];
-			if (!entry) return json(res, { ok: false, error: '找不到这个连接器' }, 404);
-			if (entry.type === 'stdio') return json(res, { ok: false, error: '本地命令型连接器不需要授权' }, 400);
+			// Not ours: only a name Claude Code itself reports goes on to its command line.
+			if (!entry && !(await liveMcpStatus(anyRuntime())).some((s) => s.name === name)) return json(res, { ok: false, error: '找不到这个连接器' }, 404);
+			if (typeof name !== 'string' || name.startsWith('-')) return json(res, { ok: false, error: '连接器名称无效' }, 400);
+			if (entry?.type === 'stdio') return json(res, { ok: false, error: '本地命令型连接器不需要授权' }, 400);
+			const account = !entry && name.startsWith('claude.ai ');
+			let hasLogin;
 			try {
 				// `mcp login --help` succeeds even without that command, so read the command list.
-				if (!/^\s*login\b/m.test(await claudeCli(['mcp', '--help'], { timeout: 45000 }))) return json(res, { ok: true, fallback: 'chat' });
+				hasLogin = /^\s*login\b/m.test(await claudeCli(['mcp', '--help'], { timeout: 45000 }));
 			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+			if (account) {
+				// Authorized on claude.ai itself: the command only prints the link, and exits.
+				let link = '';
+				if (hasLogin) {
+					const r = await claudeCli(['mcp', 'login', name, '--no-browser'], { timeout: 60000, raw: true }).catch(() => null);
+					link = `${r?.out || ''}\n${r?.err || ''}`.match(/https:\/\/[^\s"'<>]+/)?.[0] || '';
+				}
+				return json(res, { ok: true, url: link || CLAUDE_CONNECTORS_URL });
+			}
+			if (!hasLogin) return json(res, { ok: true, fallback: 'chat' });
 			try {
-				await startMcpLogin(name, entry);
-				entry.loginRegistered = true;
-				await writeMcpFile(cfg);
+				await startMcpLogin(name, entry || null);
+				if (entry) { entry.loginRegistered = true; await writeMcpFile(cfg); }
 				return json(res, { ok: true });
 			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
 		if (path === '/api/mcp/login/cancel' && req.method === 'POST') { cancelMcpLogin(); return json(res, { ok: true }); }
 		if (path === '/api/mcp/reconnect' && req.method === 'POST') {
 			const { name } = await body(req);
-			const rt = anyRuntime();
-			if (!rt?.q?.reconnectMcpServer) return json(res, { ok: false, error: '还没有进行中的对话，先发一条消息再重连' }, 400);
-			try { await rt.q.reconnectMcpServer(name); return json(res, { ok: true }); }
-			catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+			const live = [...runtimes.values()].filter((rt) => rt.q?.reconnectMcpServer);
+			if (!live.length) return json(res, { ok: false, error: '还没有进行中的对话，先发一条消息再重试' }, 400);
+			// Each conversation holds its own connection.
+			const results = await Promise.allSettled(live.map((rt) => withTimeout(rt.q.reconnectMcpServer(name), 45000, '连接超时')));
+			const bad = results.find((r) => r.status === 'rejected');
+			broadcast({ type: 'mcp_updated' });
+			return bad ? json(res, { ok: false, error: bad.reason?.message || '连接失败' }, 500) : json(res, { ok: true });
+		}
+		// Connectors that aren't ours (account, plugins): Claude Code keeps the on/off itself.
+		if (path === '/api/mcp/external-toggle' && req.method === 'POST') {
+			const { name, enabled } = await body(req);
+			const live = [...runtimes.values()].filter((rt) => rt.q?.toggleMcpServer);
+			if (!live.length) return json(res, { ok: false, error: '还没有进行中的对话，先发一条消息再操作' }, 400);
+			const results = await Promise.allSettled(live.map((rt) => withTimeout(rt.q.toggleMcpServer(name, !!enabled), 45000, '操作超时')));
+			const bad = results.find((r) => r.status === 'rejected');
+			broadcast({ type: 'mcp_updated' });
+			return bad ? json(res, { ok: false, error: bad.reason?.message || '操作失败' }, 500) : json(res, { ok: true });
 		}
 
 		// ---- Slash commands (for the composer's "/" autocomplete) ----

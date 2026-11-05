@@ -939,3 +939,4 @@ div.row:active { transform: none; }
 @keyframes job-slide { to { left: 100%; } }
 @media (prefers-reduced-motion: reduce) { .job-bar::after { animation: none; left: 0; width: 100%; opacity: .5; } }
 .market-row .sw:last-child { margin-right: 42px; }
+.market-error { display: block; margin-top: 3px; color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
