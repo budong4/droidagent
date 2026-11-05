@@ -190,11 +190,14 @@ function legacyCopy(text) {
 
 /* ================================================================ look: theme, font, background */
 let look = LOOK.load();
-function renderMainArt() {
-	const art = $('#art');
-	if (look.bg) art.innerHTML = `<div class="art-img" style="background-image:url('/api/background?v=${look.bg}')"></div>`;
-	else LOOK.renderArt(art, look.theme);
+// The picture (a preset or the owner's own) under a veil of the theme's background colour, or
+// else the theme's own illustration.
+function paintWall(layer, mini) {
+	const url = LOOK.wallUrl(look);
+	if (url) layer.innerHTML = `<div class="art-img" style="background-image:url('${url}')"></div>`;
+	else LOOK.renderArt(layer, look.theme, { mini });
 }
+function renderMainArt() { paintWall($('#art'), false); }
 function setLook(patch, { transition = false } = {}) {
 	Object.assign(look, patch);
 	LOOK.save(look);
@@ -208,7 +211,8 @@ function updateLookValues() {
 	const f = LOOK.FONTS.find((x) => x.id === look.font);
 	$('#val-theme').textContent = t ? t.name : '';
 	$('#val-font').textContent = f ? f.name : '';
-	$('#val-bg').textContent = look.bg ? '自定义图片' : (t && t.group === 'art' ? '主题插画' : '纯色');
+	const preset = LOOK.PRESETS.find((x) => x.id === look.wall);
+	$('#val-bg').textContent = look.wall === 'custom' ? '我的图片' : preset ? preset.name : (t && t.group === 'art' ? '主题插画' : '跟随主题');
 	$$('.theme-card').forEach((c) => c.classList.toggle('sel', c.dataset.id === look.theme));
 	$$('.font-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === look.font));
 }
@@ -261,20 +265,67 @@ function buildFontPage() {
 PAGE_OPEN['page-font'] = buildFontPage;
 
 function buildBgPage() {
+	// live preview: the current choice with a few mock messages over it
 	const pv = $('#bg-preview');
 	pv.dataset.theme = look.theme;
 	pv.dataset.scheme = LOOK.schemeOf(look.theme);
 	pv.innerHTML = '';
 	const layer = el('div', 'art-layer');
-	if (look.bg) layer.innerHTML = `<div class="art-img" style="background-image:url('/api/background?v=${look.bg}')"></div>`;
-	else LOOK.renderArt(layer, look.theme, { mini: true });
+	paintWall(layer, true);
 	pv.appendChild(layer);
 	pv.insertAdjacentHTML('beforeend', '<span class="tm-line" style="top:16%;width:50%"></span><span class="tm-line" style="top:23%;width:34%"></span><span class="tm-bubble"></span><span class="tm-line" style="top:62%;width:60%"></span><span class="tm-line" style="top:69%;width:44%"></span><span class="tm-line" style="top:76%;width:28%"></span>');
 	pv.style.setProperty('--bg-dim', look.dim + '%');
 	$('#bg-dim').value = look.dim;
 	$('#bg-dim-val').textContent = look.dim + '%';
-	$('#bg-clear').disabled = !look.bg;
-	$('#bg-dim-group').classList.toggle('hidden', !look.bg);
+	$('#bg-dim-group').classList.toggle('hidden', !look.wall);
+	buildWallGrid();
+}
+function wallCard(id, name, paint) {
+	const card = el('button', 'wall-card' + (look.wall === id ? ' sel' : ''));
+	card.dataset.id = id;
+	const pic = el('span', 'wall-pic');
+	paint(pic);
+	pic.insertAdjacentHTML('beforeend', `<span class="tm-check">${ic('i-check')}</span>`);
+	card.appendChild(pic);
+	card.appendChild(el('span', 'wall-name', esc(name)));
+	return card;
+}
+function buildWallGrid() {
+	const box = $('#wall-groups');
+	box.innerHTML = '';
+	const group = (label) => {
+		box.insertAdjacentHTML('beforeend', `<h2 class="group-label">${esc(label)}</h2>`);
+		const g = el('div', 'wall-grid'); box.appendChild(g); return g;
+	};
+	const mine = group('基础');
+	const themeCard = wallCard('', '跟随主题', (pic) => {
+		pic.dataset.theme = look.theme; pic.dataset.scheme = LOOK.schemeOf(look.theme);
+		const l = el('div', 'art-layer'); LOOK.renderArt(l, look.theme, { mini: true }); pic.appendChild(l);
+		pic.insertAdjacentHTML('beforeend', '<span class="tm-line" style="top:30%;width:50%"></span><span class="tm-line" style="top:36%;width:32%"></span><span class="tm-bubble" style="top:50%;height:14px"></span><span class="tm-line" style="top:64%;width:56%"></span>');
+	});
+	themeCard.addEventListener('click', () => chooseWall(''));
+	mine.appendChild(themeCard);
+	if (look.bg) {
+		const c = wallCard('custom', '我的图片', (pic) => { pic.style.backgroundImage = `url('/api/background?v=${look.bg}')`; });
+		c.addEventListener('click', () => chooseWall('custom'));
+		mine.appendChild(c);
+	}
+	const pick = el('button', 'wall-card add');
+	pick.innerHTML = `<span class="wall-pic">${ic('i-image')}<span>${look.bg ? '换一张' : '从相册选'}</span></span><span class="wall-name">我的图片</span>`;
+	pick.addEventListener('click', () => $('#file-bg').click());
+	mine.appendChild(pick);
+	let cur = null, grid = null;
+	for (const p of LOOK.PRESETS) {
+		if (p.group !== cur) { cur = p.group; grid = group(cur); }
+		const c = wallCard(p.id, p.name, (pic) => { pic.style.backgroundImage = `url('${LOOK.presetThumb(p)}')`; });
+		c.addEventListener('click', () => chooseWall(p.id));
+		grid.appendChild(c);
+	}
+}
+function chooseWall(id) {
+	if (look.wall === id) return;
+	setLook({ wall: id }, { transition: true });
+	buildBgPage();
 }
 PAGE_OPEN['page-bg'] = buildBgPage;
 $('#bg-dim').addEventListener('input', (e) => {
@@ -282,13 +333,6 @@ $('#bg-dim').addEventListener('input', (e) => {
 	$('#bg-dim-val').textContent = v + '%';
 	$('#bg-preview').style.setProperty('--bg-dim', v + '%');
 	setLook({ dim: v });
-});
-$('#bg-pick').addEventListener('click', () => $('#file-bg').click());
-$('#bg-clear').addEventListener('click', async () => {
-	await api('/api/background/clear');
-	setLook({ bg: 0 });
-	buildBgPage();
-	toast('已恢复主题插画');
 });
 // Pictures from the camera are 10+ MB; scale to the screen before uploading.
 function shrinkImage(file, maxSide = 2000) {
@@ -315,7 +359,7 @@ $('#file-bg').addEventListener('change', async (e) => {
 		const dataUrl = await shrinkImage(f);
 		const r = await api('/api/background', { dataUrl });
 		if (!r.ok) throw new Error(r.error || '上传失败');
-		setLook({ bg: r.v, dim: look.bg ? look.dim : 55 });
+		setLook({ bg: r.v, wall: 'custom' });
 		buildBgPage();
 		toast('背景已更换');
 	} catch (err) { toast('没能设置背景：' + err.message); }
@@ -748,6 +792,14 @@ function updateSendState() {
 	$('#btn-send').classList.toggle('hidden', showStop);
 	$('#btn-send').disabled = !has;
 }
+// The composer floats over the thread; the thread keeps that much room at its end. Pinned to
+// the newest message when the composer grows (a longer draft, attachments).
+const composerEl = $('#composer');
+new ResizeObserver(() => {
+	const stick = atBottom();
+	$('#app').style.setProperty('--composer-h', composerEl.offsetHeight + 'px');
+	if (stick) thread.scrollTop = thread.scrollHeight;
+}).observe(composerEl);
 function autosize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.35) + 'px'; }
 input.addEventListener('input', () => { autosize(); updateSendState(); checkSlashInput(); });
 input.addEventListener('keydown', (e) => {
@@ -1007,7 +1059,9 @@ function renderSidebar() {
 	const box = $('#session-groups');
 	box.innerHTML = '';
 	const q = searchQuery.trim().toLowerCase();
-	const list = sessionsList.filter((s) => !q || (s.title || '').toLowerCase().includes(q) || (s.preview || '').toLowerCase().includes(q));
+	// A conversation nothing has been said in yet is not listed (it shows up with its first message).
+	const blank = (s) => s.msgCount === 0 && !s.pinned && (s.title || '新对话') === '新对话';
+	const list = sessionsList.filter((s) => !blank(s) && (!q || (s.title || '').toLowerCase().includes(q) || (s.preview || '').toLowerCase().includes(q)));
 	if (!list.length) { box.innerHTML = `<div class="drawer-empty">${q ? '没有找到相关对话' : '还没有对话'}</div>`; return; }
 	const groups = new Map();
 	for (const s of list) {
@@ -1067,6 +1121,8 @@ async function switchSession(id) {
 	}
 }
 async function createNewChat() {
+	// Already on an empty conversation: that is the new one.
+	if ($('#welcome') && !running) { closeDrawer(); input.focus(); return; }
 	const r = await api('/api/sessions/new');
 	if (r.ok && r.session) {
 		curSession = r.session;
@@ -1297,7 +1353,9 @@ function fmtAgo(ts) {
 let announcedInstall = '';
 function renderUpdate(u) {
 	if (!u) return;
-	$('#update-line').textContent = u.current ? `版本 ${u.current}` : '版本';
+	$('#update-line').textContent = u.current || '';
+	$('#val-version').textContent = u.current || '';
+	if (u.current) installedVersion = u.current;
 	let sub;
 	if (u.installing) sub = `正在安装 ${u.latest}，App 会自动重新打开`;
 	else if (u.checking) sub = '正在检查';
@@ -1306,6 +1364,7 @@ function renderUpdate(u) {
 	else if (u.lastCheck) sub = `已是最新，${fmtAgo(u.lastCheck)}检查过`;
 	else sub = '还没有检查过';
 	$('#update-sub').textContent = sub;
+	$('#update-sub-row').textContent = u.available && !u.installing ? `有新版本 ${u.latest}` : sub;
 	const btn = $('#btn-check-update');
 	btn.textContent = u.available && !u.installing ? '立即更新' : '检查更新';
 	btn.classList.toggle('accent', !!(u.available && !u.installing));
@@ -1313,6 +1372,26 @@ function renderUpdate(u) {
 	if (u.installing && announcedInstall !== u.latest) { announcedInstall = u.latest; sysline(`正在安装 DroidAgent ${u.latest}，完成后 App 会自动重新打开`); }
 }
 async function loadUpdate() { const r = await getJSON('/api/update'); if (r.ok) renderUpdate(r.update); }
+
+// Every release's notes, newest first (the same text as the GitHub release pages).
+let installedVersion = '';
+async function loadChangelog() {
+	const box = $('#changelog');
+	const r = await getJSON('/api/changelog');
+	if (!r.ok) { box.innerHTML = `<div class="empty-state">${esc(r.error || '读取失败')}</div>`; return; }
+	const parts = String(r.text).split(/^## +/m).slice(1);
+	if (!parts.length) { box.innerHTML = '<div class="empty-state">暂无更新记录</div>'; return; }
+	box.innerHTML = '';
+	for (const part of parts) {
+		const nl = part.indexOf('\n');
+		const ver = (nl < 0 ? part : part.slice(0, nl)).trim();
+		const body = nl < 0 ? '' : part.slice(nl + 1).trim();
+		const item = el('article', 'cl-item' + (ver === installedVersion ? ' current' : ''));
+		item.innerHTML = `<div class="cl-head"><span class="cl-ver">${esc(ver)}</span>${ver === installedVersion ? '<span class="badge builtin">当前版本</span>' : ''}</div><div class="cl-body md">${md(body)}</div>`;
+		box.appendChild(item);
+	}
+}
+PAGE_OPEN['page-version'] = async () => { await loadUpdate(); loadChangelog(); };
 $('#btn-check-update').addEventListener('click', async () => {
 	$('#btn-check-update').disabled = true;
 	$('#update-sub').textContent = '正在检查';

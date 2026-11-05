@@ -18,6 +18,12 @@
 	<!-- icon sprite: one stroke style everywhere -->
 	<svg width="0" height="0" style="position:absolute" aria-hidden="true">
 		<defs>
+			<!-- Liquid glass: a lens map that bends what lies behind the composer toward its middle at
+			     the edges (red = horizontal shift, green = vertical; mid-grey = none). -->
+			<filter id="glass-lens" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB" primitiveUnits="objectBoundingBox">
+				<feImage href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%20100%20100%27%20preserveAspectRatio%3D%27none%27%3E%3Cdefs%3E%3ClinearGradient%20id%3D%27x%27%20x1%3D%270%27%20x2%3D%271%27%3E%3Cstop%20offset%3D%270%27%20stop-color%3D%27%23f00%27/%3E%3Cstop%20offset%3D%27.1%27%20stop-color%3D%27%23800000%27/%3E%3Cstop%20offset%3D%27.9%27%20stop-color%3D%27%23800000%27/%3E%3Cstop%20offset%3D%271%27%20stop-color%3D%27%23000%27/%3E%3C/linearGradient%3E%3ClinearGradient%20id%3D%27y%27%20x1%3D%270%27%20y1%3D%270%27%20x2%3D%270%27%20y2%3D%271%27%3E%3Cstop%20offset%3D%270%27%20stop-color%3D%27%230f0%27/%3E%3Cstop%20offset%3D%27.28%27%20stop-color%3D%27%23008000%27/%3E%3Cstop%20offset%3D%27.72%27%20stop-color%3D%27%23008000%27/%3E%3Cstop%20offset%3D%271%27%20stop-color%3D%27%23000%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width%3D%27100%27%20height%3D%27100%27%20fill%3D%27url%28%23x%29%27/%3E%3Crect%20width%3D%27100%27%20height%3D%27100%27%20fill%3D%27url%28%23y%29%27%20style%3D%27mix-blend-mode%3Ascreen%27/%3E%3C/svg%3E" x="0" y="0" width="1" height="1" preserveAspectRatio="none" result="map"/>
+				<feDisplacementMap in="SourceGraphic" in2="map" scale=".12" xChannelSelector="R" yChannelSelector="G"/>
+			</filter>
 			<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></symbol>
 			<symbol id="i-new" viewBox="0 0 24 24"><path d="M12 4H6.5A2.5 2.5 0 004 6.5v11A2.5 2.5 0 006.5 20h11a2.5 2.5 0 002.5-2.5V12"/><path d="M17.6 3.6a1.9 1.9 0 012.8 2.8L12 14.8l-3.6.8.8-3.6z"/></symbol>
 			<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
@@ -189,11 +195,27 @@
 
 			<h2 class="group-label">通用</h2>
 			<div class="list">
-				<label class="row"><svg class="ic row-ic"><use href="#i-refresh"/></svg><span class="row-text">自动更新<small>有新版本时在后台下载并安装</small></span><span class="sw"><input type="checkbox" id="t-autoupdate"><i></i></span></label>
-				<div class="row"><svg class="ic row-ic"><use href="#i-info"/></svg><span class="row-text"><span id="update-line">版本</span><small id="update-sub">正在读取</small></span><button id="btn-check-update" class="pill-btn">检查更新</button></div>
+				<button class="row" data-page="page-version"><svg class="ic row-ic"><use href="#i-info"/></svg><span class="row-text">版本与更新<small id="update-sub-row">正在读取</small></span><span id="val-version" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 				<button class="row danger" id="row-clear"><svg class="ic row-ic"><use href="#i-trash"/></svg><span class="row-text">清空全部对话</span></button>
 			</div>
 			<p class="foot-note">DroidAgent 是开源项目<br><a href="https://github.com/budong4/droidagent" target="_blank" rel="noopener">在 GitHub 上查看源码</a></p>
+		</div>
+	</section>
+
+	<section id="page-version" class="page hidden" aria-label="版本与更新">
+		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>版本与更新</h1></header>
+		<div class="page-body">
+			<div class="ver-hero">
+				<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>
+				<div class="ver-name">DroidAgent <span id="update-line"></span></div>
+				<div id="update-sub" class="ver-sub">正在读取</div>
+				<button id="btn-check-update" class="pill-btn">检查更新</button>
+			</div>
+			<div class="list">
+				<label class="row"><svg class="ic row-ic"><use href="#i-refresh"/></svg><span class="row-text">自动更新<small>有新版本时在后台下载并安装，不打断正在进行的对话</small></span><span class="sw"><input type="checkbox" id="t-autoupdate"><i></i></span></label>
+			</div>
+			<h2 class="group-label">更新记录</h2>
+			<div id="changelog" class="changelog"><div class="empty-state"><span class="spin"></span></div></div>
 		</div>
 	</section>
 
@@ -225,10 +247,6 @@
 		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>聊天背景</h1></header>
 		<div class="page-body">
 			<div id="bg-preview" class="bg-preview"></div>
-			<div class="bg-actions">
-				<button id="bg-pick" class="pill-btn accent">从相册选择</button>
-				<button id="bg-clear" class="pill-btn">恢复主题插画</button>
-			</div>
 			<div id="bg-dim-group">
 				<h2 class="group-label">图片遮罩</h2>
 				<div class="list">
@@ -236,7 +254,8 @@
 				</div>
 				<p class="hint">遮罩用主题的底色盖在图片上，数值越大文字越清楚。</p>
 			</div>
-			<p class="hint bg-note">选一张自己的图片作为聊天背景，比如喜欢的角色或风景。图片只保存在这台手机里。</p>
+			<div id="wall-groups"></div>
+			<p class="foot-note">动漫风和渐变为本应用原创绘制。浮世绘：歌川广重《名所江户百景》（1856–1859）；名画：梵高《柏树》《麦田与柏树》（1889），均来自大都会艺术博物馆开放资源，公有领域。极光：NASA 国际空间站拍摄，公有领域。你自己的图片只保存在这台手机里。</p>
 		</div>
 	</section>
 

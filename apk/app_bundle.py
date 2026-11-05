@@ -25,6 +25,10 @@ def build_app_bundle(out_path, repo_dir=REPO_DIR):
                 continue
             full = os.path.join(root, name)
             entries.append((full, os.path.relpath(full, app_dir).replace("\\", "/")))
+    # The release notes travel with the web files, for Settings -> 版本与更新.
+    changelog = os.path.join(repo_dir, "CHANGELOG.md")
+    if os.path.isfile(changelog):
+        entries.append((changelog, "web/changelog.md"))
     for sub in ("bin", "sbin"):
         tools = os.path.join(repo_dir, "phone", "overlay", "usr", "local", sub)
         if os.path.isdir(tools):

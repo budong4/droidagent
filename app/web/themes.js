@@ -22,6 +22,26 @@
 		sakura: '#FBF6F7', summer: '#F3F8FB', wafu: '#F4EFE4', starry: '#0E1426', neon: '#110F18',
 	};
 
+	// Chat backgrounds that ship with the app. Original drawings, or public domain / CC0 (see
+	// tools/background_photos.py for where each came from).
+	const PRESETS = [
+		{ id: 'anime-summer', name: '夏空', group: '动漫风', file: 'anime-summer.svg' },
+		{ id: 'anime-dusk', name: '黄昏电车', group: '动漫风', file: 'anime-dusk.svg' },
+		{ id: 'anime-stars', name: '星降之丘', group: '动漫风', file: 'anime-stars.svg' },
+		{ id: 'ukiyoe-plum', name: '蒲田梅园', group: '浮世绘', file: 'ukiyoe-plum.jpg' },
+		{ id: 'ukiyoe-shower', name: '大桥骤雨', group: '浮世绘', file: 'ukiyoe-shower.jpg' },
+		{ id: 'ukiyoe-fireworks', name: '两国烟火', group: '浮世绘', file: 'ukiyoe-fireworks.jpg' },
+		{ id: 'ukiyoe-maples', name: '真间红叶', group: '浮世绘', file: 'ukiyoe-maples.jpg' },
+		{ id: 'ukiyoe-snow', name: '浅草雪景', group: '浮世绘', file: 'ukiyoe-snow.jpg' },
+		{ id: 'vangogh-cypresses', name: '柏树', group: '风景与名画', file: 'vangogh-cypresses.jpg' },
+		{ id: 'vangogh-wheat', name: '麦田与柏树', group: '风景与名画', file: 'vangogh-wheat.jpg' },
+		{ id: 'aurora-red', name: '极光', group: '风景与名画', file: 'aurora-red.jpg' },
+		{ id: 'aurora-city', name: '极光与灯火', group: '风景与名画', file: 'aurora-city.jpg' },
+		{ id: 'mesh-peach', name: '蜜桃', group: '渐变', file: 'mesh-peach.svg' },
+		{ id: 'mesh-aurora', name: '极夜', group: '渐变', file: 'mesh-aurora.svg' },
+	];
+	const presetThumb = (p) => 'backgrounds/' + (p.file.endsWith('.svg') ? p.file : 'thumbs/' + p.file);
+
 	// Open-source fonts (SIL OFL / MIT). The server fetches each one slice by slice on first use.
 	const FONTS = [
 		{ id: 'system', name: '系统默认', family: '' },
@@ -143,11 +163,15 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 	}
 
 	/* ---------------- applying a look ---------------- */
-	const DEFAULT_LOOK = { theme: 'default', font: 'system', bg: 0, dim: 55 };
+	// wall: '' = the theme's own art, 'custom' = the owner's picture (version in bg), else a preset id
+	const DEFAULT_LOOK = { theme: 'default', font: 'system', wall: '', bg: 0, dim: 60 };
 	function load() {
 		let l = {};
 		try { l = JSON.parse(localStorage.getItem('look') || '{}') || {}; } catch (e) { /* private mode */ }
+		if (!('wall' in l) && l.bg) l.wall = 'custom'; // saved before presets existed
 		const look = Object.assign({}, DEFAULT_LOOK, l);
+		if (look.wall && look.wall !== 'custom' && !PRESETS.some((p) => p.id === look.wall)) look.wall = '';
+		if (look.wall === 'custom' && !look.bg) look.wall = '';
 		if (!THEMES.some((t) => t.id === look.theme)) look.theme = 'default';
 		if (!FONTS.some((f) => f.id === look.font)) look.font = 'system';
 		return look;
@@ -174,7 +198,7 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		const scheme = schemeOf(look.theme);
 		d.setAttribute('data-theme', look.theme);
 		d.setAttribute('data-scheme', scheme);
-		d.classList.toggle('has-bg', !!look.bg);
+		d.classList.toggle('has-bg', !!look.wall);
 		d.style.setProperty('--bg-dim', (look.dim ?? 55) + '%');
 		const f = FONTS.find((x) => x.id === look.font) || FONTS[0];
 		fontLink(f);
@@ -183,6 +207,13 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		if (meta) meta.setAttribute('content', THEME_BAR[look.theme] || (scheme === 'dark' ? '#0D1411' : '#F5F6F2'));
 	}
 
-	window.DA_LOOK = { THEMES, FONTS, SYSTEM_STACK, load, save, apply, renderArt, schemeOf, fontLink };
+	// The picture behind the conversation for a look, or '' for the theme's own art.
+	function wallUrl(look) {
+		if (look.wall === 'custom') return look.bg ? `/api/background?v=${look.bg}` : '';
+		const p = PRESETS.find((x) => x.id === look.wall);
+		return p ? 'backgrounds/' + p.file : '';
+	}
+
+	window.DA_LOOK = { THEMES, FONTS, PRESETS, SYSTEM_STACK, load, save, apply, renderArt, schemeOf, fontLink, wallUrl, presetThumb };
 	apply(load());
 })();

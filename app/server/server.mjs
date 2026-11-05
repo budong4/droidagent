@@ -260,6 +260,23 @@ async function createNewSession(title = '新对话') {
 	return sess;
 }
 
+// A conversation nothing was ever said in (nor pinned or renamed) is just a fresh page.
+const isBlank = (s) => !!s && !(s.messages || []).length && !s.pinned && (s.title || '新对话') === '新对话';
+const blankMeta = (m) => m && m.msgCount === 0 && !m.pinned && (m.title || '新对话') === '新对话';
+
+// "New conversation" while already looking at a blank one, or with a blank one left over, reuses
+// it instead of piling up empty conversations.
+async function freshSession() {
+	const cur = activeSessionId ? await getOrLoadSessionObj(activeSessionId) : null;
+	if (isBlank(cur)) return cur;
+	for (const m of await loadSessionsIndex()) {
+		if (!blankMeta(m) || runtimes.get(m.id)?.running) continue;
+		const s = await getOrLoadSessionObj(m.id);
+		if (isBlank(s)) return s;
+	}
+	return createNewSession('新对话');
+}
+
 async function initSessions() {
 	await ensureSessionsDir();
 	const idx = await loadSessionsIndex();
@@ -268,11 +285,27 @@ async function initSessions() {
 		const sess = await getOrLoadSessionObj(sorted[0].id);
 		if (sess) {
 			activeSessionId = sess.id;
+			await pruneBlankSessions();
 			return;
 		}
 	}
 	const sess = await createNewSession('新对话');
 	activeSessionId = sess.id;
+}
+
+// Earlier versions made a new empty conversation on every tap of "new"; drop those (all but the
+// one on screen), they hold nothing.
+async function pruneBlankSessions() {
+	const idx = await loadSessionsIndex();
+	const drop = [];
+	for (const m of idx) {
+		if (m.id === activeSessionId || !blankMeta(m)) continue;
+		if (isBlank(await loadSession(m.id))) drop.push(m.id);
+	}
+	if (!drop.length) return;
+	for (const id of drop) { sessionCache.delete(id); await unlink(join(SESSIONS_DIR, `${id}.json`)).catch(() => {}); }
+	await withLock('sessions-index', async () => saveSessionsIndex((await loadSessionsIndex()).filter((m) => !drop.includes(m.id))));
+	log(`[sessions] removed ${drop.length} empty conversations`);
 }
 
 // ---------------------------------------------------------------- SSE bus
@@ -1762,7 +1795,7 @@ const server = createServer(async (req, res) => {
 
 		// New conversation — never touches any other conversation's runtime.
 		if (path === '/api/sessions/new' && req.method === 'POST') {
-			const newSess = await createNewSession('新对话');
+			const newSess = await freshSession();
 			activeSessionId = newSess.id;
 			broadcast({ type: 'session_switched', session: newSess });
 			const idx = await loadSessionsIndex();
@@ -2084,7 +2117,7 @@ const server = createServer(async (req, res) => {
 
 		// Legacy new chat endpoint
 		if (req.method === 'POST' && path === '/api/new') {
-			const newSess = await createNewSession('新对话');
+			const newSess = await freshSession();
 			activeSessionId = newSess.id;
 			broadcast({ type: 'session_switched', session: newSess });
 			const idx = await loadSessionsIndex();
@@ -2168,6 +2201,14 @@ const server = createServer(async (req, res) => {
 				log('[fonts]', fm[1], fm[2], e?.message);
 				res.writeHead(502); return res.end();
 			}
+		}
+
+		// ---- Release notes: shipped as web/changelog.md; the repository's own copy when run from a checkout ----
+		if (path === '/api/changelog' && req.method === 'GET') {
+			for (const f of [join(WEB, 'changelog.md'), join(HERE, '..', '..', 'CHANGELOG.md')]) {
+				try { return json(res, { ok: true, text: await readFile(f, 'utf8') }); } catch { /* next */ }
+			}
+			return json(res, { ok: false, error: '没有找到更新记录' });
 		}
 
 		// ---- Chat background ----
