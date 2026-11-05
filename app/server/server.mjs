@@ -14,7 +14,9 @@ import { homedir } from 'node:os';
 import {
 	OFFICIAL_MARKETPLACES, safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
 	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, connectorName, buildMcpEntry, inspectPluginDir,
+	inspectSkillDir, mergeSlashCommands,
 } from './market.mjs';
+import { isReadOnlyBash } from './policy.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..', 'web');
@@ -164,6 +166,9 @@ function writeJsonAtomic(path, value) {
 	});
 }
 
+// What the owner typed: attachments go to Claude wrapped in a block of their own.
+const typedText = (t) => String(t || '').replace(/^【指定操作范围与上下文】[\s\S]*?【用户指令】\n?/, '');
+
 function sessionMeta(sess) {
 	const lastMsg = sess.messages?.filter((m) => m.role === 'user' || m.role === 'assistant').slice(-1)[0];
 	return {
@@ -174,7 +179,7 @@ function sessionMeta(sess) {
 		updatedAt: sess.updatedAt,
 		claudeSessionId: sess.claudeSessionId || null,
 		msgCount: sess.messages?.length || 0,
-		preview: lastMsg?.text ? lastMsg.text.replace(/\n+/g, ' ').slice(0, 60) : '',
+		preview: lastMsg?.text ? typedText(lastMsg.text).replace(/\n+/g, ' ').slice(0, 60) : '',
 	};
 }
 
@@ -202,13 +207,14 @@ async function rebuildSessionsIndex() {
 	return metas;
 }
 
-async function loadSessionsIndex() {
+async function loadSessionsIndex({ verify = true } = {}) {
 	await ensureSessionsDir();
 	let list = null;
 	try {
 		list = JSON.parse(await readFile(SESSIONS_INDEX, 'utf8'));
 	} catch { /* missing or corrupt — fall through to the rebuild below */ }
 	if (!Array.isArray(list)) return rebuildSessionsIndex();
+	if (!verify) return list;
 	// A conversation present on disk but missing from the index means the index lost entries
 	// (the old failure mode); recover them instead of quietly dropping the history.
 	const onDisk = await sessionFileIds();
@@ -242,7 +248,9 @@ async function saveSession(sess) {
 		// Read-modify-write of the shared index: one at a time, or two conversations saving
 		// together would each write back an index missing the other's change.
 		await withLock('sessions-index', async () => {
-			const idx = await loadSessionsIndex();
+			// A new conversation's file is on disk by now and about to join the index: checking the
+			// two against each other here would read every conversation back for each new one.
+			const idx = await loadSessionsIndex({ verify: false });
 			const existing = idx.findIndex((s) => s.id === sess.id);
 			const meta = sessionMeta(sess);
 			if (existing >= 0) idx[existing] = meta;
@@ -331,7 +339,6 @@ const DANGER_ANDROID = /\b(pm\s+(uninstall|clear|disable(-user)?)|cmd\s+package\
 const CATASTROPHIC = /\b(reboot|poweroff|fastboot|recovery|flash\b|wipe\b)\b|\bdd\b[^\n]*\bof=\/dev\/block|\/dev\/block\/(sd|dm|mmcblk)|\b(lk|vbmeta|seccfg|tee|userdata|boot|init_boot)_?[ab]?\b/i;
 const PIPE_TO_SHELL = /\b(curl|wget)\b[^\n]*\|\s*(sh|bash)\b/i;
 const SENSITIVE_PATH = /^\/(system|vendor|product|apex|proc|sys|dev)(\/|$)|\/data\/adb(\/|$)|\/dev\/block\//;
-const READ_ONLY_BASH = /^(\s*(ls|cat|head|tail|less|grep|rg|fd|find|stat|file|wc|echo|pwd|df|du|free|ps|top|htop|id|whoami|uname|date|getprop|dumpsys|logcat|pm\s+(list|path|dump)|cmd\s+\w+\s+(list|get|dump)|settings\s+get|input\s+keyevent\s+KEYCODE_(POWER|WAKEUP)|droid\s+(ui|shot|top|apps)|screencap|uiautomator\s+dump|sqlite3\s+\S+\s+["']?select|tree|which|env|node\s+-|python3?\s+-c)\b)/i;
 const SCREEN_ACTION = /\bdroid\s+(tap|tap-id|tap-text|swipe|longpress|text|key|app|wake)\b|\binput\s+(tap|swipe|text|keyevent|draganddrop)\b/i;
 // Reads of personal data (contacts/SMS/call log/calendar/media/notifications) go through the `pdata` helper.
 const PERSONAL_DATA = /(^|[\s;|&])pdata(\s|$)/i;
@@ -403,6 +410,7 @@ async function refreshSkillNames() {
 		for (const sk of await listSkills()) {
 			const m = /^([^。.]{2,10})[。.]/.exec(sk.description || '');
 			skillNames.set(sk.id, m ? m[1] : sk.name);
+			skillNames.set(sk.name, m ? m[1] : sk.name); // Claude calls a skill by this one
 		}
 	} catch { /* keep the old names */ }
 }
@@ -456,7 +464,7 @@ function policy(toolName, input) {
 	if (name === 'ExitPlanMode') return ask('计划已就绪', '按这个计划开始执行？', String(input?.plan || ''));
 
 	const personal = name === 'Bash' && PERSONAL_DATA.test(cmd);
-	const readOnlyCmd = name === 'Bash' && READ_ONLY_BASH.test(cmd) && !DANGER.test(cmd) && !DANGER_ANDROID.test(cmd) && !CATASTROPHIC.test(cmd);
+	const readOnlyCmd = name === 'Bash' && isReadOnlyBash(cmd) && !DANGER.test(cmd) && !DANGER_ANDROID.test(cmd) && !CATASTROPHIC.test(cmd);
 	const catastrophic = name === 'Bash' && (CATASTROPHIC.test(cmd) || PIPE_TO_SHELL.test(cmd));
 	const dangerous =
 		(name === 'Bash' && (DANGER.test(cmd) || DANGER_ANDROID.test(cmd))) ||
@@ -481,13 +489,51 @@ function policy(toolName, input) {
 // only explicitly deleting/clearing that conversation (or the idle reaper below) does.
 const runtimes = new Map(); // id -> { pushUser, end, q, pending:Map, running, assistantText, lastActive }
 
+// A control message to a conversation that may already be on its way out: no reply is an answer too.
+function tell(fn) {
+	try { Promise.resolve(fn()).catch((e) => log('[runtime] control message:', e?.message)); } catch { /* gone */ }
+}
+
 function teardownRuntime(id) {
 	const rt = runtimes.get(id);
 	if (!rt) return;
 	try { rt.end(); } catch { /* already done */ }
-	try { rt.q?.interrupt?.(); } catch { /* ignore */ }
+	tell(() => rt.q?.interrupt?.());
 	for (const [, p] of rt.pending) p.resolve({ behavior: 'deny', message: '会话已重置', interrupt: false });
 	runtimes.delete(id);
+}
+
+// A setting a running process can't take in: it applies from the next message, which starts a new
+// process that resumes the same conversation (invisible to the owner). A busy one finishes first.
+function restartRuntimesWhenIdle() {
+	for (const rt of runtimes.values()) rt.restartWhenIdle = true;
+}
+
+// A conversation as the page needs it: with the reply still being written, which joins `messages`
+// only once finished. Without it a page opened mid-reply loses everything written so far.
+function forPage(sess) {
+	const liveText = sess && runtimes.get(sess.id)?.assistantText;
+	return liveText ? { ...sess, liveText } : sess;
+}
+
+// Closes a confirmation card, here and in the saved conversation, whoever answered it.
+function closePermission(sessionId, permId, decision) {
+	const sess = sessionId && sessionCache.get(sessionId);
+	const pm = sess?.messages.find((x) => x.role === 'perm' && x.id === permId);
+	if (pm) {
+		pm.verdict = decision;
+		saveSession(sess);
+	}
+	broadcast({ type: 'permission_resolved', sessionId, id: permId, decision });
+}
+
+// Claude Code deletes its transcripts after 30 days, while the App keeps the conversation. Asking it
+// to resume one that is gone ends every message with an error, so that conversation could never
+// be used again.
+async function transcriptExists(claudeSessionId) {
+	const root = join(homedir(), '.claude', 'projects');
+	for (const dir of await dirNames(root)) if (existsSync(join(root, dir, `${claudeSessionId}.jsonl`))) return true;
+	return false;
 }
 
 // Free the underlying `claude` process for conversations nobody has touched in a while — their
@@ -518,7 +564,8 @@ function getSdkModel(m) {
 // Always appended: the person watching reads the steps, mostly not command lines.
 const APP_PROMPT = `## 在 DroidAgent App 里工作
 - 用户在手机 App 里看着你的每一步，大多数人看不懂命令行。调用 Bash 工具时，description 参数一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「统计下载文件夹大小」「打开微信」，不要把命令本身写进去。
-- 用户用什么语言提问，就用什么语言回答。`;
+- 用户用什么语言提问，就用什么语言回答。
+- 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。`;
 // Older models take a fixed budget instead of adaptive thinking.
 function thinkingFor(model) {
 	const m = String(model || '');
@@ -546,13 +593,7 @@ async function listSkills() {
 	const out = [];
 	for (const [dir, enabled] of [[SKILLS_DIR, true], [SKILLS_OFF_DIR, false]]) {
 		for (const id of await dirNames(dir)) {
-			let name = id, description = '';
-			try {
-				const fm = parseFrontmatter(await readFile(join(dir, id, 'SKILL.md'), 'utf8'));
-				if (fm?.name) name = fm.name;
-				if (fm?.description) description = fm.description;
-			} catch { /* no SKILL.md */ }
-			out.push({ id, name, description, enabled, builtin: existsSync(join(dir, id, '.builtin')) });
+			out.push({ ...(await inspectSkillDir(join(dir, id), id)), enabled, builtin: existsSync(join(dir, id, '.builtin')) });
 		}
 	}
 	return out;
@@ -638,13 +679,33 @@ function anyRuntime() {
 
 let usageCache = { t: 0, data: null };
 
-async function ensureRuntime(id) {
+// One start at a time per conversation: typing "/" and sending can both start one, and the slower
+// start would replace the other in `runtimes` and leave its process running with nobody to reap it.
+const runtimeStarts = new Map();
+function ensureRuntime(id) {
+	let start = runtimeStarts.get(id);
+	if (!start) {
+		start = startRuntime(id).finally(() => runtimeStarts.delete(id));
+		runtimeStarts.set(id, start);
+	}
+	return start;
+}
+
+async function startRuntime(id) {
 	let rt = runtimes.get(id);
 	if (rt && rt.restartWhenIdle && !rt.running && rt.pending.size === 0) { teardownRuntime(id); rt = null; }
 	if (rt) return rt;
 	await pluginGate; // a plugin being downloaded is enabled for a moment; don't start a session in that window
 	const sess = await getOrLoadSessionObj(id);
 	if (!sess) throw new Error('session not found: ' + id);
+	if (sess.claudeSessionId && !(await transcriptExists(sess.claudeSessionId))) {
+		log('[sessions] transcript gone, starting over', id.slice(0, 8));
+		sess.claudeSessionId = null;
+		const text = '这段对话时间太久，Claude 已经不记得之前的内容了。上面的记录还在，接下来它会从头开始。';
+		sess.messages.push({ role: 'sys', text, time: Date.now() });
+		saveSession(sess);
+		broadcast({ type: 'notice', sessionId: id, text });
+	}
 	const runtime = await claudeRuntime();
 	if (!runtime.chat) throw new Error(noRuntimeMessage(runtime));
 	const chatSpec = runtime.chat;
@@ -718,8 +779,17 @@ async function ensureRuntime(id) {
 
 	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now(), chatSpec };
 	runtimes.set(id, rt);
-	consume(id, q, rt).catch((e) => {
+	const started = rt;
+	consume(id, q, started).then(() => {
+		// Ended by itself, not by us: nothing would answer the next message sent to it.
+		if (runtimes.get(id) !== started) return;
+		if (started.running) broadcast({ type: 'error', sessionId: id, message: 'Claude Code 意外退出了，再发一次就能继续' });
+		teardownRuntime(id);
+	}, (e) => {
 		log('session error', id, e?.message || e);
+		// A process stopped on purpose can fail on its way out, after the next one has taken over.
+		// That is no news to anyone, and the new one must not go down with it.
+		if (runtimes.get(id) !== started) return;
 		broadcast({ type: 'error', sessionId: id, message: String(e?.message || e) });
 		teardownRuntime(id);
 	});
@@ -737,6 +807,9 @@ async function consume(id, q, rt) {
 				saveSession(sess);
 			}
 			broadcast({ type: 'session', sessionId: id, claudeSessionId: m.session_id, model: m.model });
+			broadcast({ type: 'skills_updated' }); // the "/" menu can now show this conversation's full list
+		} else if (m.type === 'system' && m.subtype === 'commands_changed') {
+			broadcast({ type: 'skills_updated' }); // Claude Code noticed new skills by itself (new runtime only)
 		} else if (m.type === 'system' && m.subtype === 'local_command_output') {
 			// What a slash command such as /context or /cost printed.
 			const text = String(m.content || '').trim();
@@ -834,8 +907,9 @@ async function consume(id, q, rt) {
 				saveSession(sess);
 				maybeTitle(id); // name the conversation once it has its first answer
 			}
-			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype });
+			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype, errors: m.errors });
 			announceSkillDrafts(id).catch((e) => log('[skills] draft scan', e?.message));
+			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
 		}
 	}
 }
@@ -843,7 +917,7 @@ async function consume(id, q, rt) {
 // ---------------------------------------------------------------- conversation titles
 // The first message gives a stand-in title; once the conversation has its first answer, a quick
 // one-off Haiku call names it. A title the owner typed is never replaced.
-const autoTitleOf = (text) => String(text || '').replace(/【.*?】/g, '').trim().slice(0, 24).replace(/\n/g, ' ') || '新对话';
+const autoTitleOf = (text) => typedText(text).trim().slice(0, 24).replace(/\n/g, ' ') || '新对话';
 const TITLE_DIR = join(homedir(), '.claude', 'agent-titles');
 const titling = new Set();
 const cleanTitle = (t) => (String(t || '').split('\n').map((l) => l.trim()).find(Boolean) || '')
@@ -853,7 +927,7 @@ async function generateTitle(userText, replyText) {
 	if (!runtime.chat) return '';
 	const { query } = await loadSdkFor(runtime.chat);
 	await mkdir(TITLE_DIR, { recursive: true });
-	const clip = (t, n) => String(t || '').replace(/【指定操作范围与上下文】[\s\S]*?【用户指令】/, '').trim().slice(0, n);
+	const clip = (t, n) => typedText(t).trim().slice(0, n);
 	const prompt = `给下面这段对话起一个标题：不超过 12 个汉字，概括用户想做的事；不要标点、引号、表情和解释，只输出标题本身。\n\n用户：${clip(userText, 800)}\n\n助手：${clip(replyText, 800)}`;
 	const q = query({
 		prompt,
@@ -863,7 +937,7 @@ async function generateTitle(userText, replyText) {
 			...queryRuntimeOptions(runtime.chat),
 		},
 	});
-	const timer = setTimeout(() => { try { q.interrupt?.(); } catch { /* */ } }, 60000);
+	const timer = setTimeout(() => tell(() => q.interrupt?.()), 60000);
 	let out = '';
 	try { for await (const m of q) if (m.type === 'result') out = m.result || ''; } finally { clearTimeout(timer); }
 	return cleanTitle(out);
@@ -879,6 +953,7 @@ async function maybeTitle(id) {
 	try {
 		const title = await generateTitle(firstUser.text, firstReply.text);
 		if (!title || sess.titleSource) return; // nothing usable, or renamed meanwhile
+		if (sessionCache.get(id) !== sess) return; // deleted meanwhile: saving would bring it back
 		sess.title = title;
 		sess.titleSource = 'ai';
 		await saveSession(sess);
@@ -1094,29 +1169,91 @@ async function installSkill(input) {
 	}
 }
 
-// Live conversations pick up changed skills and plugins: Claude Code's own reload where it works.
-// 2.1.112's reloadPlugins answers with the previous state, so those conversations restart instead,
-// which is invisible: the next message resumes the same conversation. A busy one waits until idle.
-async function refreshRuntimes() {
-	for (const [id, rt] of runtimes) {
+// Live conversations pick up changed skills and plugins with Claude Code's own reload. On 2.1.112 it
+// answers with the previous state: fine for skills, which are usable right after it, while for
+// plugins those conversations restart too, which is invisible: the next message resumes the same
+// conversation. A busy one waits until idle. Skills must not restart on 2.1.112, as a resumed
+// conversation isn't told about new ones again, so the model would never hear of them.
+async function refreshRuntimes({ restartOld = true } = {}) {
+	const seen = await changeMarks();
+	skillsSeen = seen.skills;
+	pluginsSeen = seen.plugins;
+	// A copy: a conversation started while this waits on a reload has already seen the change.
+	for (const [id, rt] of [...runtimes]) {
+		if (runtimes.get(id) !== rt) continue;
 		let reloaded = false;
-		if (rt.chatSpec?.kind !== 'legacy' && rt.q?.reloadPlugins) {
+		const old = rt.chatSpec?.kind === 'legacy';
+		if (rt.q?.reloadPlugins && !(old && restartOld)) { // about to restart: nothing to gain from reloading first
 			try {
-				await rt.q.reloadPlugins();
-				if (rt.q.reloadSkills) await rt.q.reloadSkills();
-				reloaded = true;
+				await withTimeout(rt.q.reloadPlugins(), 20000, 'timeout');
+				if (rt.q.reloadSkills) await withTimeout(rt.q.reloadSkills(), 20000, 'timeout');
+				reloaded = !old;
 			} catch (e) { log('[market] reload failed', id.slice(0, 8), e?.message); }
 		}
-		if (reloaded) continue;
+		if (reloaded || !restartOld) continue;
 		if (!rt.running && rt.pending.size === 0) teardownRuntime(id);
 		else rt.restartWhenIdle = true;
 	}
 }
 
 async function afterSkillChange() {
-	await refreshRuntimes();
+	await refreshRuntimes({ restartOld: false });
 	broadcast({ type: 'skills_updated' });
 	refreshSkillNames();
+}
+
+// The App isn't the only one who changes skills: the assistant can install one with its own tools
+// (it runs as root), and then nothing above runs. So the skills directory and the plugin registry
+// are compared with what was last seen whenever it matters: after a turn and when "/" is typed.
+const PLUGIN_REGISTRY = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+let skillsSeen = '';
+let pluginsSeen = '';
+async function changeMarks() {
+	const parts = [];
+	for (const id of (await dirNames(SKILLS_DIR)).sort()) {
+		const st = await stat(join(SKILLS_DIR, id, 'SKILL.md')).catch(() => null);
+		parts.push(`${id}:${st ? st.mtimeMs : 0}`);
+	}
+	const reg = await stat(PLUGIN_REGISTRY).catch(() => null);
+	return { skills: parts.join('|'), plugins: String(reg ? reg.mtimeMs : 0) };
+}
+async function noticeSkillChanges() {
+	const now = await changeMarks();
+	if (now.plugins !== pluginsSeen) {
+		log('[plugins] changed on disk');
+		pluginsSeen = now.plugins;
+		skillsSeen = now.skills;
+		await pluginTask(refreshInstalledPlugins).catch((e) => log('[plugins] list', e?.message));
+		pluginsChanged();
+	} else if (now.skills !== skillsSeen) {
+		log('[skills] changed on disk');
+		skillsSeen = now.skills;
+		await afterSkillChange();
+	}
+}
+// Names that have been skills since the server started: see mergeSlashCommands.
+const formerSkillNames = new Set();
+async function slashCommandsWith(base) {
+	const skills = await listSkills();
+	for (const s of skills) if (s.loadable) formerSkillNames.add(s.name);
+	return mergeSlashCommands(base, skills, formerSkillNames);
+}
+
+// A repository cloned whole into the skills directory: lift the skills it holds up to where Claude
+// Code looks, then drop the rest of the clone. Everything is checked before anything moves.
+async function repairSkill(id) {
+	const dir = [SKILLS_DIR, SKILLS_OFF_DIR].map((d) => join(d, id)).find((p) => existsSync(p));
+	if (!dir) throw new Error('找不到这个技能');
+	const roots = await findSkillRoots(dir);
+	if (!roots.length || roots.some((r) => !r.id)) throw new Error(roots.length ? '这个技能本来就是好的' : '里面没有找到技能文件，只能删除后重新安装');
+	for (const { id: inner } of roots) {
+		if (!safeId(inner)) throw new Error(`技能名称无效：${inner}`);
+		if (inner !== id && (existsSync(join(SKILLS_DIR, inner)) || existsSync(join(SKILLS_OFF_DIR, inner)))) throw new Error(`已经有一个叫「${inner}」的技能`);
+	}
+	// One named like the clone goes last: placing it replaces the clone, with the others still inside.
+	for (const r of roots.sort((a, b) => (a.id === id) - (b.id === id))) await placeSkill(r.dir, r.id);
+	if (!roots.some((r) => r.id === id)) await rm(dir, { recursive: true, force: true });
+	return roots.map((r) => r.id);
 }
 
 // ---------------------------------------------------------------- skill drafts
@@ -1385,6 +1522,8 @@ async function saveProxySetting(url) {
 	await mkdir(dirname(PROXY_FILE), { recursive: true });
 	await writeFile(PROXY_FILE, text, 'utf8');
 	applyProxy(url);
+	// A running claude keeps the proxy it started with, and a wrong one is usually why this changed.
+	restartRuntimesWhenIdle();
 }
 applyProxy(readProxySetting());
 
@@ -1498,6 +1637,7 @@ function httpsGet(host, path, headers, proxy, timeout = 12000) {
 				let body = '';
 				res.setEncoding('utf8');
 				res.on('data', (d) => { body += d; });
+				res.on('error', reject); // dropped halfway: see fetchUrl
 				res.on('end', () => resolve({ status: res.statusCode, body }));
 			});
 			req.on('timeout', () => req.destroy(new Error('超时')));
@@ -1704,6 +1844,9 @@ function fetchUrl(url, { headers = {}, file = null, timeout = 30000, redirects =
 				let body = '';
 				res.setEncoding('utf8');
 				res.on('data', (d) => { body += d; });
+				// A connection dropped halfway ends with neither 'end' nor a req error: without this
+				// the update check would wait forever and never run again.
+				res.on('error', reject);
 				res.on('end', () => resolve({ status: 200, body }));
 			});
 			req.on('timeout', () => req.destroy(new Error('超时')));
@@ -2010,7 +2153,12 @@ async function startLogin() {
 		done = true;
 		broadcast({ type: 'login_done', ok, message });
 		if (login === child) login = null;
-		if (ok) isLoggedIn().then((li) => broadcast({ type: 'auth', loggedIn: li }));
+		if (ok) {
+			// Possibly another account: conversations keep the login they started with otherwise.
+			restartRuntimesWhenIdle();
+			usageCache = { t: 0, data: null };
+			isLoggedIn().then((li) => broadcast({ type: 'auth', loggedIn: li }));
+		}
 	};
 	child.stdout.on('data', (d) => {
 		buf += d.toString();
@@ -2063,11 +2211,13 @@ async function getAuthStatus() {
 	const spec = (await claudeRuntime()).auth;
 	if (!spec) return null;
 	return await new Promise((resolve) => {
-		const c = runClaude(spec, ['auth', 'status']);
+		const c = runClaude(spec, ['auth', 'status'], { stdio: ['ignore', 'pipe', 'ignore'] });
 		let out = '';
 		const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(null); }, 15000);
 		c.stdout.on('data', (d) => { out += d; });
-		c.on('exit', () => {
+		// 'close', not 'exit': the output may still be on its way when the process has exited, and
+		// reading it too early would look like being logged out.
+		c.on('close', () => {
 			clearTimeout(t);
 			try { resolve(JSON.parse(out)); } catch { resolve(null); }
 		});
@@ -2077,7 +2227,9 @@ async function getAuthStatus() {
 
 async function isLoggedIn() {
 	const s = await getAuthStatus();
-	return !!s?.loggedIn;
+	// No answer at all (a busy phone, a slow start) says nothing about the login: go by the stored
+	// credentials rather than throwing the login page at someone who is signed in.
+	return s ? !!s.loggedIn : !!readOauth()?.accessToken;
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -2156,7 +2308,7 @@ const server = createServer(async (req, res) => {
 			res.write(': connected\n\n');
 			res.isMain = url.searchParams.get('main') === '1'; // the chat page (vs. the bubble's panel)
 			clients.add(res);
-			res.write(`data: ${JSON.stringify({ type: 'hello', settings, activeSessionId, activeSession: activeSessionId ? sessionCache.get(activeSessionId) : null, lastUpdate: lastUpdateInfo() })}\n\n`);
+			res.write(`data: ${JSON.stringify({ type: 'hello', settings, activeSessionId, activeSession: activeSessionId ? forPage(sessionCache.get(activeSessionId)) : null, lastUpdate: lastUpdateInfo() })}\n\n`);
 			isLoggedIn().then((li) => { try { res.write(`data: ${JSON.stringify({ type: 'auth', loggedIn: li })}\n\n`); } catch { /* */ } });
 			const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch { /* */ } }, 20000);
 			req.on('close', () => { clearInterval(ka); clients.delete(res); });
@@ -2177,7 +2329,9 @@ const server = createServer(async (req, res) => {
 			// Format title from first message
 			if (sess.messages.length === 0 || sess.title === '新对话') sess.title = autoTitleOf(str);
 
-			sess.messages.push({ role: 'user', text: str, scopes: scopes || [], time: Date.now() });
+			// Not the picture itself: this file is rewritten on every event of every turn from now on.
+			const kept = (Array.isArray(scopes) ? scopes : []).map(({ dataUrl, ...s }) => s);
+			sess.messages.push({ role: 'user', text: str, scopes: kept, time: Date.now() });
 			await saveSession(sess);
 
 			const rt = await ensureRuntime(id);
@@ -2196,22 +2350,14 @@ const server = createServer(async (req, res) => {
 			const rt = sid && runtimes.get(sid);
 			const p = rt?.pending.get(permId);
 			if (!p) return json(res, { ok: false, error: 'gone' }, 404);
-			const sess = sid && sessionCache.get(sid);
-			if (sess) {
-				const pm = sess.messages.find((x) => x.role === 'perm' && x.id === permId);
-				if (pm) {
-					pm.verdict = decision;
-					saveSession(sess);
-				}
-			}
 			if (decision === 'allow') p.resolve({ behavior: 'allow', updatedInput: p.input });
 			else p.resolve({ behavior: 'deny', message: '用户拒绝了这个操作', interrupt: decision === 'stop' });
-			broadcast({ type: 'permission_resolved', sessionId: sid, id: permId, decision });
+			closePermission(sid, permId, decision);
 			// An approved plan means "do it": leave Plan mode the way Claude Code does, into Accept edits.
 			if (decision === 'allow' && p.toolName === 'ExitPlanMode' && settings.mode === 'plan') {
 				settings.mode = 'acceptEdits';
 				await persistSettings();
-				for (const r of runtimes.values()) { try { r.q.setPermissionMode?.('default'); } catch { /* */ } }
+				for (const r of runtimes.values()) tell(() => r.q.setPermissionMode?.('default'));
 				broadcast({ type: 'settings', settings });
 			}
 			return json(res, { ok: true });
@@ -2223,8 +2369,11 @@ const server = createServer(async (req, res) => {
 			const { sessionId } = await body(req);
 			const sid = sessionId || activeSessionId;
 			const rt = sid && runtimes.get(sid);
-			try { rt?.q?.interrupt?.(); } catch { /* */ }
-			for (const [, p] of rt?.pending || []) p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
+			tell(() => rt?.q?.interrupt?.());
+			for (const [permId, p] of rt?.pending || []) {
+				p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
+				closePermission(sid, permId, 'stop');
+			}
 			return json(res, { ok: true });
 		}
 
@@ -2276,8 +2425,8 @@ const server = createServer(async (req, res) => {
 			const s = await getOrLoadSessionObj(id);
 			if (!s) return json(res, { ok: false, error: 'not found' }, 404);
 			activeSessionId = id;
-			broadcast({ type: 'session_switched', session: s });
-			return json(res, { ok: true, session: s });
+			broadcast({ type: 'session_switched', session: forPage(s) });
+			return json(res, { ok: true, session: forPage(s) });
 		}
 
 		if (path === '/api/sessions/pin' && req.method === 'POST') {
@@ -2396,7 +2545,7 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/upload' && req.method === 'POST') {
 			const { dataUrl, filename } = await body(req);
 			if (!dataUrl) return json(res, { ok: false, error: 'no data' }, 400);
-			const matches = dataUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+			const matches = dataUrl.match(/^data:([\w.+\/-]+);base64,(.+)$/);
 			if (!matches || matches.length !== 3) return json(res, { ok: false, error: 'invalid data url' }, 400);
 			const ext = (filename && extname(filename)) ? extname(filename) : '.png';
 			const uploadPath = `/tmp/agent-upload-${randomUUID()}${ext}`;
@@ -2426,11 +2575,15 @@ const server = createServer(async (req, res) => {
 		if (req.method === 'POST' && path === '/api/settings') {
 			const next = await body(req);
 			if ('mode' in next && !MODES.includes(next.mode)) delete next.mode; // unknown mode: keep the current one
+			// Fixed when a process starts: effort, fast mode and how thinking is asked for.
+			const fixedAtStart = () => JSON.stringify([settings.effort, settings.fastMode, thinkingFor(settings.model)]);
+			const before = fixedAtStart();
 			for (const k of SETTING_KEYS) if (k in next) settings[k] = next[k];
 			await persistSettings();
+			if (fixedAtStart() !== before) restartRuntimesWhenIdle();
 			for (const rt of runtimes.values()) {
-				try { if (settings.mode === 'plan') rt.q.setPermissionMode?.('plan'); else rt.q.setPermissionMode?.('default'); } catch { /* */ }
-				try { rt.q.setModel?.(modelFor(rt.chatSpec, settings.model)); } catch { /* */ }
+				tell(() => rt.q.setPermissionMode?.(settings.mode === 'plan' ? 'plan' : 'default'));
+				tell(() => rt.q.setModel?.(modelFor(rt.chatSpec, settings.model)));
 			}
 			broadcast({ type: 'settings', settings });
 			return json(res, { ok: true, settings });
@@ -2446,9 +2599,8 @@ const server = createServer(async (req, res) => {
 			const { text } = await body(req);
 			await mkdir(dirname(SYSTEM_PROMPT_FILE), { recursive: true });
 			await writeFile(SYSTEM_PROMPT_FILE, String(text || ''), 'utf8');
-			// The SDK builds systemPrompt once at query() creation, so this can't be hot-pushed into
-			// conversations already running — it applies to new conversations, or ones reopened after
-			// their runtime idles out. Deliberately NOT tearing anything down to make it "apply sooner".
+			// Applies to new conversations only: the SDK builds systemPrompt once at query() creation, and
+			// the current Claude Code keeps a conversation's original prompt even when it is resumed.
 			broadcast({ type: 'systemprompt_saved' });
 			return json(res, { ok: true });
 		}
@@ -2482,6 +2634,17 @@ const server = createServer(async (req, res) => {
 			}
 			await afterSkillChange();
 			return json(res, { ok: true, skills: await listSkills() });
+		}
+		if (path === '/api/skills/repair' && req.method === 'POST') {
+			const { id } = await body(req);
+			if (!safeId(id)) return json(res, { ok: false, error: '技能名称无效' }, 400);
+			try {
+				const installed = await repairSkill(id);
+				await afterSkillChange();
+				return json(res, { ok: true, installed, skills: await listSkills() });
+			} catch (e) {
+				return json(res, { ok: false, error: e?.message || '修复失败' }, 400);
+			}
 		}
 		if (path === '/api/skills/drafts' && req.method === 'GET') {
 			return json(res, { ok: true, drafts: await listSkillDrafts() });
@@ -2745,14 +2908,25 @@ const server = createServer(async (req, res) => {
 		}
 
 		// ---- Slash commands (for the composer's "/" autocomplete) ----
-		// Keyed by sessionId because skills (which can add commands) are reloaded per-runtime; falls
-		// back to any live runtime, or a conversation that hasn't sent a message yet gets the static list.
+		// The base is a running conversation's own list, or the static one when none runs. Skills on
+		// disk always go in, so the answer never waits on a process. `probe` (the "/" was just typed)
+		// starts the visible conversation for the rest of the list, such as plugin skills: that sends
+		// nothing to the model, and the page hears when it is ready.
 		if (path === '/api/commands' && req.method === 'GET') {
 			const sid = url.searchParams.get('sessionId') || activeSessionId;
+			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
 			const rt = (sid && runtimes.get(sid)) || anyRuntime();
-			if (!rt?.q?.supportedCommands) return json(res, { ok: true, commands: STATIC_SLASH_COMMANDS });
-			try { return json(res, { ok: true, commands: await rt.q.supportedCommands() }); }
-			catch (e) { return json(res, { ok: true, commands: STATIC_SLASH_COMMANDS, error: e?.message }); }
+			if (!rt && sid && url.searchParams.get('probe')) {
+				ensureRuntime(sid)
+					.then((started) => withTimeout(started.q.supportedCommands(), 60000, 'timeout'))
+					.then(() => broadcast({ type: 'skills_updated' }))
+					.catch((e) => log('[commands] probe', e?.message));
+			}
+			let live = null;
+			if (rt?.q?.supportedCommands) {
+				try { live = await withTimeout(rt.q.supportedCommands(), 3000, 'timeout'); } catch (e) { log('[commands]', e?.message); }
+			}
+			return json(res, { ok: true, commands: await slashCommandsWith(live || STATIC_SLASH_COMMANDS) });
 		}
 
 		// ---- Usage / quota (experimental SDK API) ----
@@ -2768,7 +2942,7 @@ const server = createServer(async (req, res) => {
 			const rt = anyRuntime();
 			const fn = rt?.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
 			let sdkUsage = null;
-			if (typeof fn === 'function') { try { sdkUsage = await fn.call(rt.q, { skipBehaviors: true }); } catch { /* */ } }
+			if (typeof fn === 'function') { try { sdkUsage = await withTimeout(fn.call(rt.q, { skipBehaviors: true }), 8000, 'timeout'); } catch { /* */ } }
 			const cost = sdkUsage?.session?.total_cost_usd ?? sdkUsage?.total_cost_usd ?? null;
 			let data;
 			if (plan.ok) data = { rate_limits_available: true, rate_limits: plan.rate_limits, subscription_type: plan.subscription_type, cost };
@@ -2848,6 +3022,9 @@ const server = createServer(async (req, res) => {
 				c.on('exit', () => { clearTimeout(t); resolve(); });
 				c.on('error', () => { clearTimeout(t); resolve(); });
 			});
+			// A running conversation holds the token in memory and would carry on as the old account.
+			for (const id of [...runtimes.keys()]) teardownRuntime(id);
+			usageCache = { t: 0, data: null };
 			broadcast({ type: 'auth', loggedIn: false });
 			return json(res, { ok: true });
 		}
@@ -2910,6 +3087,8 @@ await migrateSkillState().catch((e) => log('[skills] migration failed', e?.messa
 await seedBuiltinSkills().catch((e) => log('[skills] seeding failed', e?.message));
 for (const d of await listSkillDrafts().catch(() => [])) draftsSeen.set(d.id, d.mtime); // only announce new ones
 await refreshSkillNames();
+await slashCommandsWith([]).catch(() => {}); // what counts as a skill from the start
+({ skills: skillsSeen, plugins: pluginsSeen } = await changeMarks().catch(() => ({ skills: '', plugins: '' })));
 server.listen(PORT, HOST, () => {
 	log(`agent app on http://${HOST}:${PORT}  cwd=${CWD}`);
 	claudeRuntime().catch((e) => log('[runtime] probe failed', e?.message)); // find a working claude before anyone asks

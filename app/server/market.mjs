@@ -114,6 +114,54 @@ export async function findSkillRoots(dir) {
 	return roots;
 }
 
+// What Claude Code will make of one directory under ~/.claude/skills. It reads a SKILL.md directly
+// inside and nowhere deeper, so a repository cloned in whole looks installed but never loads.
+export async function inspectSkillDir(dir, id) {
+	const out = { id, name: id, description: '', argumentHint: '', loadable: false, nested: [], userInvocable: true, modelInvocable: true };
+	let text;
+	try { text = await readFile(join(dir, 'SKILL.md'), 'utf8'); }
+	catch {
+		out.nested = (await findSkillRoots(dir).catch(() => [])).map((r) => r.id).filter(Boolean);
+		return out;
+	}
+	out.loadable = true;
+	const fm = parseFrontmatter(text) || {};
+	if (fm.name) out.name = fm.name;
+	if (fm.description) out.description = fm.description;
+	if (fm['argument-hint']) out.argumentHint = fm['argument-hint'];
+	out.userInvocable = fm['user-invocable'] !== 'false';
+	out.modelInvocable = fm['disable-model-invocation'] !== 'true';
+	return out;
+}
+
+// The "/" menu. Claude Code's own list is a snapshot, and there is none at all before a conversation
+// starts, so the skills directory decides which skills are in it. Listing a skill that hasn't loaded
+// yet is safe: both runtimes look for it again when the command is sent. `formerly` holds names that
+// were skills at some point: on disk no more, they must not stay listed from an old snapshot.
+export function mergeSlashCommands(base, skills, formerly = new Set()) {
+	const on = new Map();
+	const off = new Set(formerly);
+	for (const s of skills) {
+		if (!s.loadable) continue;
+		if (s.enabled) on.set(s.name, s);
+		else off.add(s.name);
+	}
+	const aliasesOf = (s) => (s.id !== s.name ? { aliases: [s.id] } : {});
+	const out = [];
+	for (const c of base) {
+		const s = on.get(c.name);
+		// The description from the file: Claude Code's copy has " (user)" stuck on the end.
+		if (s) out.push({ ...c, description: s.description || c.description, kind: 'skill', ...aliasesOf(s) });
+		else if (off.has(c.name)) continue;
+		else out.push(c.name.includes(':') ? { ...c, kind: 'skill' } : c);
+	}
+	for (const s of on.values()) {
+		if (!s.userInvocable || out.some((c) => c.name === s.name)) continue;
+		out.push({ name: s.name, description: s.description, argumentHint: s.argumentHint, kind: 'skill', ...aliasesOf(s) });
+	}
+	return out;
+}
+
 // Relative paths of symlinks whose target is outside `root`.
 export async function findEscapingSymlinks(root) {
 	const bad = [];

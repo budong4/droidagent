@@ -763,6 +763,7 @@ function upsertTodo(todos) {
 }
 
 const VERDICT = { allow: '已允许', deny: '已拒绝', stop: '已停止', expired: '已失效（服务重启过，需要的话重新发一次）' };
+const permMarks = new Map(); // id -> closes that card, whoever answered it
 function addPermission(p) {
 	endAssistant();
 	killWelcome();
@@ -781,11 +782,16 @@ function addPermission(p) {
 		v.classList.remove('hidden');
 		v.textContent = plan && d === 'allow' ? '已同意计划，开始执行' : plan && d === 'deny' ? '已退回，可以接着说要改什么' : (VERDICT[d] || d);
 	};
-	const decide = (d) => { api('/api/permission', { id: p.id, decision: d, sessionId: sid }); mark(d); };
+	const decide = (d) => {
+		if (d === 'stop') stoppedIds.add(sid);
+		api('/api/permission', { id: p.id, decision: d, sessionId: sid });
+		mark(d);
+	};
 	$('.yes', card).addEventListener('click', () => decide('allow'));
 	$('.no', card).addEventListener('click', () => decide('deny'));
 	$('.stop', card).addEventListener('click', () => decide('stop'));
 	if (p.verdict) mark(p.verdict);
+	else permMarks.set(p.id, mark);
 	thread.appendChild(card);
 	scroll(true);
 }
@@ -822,16 +828,19 @@ function buildWelcome() {
 
 /* ---------------- transcript ---------------- */
 let curSession = null;
+// What the owner typed: send() wraps attachments in a block of their own for Claude.
+const typedText = (t) => String(t || '').replace(/^【指定操作范围与上下文】[\s\S]*?【用户指令】\n?/, '');
 function renderTranscript(sess) {
 	stopActivity(); // whichever conversation is now on screen reports its own (fetchSessions)
 	thread.innerHTML = '';
 	toolEls.clear();
+	permMarks.clear();
 	curAssistant = null; curThink = null; curTodoEl = null;
 	chatTitle.textContent = sess?.title || '新对话';
 	if (!sess || !sess.messages || !sess.messages.length) buildWelcome();
 	else {
 		for (const m of sess.messages) {
-			if (m.role === 'user') addUser(m.text);
+			if (m.role === 'user') addUser(typedText(m.text));
 			else if (m.role === 'assistant') { endAssistant(); addAssistantStatic(m.text, m.tookMs); }
 			else if (m.role === 'tool') {
 				if (m.kind === 'todo') { upsertTodo(m.todos || []); continue; }
@@ -844,6 +853,7 @@ function renderTranscript(sess) {
 		}
 	}
 	for (const c of thread.children) c.classList.add('static'); // history appears at once, only new messages animate in
+	if (sess?.liveText) appendAssistant(sess.liveText); // opened mid-reply: what is already written
 	thread.scrollTop = thread.scrollHeight;
 }
 
@@ -893,7 +903,10 @@ new ResizeObserver(() => {
 	if (stick) thread.scrollTop = thread.scrollHeight;
 }).observe(composerEl);
 function autosize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.35) + 'px'; }
-input.addEventListener('input', () => { autosize(); updateSendState(); checkSlashInput(); });
+input.addEventListener('input', () => {
+	autosize(); updateSendState(); checkSlashInput();
+	if (input.value === '/') loadSlashCommands(true); // the list changes behind the page's back
+});
 input.addEventListener('keydown', (e) => {
 	// On the phone Enter makes a new line (the send button is right there); on a keyboard it sends.
 	if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer: fine)').matches) { e.preventDefault(); hideSlash(); send(); }
@@ -929,6 +942,7 @@ function renderScopes() {
 
 const runningIds = new Set();
 const pendingIds = new Set();
+const stoppedIds = new Set(); // the owner pressed Stop, so a turn ending early is no news
 async function send() {
 	const rawText = input.value.trim();
 	if (!rawText && !attachedScopes.length) return;
@@ -947,7 +961,7 @@ async function send() {
 	autosize();
 	hideSlash();
 	const sid = curSession?.id;
-	const scopes = [...attachedScopes];
+	const scopes = attachedScopes.map(({ dataUrl, ...s }) => s); // the picture is already on the phone
 	attachedScopes = [];
 	renderScopes();
 	runningIds.add(sid);
@@ -965,7 +979,7 @@ $('#btn-send').addEventListener('click', send);
 // Stops only this conversation's current turn (like Esc in the terminal).
 $('#btn-stop').addEventListener('click', () => {
 	api('/api/stop', { sessionId: curSession?.id });
-	if (curSession) runningIds.delete(curSession.id);
+	if (curSession) { runningIds.delete(curSession.id); stoppedIds.add(curSession.id); }
 	setRunning(false);
 });
 
@@ -1002,22 +1016,32 @@ const CC_DESC = {
 };
 const appCommand = (name) => APP_COMMANDS.find((c) => c.name === name || (c.aliases || []).includes(name));
 let slashCommands = [];
-async function loadSlashCommands() {
-	const r = await getJSON(`/api/commands?sessionId=${encodeURIComponent(curSession?.id || '')}`);
-	if (r.ok) slashCommands = (r.commands || []).filter((c) => !appCommand(c.name));
+async function loadSlashCommands(probe) {
+	const r = await getJSON(`/api/commands?sessionId=${encodeURIComponent(curSession?.id || '')}${probe ? '&probe=1' : ''}`);
+	if (r.ok) slashCommands = (r.commands || []).filter((c) => !appCommand(c.name) && !c.name.startsWith('__')); // __: Claude Code's internals
+	if (/^\/\S*$/.test(input.value)) checkSlashInput(); // the menu is open: show the new list in it
 }
 function hideSlash() { $('#slash-menu').classList.add('hidden'); }
 function checkSlashInput() {
 	const m = input.value.match(/^\/(\S*)$/);
 	if (!m) return hideSlash();
 	const q = m[1].toLowerCase();
-	const hit = (name, aliases, desc) => !q || name.toLowerCase().startsWith(q) || (aliases || []).some((a) => a.startsWith(q)) || (q.length > 1 && String(desc || '').toLowerCase().includes(q));
+	const named = (name, aliases) => !q || name.toLowerCase().startsWith(q) || (aliases || []).some((a) => a.toLowerCase().startsWith(q));
+	// Descriptions are searched only when no command is called that: "/pd" means /pdf, not every
+	// command that mentions a "pd" somewhere.
+	const anyNamed = [...APP_COMMANDS, ...slashCommands].some((c) => named(c.name, c.aliases));
+	const hit = (name, aliases, desc) => named(name, aliases) || (!anyNamed && q.length > 1 && String(desc || '').toLowerCase().includes(q));
 	const app = APP_COMMANDS.filter((c) => hit(c.name, c.aliases, c.desc)).map((c) => ({ kind: 'app', name: c.name, hint: c.hint || '', desc: c.desc }));
-	const cc = slashCommands.filter((c) => hit(c.name, c.aliases, c.description)).map((c) => ({ kind: 'cc', name: c.name, hint: c.argumentHint || '', desc: CC_DESC[c.name] || c.description || '' }));
+	const found = slashCommands.filter((c) => hit(c.name, c.aliases, c.description));
+	const ccRow = (c) => ({ kind: 'cc', name: c.name, hint: c.argumentHint || '', desc: CC_DESC[c.name] || c.description || '' });
+	const skills = found.filter((c) => c.kind === 'skill').map(ccRow);
+	const cc = found.filter((c) => c.kind !== 'skill').map(ccRow);
 	const menu = $('#slash-menu');
-	if (!app.length && !cc.length) return hideSlash();
+	if (!app.length && !skills.length && !cc.length) return hideSlash();
 	const row = (c) => `<button class="slash-item" data-kind="${c.kind}" data-name="${esc(c.name)}"><span class="slash-name">/${esc(c.name)}${c.hint ? ` <span class="slash-hint">${esc(c.hint)}</span>` : ''}</span><span class="slash-desc">${esc(c.desc)}</span></button>`;
-	menu.innerHTML = (app.length ? `<div class="slash-group">App</div>${app.map(row).join('')}` : '') + (cc.length ? `<div class="slash-group">Claude Code</div>${cc.map(row).join('')}` : '');
+	const group = (title, rows) => (rows.length ? `<div class="slash-group">${title}</div>${rows.map(row).join('')}` : '');
+	// Skills first: on a phone, whatever sits below twenty App commands may as well not exist.
+	menu.innerHTML = group('技能', skills) + group('App', app) + group('Claude Code', cc);
 	menu.classList.remove('hidden');
 	menu.scrollTop = 0;
 	$$('.slash-item', menu).forEach((b) => b.addEventListener('click', () => chooseSlash(b.dataset.kind, b.dataset.name)));
@@ -1058,7 +1082,7 @@ async function cmdStatus() {
 		+ kvRow('账号', a ? `${a.email || ''}${SUBSCRIPTION_LABEL[a.subscriptionType] ? `（Claude ${SUBSCRIPTION_LABEL[a.subscriptionType]}）` : ''}` : '未登录')
 		+ kvRow('工作目录', rt.cwd)
 		+ kvRow('MCP 服务器', mcpNames.length ? `${mcpNames.length} 个，已连接 ${mcpOn} 个` : '没有')
-		+ kvRow('技能', sk.ok ? `已启用 ${sk.skills.filter((x) => x.enabled).length} 个` : '')
+		+ kvRow('技能', sk.ok ? `已启用 ${sk.skills.filter((x) => x.enabled && x.loadable).length} 个` : '')
 		+ kvRow('网络代理', px.ok ? (px.proxy || '直连') : '')
 		+ kvRow('对话', curSession?.claudeSessionId ? `Claude 会话 ${curSession.claudeSessionId.slice(0, 8)}` : '还没开始');
 }
@@ -1083,8 +1107,10 @@ async function cmdDoctor() {
 }
 function cmdHelp() {
 	const row = (n, h, d) => `<div class="help-row"><code>/${esc(n)}${h ? ' ' + esc(h) : ''}</code><span>${esc(d)}</span></div>`;
-	infoCard('命令', 'i-terminal', `<div class="help-group">App</div>${APP_COMMANDS.map((c) => row(c.name, c.hint, c.desc + ((c.aliases || []).length ? `（也可以用 /${c.aliases.join('、/')}）` : ''))).join('')}`
-		+ (slashCommands.length ? `<div class="help-group">Claude Code</div>${slashCommands.map((c) => row(c.name, c.argumentHint, CC_DESC[c.name] || c.description || '')).join('')}` : ''));
+	const group = (title, list) => (list.length ? `<div class="help-group">${title}</div>${list.map((c) => row(c.name, c.argumentHint, CC_DESC[c.name] || c.description || '')).join('')}` : '');
+	infoCard('命令', 'i-terminal', group('技能', slashCommands.filter((c) => c.kind === 'skill'))
+		+ `<div class="help-group">App</div>${APP_COMMANDS.map((c) => row(c.name, c.hint, c.desc + ((c.aliases || []).length ? `（也可以用 /${c.aliases.join('、/')}）` : ''))).join('')}`
+		+ group('Claude Code', slashCommands.filter((c) => c.kind !== 'skill')));
 }
 async function cmdExport() {
 	const r = await getJSON('/api/sessions');
@@ -1138,6 +1164,7 @@ $('#file-image').addEventListener('change', (e) => {
 	const f = e.target.files[0];
 	e.target.value = '';
 	if (!f) return;
+	if (f.size > 14e6) { toast('图片太大了，请选择 14 MB 以内的图片'); return; } // base64 of it must fit the server's 20 MB limit
 	const reader = new FileReader();
 	reader.onload = async () => {
 		const dataUrl = reader.result;
@@ -1459,7 +1486,7 @@ $('#prompt-save').addEventListener('click', async () => {
 	if (r.ok === false) { toast('保存失败'); return; }
 	$('#val-prompt').textContent = text.trim() ? '已设置' : '未设置';
 	closePage('page-prompt');
-	toast('已保存，从下一条消息起生效');
+	toast('已保存，从新对话开始生效');
 });
 
 /* ---------------- self-update ---------------- */
@@ -1698,7 +1725,8 @@ function connect() {
 				break;
 			case 'permission_resolved':
 				if (m.sessionId) pendingIds.delete(m.sessionId);
-				if (mine) setActivity('正在思考'); else renderSidebar();
+				if (permMarks.has(m.id)) { permMarks.get(m.id)(m.decision); permMarks.delete(m.id); } // answered elsewhere, or stopped
+				if (mine) { if (running) setActivity('正在思考'); } else renderSidebar();
 				break;
 			case 'result':
 				if (m.sessionId) runningIds.delete(m.sessionId);
@@ -1706,9 +1734,10 @@ function connect() {
 					endAssistant();
 					setRunning(false);
 					markTurnTime(m.durationMs);
-					if (m.subtype && m.subtype !== 'success') sysline(`本轮结束：${m.subtype}`);
+					if (m.subtype && m.subtype !== 'success') sysline(stoppedIds.has(m.sessionId) ? '已停止' : `这一轮没有做完${m.errors?.[0] ? `：${m.errors[0]}` : '，可以再发一次试试'}`);
 					fetchSessions();
 				} else renderSidebar();
+				stoppedIds.delete(m.sessionId);
 				usageSoon();
 				break;
 			case 'cleared':

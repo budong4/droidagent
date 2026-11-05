@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import {
 	safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
 	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, buildMcpEntry, inspectPluginDir,
-	resolveInside,
+	resolveInside, inspectSkillDir, mergeSlashCommands,
 } from '../app/server/market.mjs';
 
 async function tmp() { return mkdtemp(join(tmpdir(), 'market-test-')); }
@@ -243,4 +243,80 @@ test('inspectPluginDir reports the parts that can run things', async () => {
 		assert.equal(b.runsCode, true, 'an unreadable hooks file must not look harmless');
 		await rm(broken, { recursive: true, force: true });
 	} finally { await rm(d, { recursive: true, force: true }); }
+});
+
+test('inspectSkillDir says what Claude Code will make of a directory', async () => {
+	const d = await tmp();
+	try {
+		await mkdir(join(d, 'plain'));
+		await writeFile(join(d, 'plain', 'SKILL.md'), '---\nname: shown\ndescription: d\nargument-hint: <file>\n---\nb\n');
+		const plain = await inspectSkillDir(join(d, 'plain'), 'plain');
+		assert.equal(plain.loadable, true);
+		assert.equal(plain.name, 'shown');
+		assert.equal(plain.description, 'd');
+		assert.equal(plain.argumentHint, '<file>');
+		assert.equal(plain.userInvocable, true);
+		assert.equal(plain.modelInvocable, true);
+
+		await mkdir(join(d, 'flags'));
+		await writeFile(join(d, 'flags', 'SKILL.md'), '---\nname: flags\ndescription: d\nuser-invocable: false\ndisable-model-invocation: true\n---\nb\n');
+		const flags = await inspectSkillDir(join(d, 'flags'), 'flags');
+		assert.equal(flags.userInvocable, false);
+		assert.equal(flags.modelInvocable, false);
+
+		await mkdir(join(d, 'bare'));
+		await writeFile(join(d, 'bare', 'SKILL.md'), 'no frontmatter at all\n');
+		const bare = await inspectSkillDir(join(d, 'bare'), 'bare');
+		assert.equal(bare.loadable, true, 'Claude Code loads it under its directory name');
+		assert.equal(bare.name, 'bare');
+
+		// A repository cloned in whole: the folder is there, but Claude Code never reads this deep.
+		await skill(join(d, 'repo', 'skills', 'inner'), 'inner');
+		const repo = await inspectSkillDir(join(d, 'repo'), 'repo');
+		assert.equal(repo.loadable, false);
+		assert.deepEqual(repo.nested, ['inner']);
+
+		await mkdir(join(d, 'empty'));
+		const empty = await inspectSkillDir(join(d, 'empty'), 'empty');
+		assert.equal(empty.loadable, false);
+		assert.deepEqual(empty.nested, []);
+	} finally { await rm(d, { recursive: true, force: true }); }
+});
+
+test('mergeSlashCommands puts what is on disk over a stale or missing list', () => {
+	const on = (id, extra = {}) => ({ id, name: id, description: `${id} desc`, argumentHint: '', enabled: true, loadable: true, userInvocable: true, modelInvocable: true, nested: [], ...extra });
+	const names = (l) => l.map((c) => c.name);
+
+	// No conversation running: the fallback list still gets every working skill.
+	const fresh = mergeSlashCommands([{ name: 'compact', description: 'c' }], [on('mine')]);
+	assert.deepEqual(names(fresh), ['compact', 'mine']);
+	assert.equal(fresh[1].kind, 'skill');
+	assert.equal(fresh[1].description, 'mine desc');
+	assert.equal(fresh[0].kind, undefined, 'a built-in command is not a skill');
+
+	// Installed by hand after the conversation began: Claude Code's list doesn't have it yet.
+	const live = [{ name: 'context', description: 'x' }, { name: 'old', description: 'from claude', argumentHint: '<a>' }];
+	const merged = mergeSlashCommands(live, [on('old'), on('new')]);
+	assert.deepEqual(names(merged), ['context', 'old', 'new']);
+	assert.equal(merged[1].kind, 'skill');
+	assert.equal(merged[1].argumentHint, '<a>', 'what Claude Code reports wins');
+	assert.equal(merged[1].description, 'old desc', 'but not its description, which has " (user)" stuck on');
+
+	// Deleted by hand: Claude Code 2.1.112's list never changes, so remember what used to be a skill.
+	assert.deepEqual(names(mergeSlashCommands(live, [], new Set(['old']))), ['context']);
+	// Turned off since the conversation began: gone at once.
+	assert.deepEqual(names(mergeSlashCommands(live, [on('old', { enabled: false })])), ['context']);
+	// ...unless another skill that is on answers to the same name.
+	assert.deepEqual(names(mergeSlashCommands(live, [on('old', { enabled: false }), on('b', { name: 'old' })])), ['context', 'old']);
+
+	// Would only fail if chosen.
+	assert.deepEqual(names(mergeSlashCommands([], [on('broken', { loadable: false }), on('hidden', { userInvocable: false })])), []);
+
+	// Called by its frontmatter name, findable by its directory name too.
+	const renamed = mergeSlashCommands([], [on('dir', { name: 'shown' })]);
+	assert.deepEqual(names(renamed), ['shown']);
+	assert.deepEqual(renamed[0].aliases, ['dir']);
+
+	// Plugin skills arrive namespaced from Claude Code.
+	assert.equal(mergeSlashCommands([{ name: 'pdemo:pone', description: 'p' }], [])[0].kind, 'skill');
 });

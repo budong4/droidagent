@@ -10,12 +10,12 @@ const curView = () => mk.view[mk.tab];
 const onMarket = () => pageStack.includes('page-market');
 const failed = (title, msg) => showDialog({ title, msg: msg || '请重试', ok: '知道了', cancel: '' });
 
-function marketRow({ title, badges = [], sub = '', meta = '', action = '' }) {
+function marketRow({ title, badges = [], sub = '', meta = '', metaWarn = false, action = '' }) {
 	const row = el('div', 'row market-row');
 	const bs = badges.map(([cls, text]) => `<span class="badge ${esc(cls)}">${esc(text)}</span>`).join('');
 	row.innerHTML = `<span class="row-text"><span>${esc(title)}${bs}</span>`
 		+ (sub ? `<span class="item-sub">${esc(sub)}</span>` : '')
-		+ (meta ? `<span class="market-meta">${esc(meta)}</span>` : '')
+		+ (meta ? `<span class="market-meta${metaWarn ? ' warn' : ''}">${esc(meta)}</span>` : '')
 		+ `</span>${action}`;
 	return row;
 }
@@ -107,7 +107,7 @@ async function loadSkillsTab() {
 			box.appendChild(listOf(drafts.drafts.map(draftRow)));
 		}
 		const rows = mine.skills.filter((s) => hit(s.id, s.name, s.description))
-			.sort((a, b) => (b.enabled - a.enabled) || (a.builtin - b.builtin) || a.name.localeCompare(b.name)).map(skillRow);
+			.sort((a, b) => (a.loadable - b.loadable) || (b.enabled - a.enabled) || (a.builtin - b.builtin) || a.name.localeCompare(b.name)).map(skillRow);
 		if (rows.length) box.appendChild(listOf(rows));
 		else if (!box.children.length) box.appendChild(emptyMsg(mk.q ? '没有符合的技能' : '还没有技能'));
 		return;
@@ -136,19 +136,39 @@ async function loadSkillsTab() {
 	foot.appendChild(el('p', 'foot-note', '官方技能在安装时从 github.com/anthropics/skills 下载，使用受各自的许可约束。'));
 }
 
+// How a skill gets used, in the owner's words: this is the one place that tells them.
+function skillNote(s) {
+	if (!s.loadable) return s.nested.length ? `没有生效：技能文件放得太深，Claude 读不到。点「修复」可以放好（找到 ${s.nested.length} 个技能）` : '没有生效：这个文件夹里没有技能文件（SKILL.md），Claude 读不到';
+	if (!s.enabled) return '';
+	if (!s.userInvocable) return 'Claude 会在需要时自己使用，斜杠菜单里没有';
+	if (!s.modelInvocable) return `输入 /${s.name} 使用，Claude 不会自己使用`;
+	return `输入 /${s.name} 使用，或者直接说出你的需求`;
+}
+
 // Installed skills show a readable title: a description opening with a short phrase ("手机体检。…") gives it.
 function skillRow(s) {
 	const dm = /^([^。.]{2,10})[。.]\s*(.+)$/s.exec(s.description || '');
+	const fixable = !s.loadable && s.nested.length > 0;
 	const row = marketRow({
 		title: dm ? dm[1] : s.name, sub: dm ? dm[2] : (s.description || s.id),
 		badges: s.builtin ? [['builtin', '内置']] : [],
-		action: toggleHtml(s.enabled) + (s.builtin ? '' : delHtml('删除')),
+		meta: skillNote(s), metaWarn: !s.loadable,
+		// A switch on something that can't load would only claim it works.
+		action: (fixable ? actionBtn('修复') : s.loadable ? toggleHtml(s.enabled) : '') + (s.builtin ? '' : delHtml('删除')),
 	});
-	$('input', row).addEventListener('change', async (e) => {
+	$('input', row)?.addEventListener('change', async (e) => {
 		e.target.disabled = true;
 		const r = await api('/api/skills/toggle', { id: s.id, enabled: e.target.checked });
 		e.target.disabled = false;
 		if (!r.ok) { e.target.checked = !e.target.checked; toast(r.error || '操作失败'); }
+		else loadMarket(); // its note changes with the switch
+	});
+	$('.market-act', row)?.addEventListener('click', async (e) => {
+		const reset = busyButton(e.currentTarget, '修复中');
+		const r = await api('/api/skills/repair', { id: s.id });
+		if (!r.ok) { reset(); failed('修复失败', r.error); return; }
+		toast(`已修复：${r.installed.join('、')}`);
+		loadMarket();
 	});
 	const del = $('.item-del', row);
 	if (del) del.addEventListener('click', () => showDialog({
@@ -203,7 +223,7 @@ function previewDraft(d) {
 
 async function publishDraft(id, overwrite) {
 	const r = await api('/api/skills/drafts/publish', { id, overwrite });
-	if (r.ok) { toast('已保存并启用，新对话里就能用了'); if (onMarket()) loadMarket(); return; }
+	if (r.ok) { toast('已保存并启用，输入 / 就能找到它'); if (onMarket()) loadMarket(); return; }
 	if (r.exists) { showDialog({ title: '覆盖同名技能？', msg: r.error, ok: '覆盖', danger: true, onOk: () => publishDraft(id, true) }); return; }
 	failed('保存失败', r.error);
 }
