@@ -364,7 +364,7 @@ $('#file-bg').addEventListener('change', async (e) => {
 });
 
 /* ================================================================ settings state */
-const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true };
+const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true, backgroundScreen: true };
 const MODES = [
 	{ id: 'default', label: 'Ask', desc: '只读操作直接做，其他每一步都先问你' },
 	{ id: 'acceptEdits', label: 'Accept edits', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
@@ -392,6 +392,7 @@ function applySettings(s) {
 	if (prevMode !== SETTINGS.mode) { chip.classList.remove('flash'); void chip.offsetWidth; chip.classList.add('flash'); }
 	$('#model-label').textContent = SETTINGS.modelName || 'Sonnet 5.5';
 	$('#t-autoupdate').checked = SETTINGS.autoUpdate !== false;
+	$('#t-bgscreen').checked = SETTINGS.backgroundScreen !== false;
 	$('#t-fast').checked = !!SETTINGS.fastMode;
 }
 function pushSettings(patch) {
@@ -864,6 +865,60 @@ function renderTranscript(sess) {
 	renderQueue(sess?.queue, sess?.queueHeld);
 	thread.scrollTop = thread.scrollHeight;
 }
+
+/* ---------------- the background screen ---------------- */
+// The assistant opens apps on a screen nobody sees, so the owner keeps the phone. While an app is
+// open there, a row above the input shows it; tapping it shows it live, and the owner can put the
+// app on their own screen or close the background one.
+let bgScreen = { active: false };
+let bgSheetOpen = false;
+let bgFrameTimer = null;
+let bgFraming = false;
+const bgOn = () => !!(bgScreen.active && bgScreen.pkg);
+function renderBgScreen(st) {
+	bgScreen = st || { active: false };
+	$('#bg-row').classList.toggle('hidden', !bgOn());
+	if (bgOn()) {
+		$('#bg-app').textContent = bgScreen.app || bgScreen.pkg;
+		$('#bg-sheet-title').textContent = bgScreen.app || '后台屏幕';
+	} else if (bgSheetOpen) closeLayer('sheet');
+	bgFrames();
+}
+async function bgFrames() {
+	clearTimeout(bgFrameTimer);
+	bgFrameTimer = null;
+	if (!bgOn() || document.hidden || bgFraming) return;
+	bgFraming = true;
+	const big = bgSheetOpen;
+	try {
+		const r = await fetch(`/api/bgscreen/frame?w=${big ? 540 : 80}`, { cache: 'no-store' });
+		if (r.ok) {
+			const img = $(big ? '#bg-live' : '#bg-thumb');
+			const old = img.src;
+			img.src = URL.createObjectURL(await r.blob());
+			if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+		}
+	} catch { /* next time */ }
+	bgFraming = false;
+	if (bgOn() && !document.hidden) bgFrameTimer = setTimeout(bgFrames, bgSheetOpen ? 800 : 3000);
+}
+$('#bg-row').addEventListener('click', () => {
+	const s = $('#sheet-bgscreen'), scrim = $('#sheet-scrim');
+	show(scrim); show(s);
+	bgSheetOpen = true;
+	openLayer('sheet', () => { hide(s); hide(scrim); bgSheetOpen = false; });
+	bgFrames();
+});
+$('#bg-show').addEventListener('click', async () => {
+	const r = await api('/api/bgscreen/show', {});
+	if (!r.ok) { toast(r.error || '没能放到前台'); return; }
+	closeLayer('sheet');
+});
+$('#bg-stop').addEventListener('click', async () => {
+	await api('/api/bgscreen/stop', {});
+	closeLayer('sheet');
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) bgFrames(); });
 
 /* ---------------- messages waiting for the turn in progress ---------------- */
 function renderQueue(list = [], held = false) {
@@ -1508,6 +1563,7 @@ PAGE_OPEN['page-settings'] = async () => {
 	$('#val-prompt').textContent = sp.ok && sp.text && sp.text.trim() ? '已设置' : '未设置';
 };
 $('#t-autoupdate').addEventListener('change', (e) => pushSettings({ autoUpdate: e.target.checked }));
+$('#t-bgscreen').addEventListener('change', (e) => pushSettings({ backgroundScreen: e.target.checked }));
 
 /* ---------------- system prompt ---------------- */
 PAGE_OPEN['page-prompt'] = async () => {
@@ -1714,6 +1770,7 @@ function connect() {
 				// those turns are gone); the session list right below says what still is.
 				runningIds.clear(); pendingIds.clear(); setRunning(false);
 				applySettings(m.settings);
+				getJSON('/api/bgscreen').then((r) => renderBgScreen(r.ok ? r : null));
 				if (m.activeSession) { curSession = m.activeSession; renderTranscript(curSession); }
 				showUpdateNotice(m.lastUpdate); // after the redraw, which would wipe it
 				fetchSessions();
@@ -1781,6 +1838,7 @@ function connect() {
 				runningIds.clear(); pendingIds.clear();
 				break;
 			case 'settings': applySettings(m.settings); break;
+			case 'bgscreen': renderBgScreen(m); break;
 			case 'queue': if (mine) renderQueue(m.queue, m.held); break;
 			case 'skills_updated': loadSlashCommands(); break;
 			case 'mcp_updated': break;

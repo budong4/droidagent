@@ -587,6 +587,8 @@ public class OverlayService extends Service {
         if (!panelOpen) return;
         panelOpen = false;
         panelClosedAt = System.currentTimeMillis();
+        // The page stops asking for pictures of the background screen nobody is looking at.
+        if (panelWeb != null) panelWeb.evaluateJavascript("window.panelHidden && window.panelHidden()", null);
         if (animated) {
             panel.animate().cancel();
             panel.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(140).withEndAction(new Detach(this, panel)).start();

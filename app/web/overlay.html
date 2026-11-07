@@ -57,6 +57,19 @@
 	button.pill:active { filter: brightness(.9); }
 	.queue { color: var(--faint); font-size: 12px; padding: 6px 0 0; }
 
+	/* The background screen: what the assistant is looking at, live. Tap the picture to enlarge it. */
+	#screen { display: none; flex: none; margin: 0 12px 6px; padding: 8px; gap: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+	#screen.on { display: flex; }
+	#screen .shot { flex: none; width: 64px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: #000; overflow: hidden; display: block; }
+	#screen .shot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+	#screen .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+	#screen .k { font-size: 11.5px; color: var(--faint); }
+	#screen .app { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	#screen .btns { margin-top: auto; display: flex; gap: 6px; }
+	#screen.big { flex-direction: column; }
+	#screen.big .shot { width: 100%; height: 46vh; }
+	#screen.big .btns { margin-top: 6px; }
+
 	footer { flex: none; padding: 8px 12px 12px; display: flex; }
 	footer button { flex: 1; height: 38px; border-radius: 12px; border: 0; background: var(--surface2); color: var(--text); font-size: 13px; font-weight: 600; font-family: inherit; display: flex; align-items: center; justify-content: center; gap: 6px; }
 	footer button:active { background: var(--line); }
@@ -70,6 +83,7 @@
 		<symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6.3 6.3l2.8 2.8M14.9 14.9l2.8 2.8M6.3 17.7l2.8-2.8M14.9 9.1l2.8-2.8"/></symbol>
 		<symbol id="i-chat" viewBox="0 0 24 24"><path d="M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H10l-5 4v-4H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/></symbol>
 		<symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+		<symbol id="i-screen" viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="2.5"/><path d="M10.5 18h3"/></symbol>
 		<symbol id="i-note" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v5M12 16h.01"/></symbol>
 	</svg>
 	<header>
@@ -77,6 +91,14 @@
 		<div class="head-text"><span id="title">连接中…</span><span id="sub"></span></div>
 		<button id="btn-close" class="icon-btn" aria-label="收起"><svg class="ic"><use href="#i-x"/></svg></button>
 	</header>
+	<section id="screen" aria-label="后台屏幕">
+		<button class="shot" id="shot" aria-label="放大或缩小"><img id="shot-img" alt=""></button>
+		<div class="info">
+			<span class="k">助手在后台使用，不占你的屏幕</span>
+			<span class="app" id="screen-app"></span>
+			<div class="btns"><button class="pill yes" id="btn-show">放到前台</button><button class="pill" id="btn-bg-stop">关闭</button></div>
+		</div>
+	</section>
 	<div id="feed"><div class="empty">正在读取…</div></div>
 	<footer><button id="btn-open"><svg class="ic"><use href="#i-open"/></svg>打开这段对话</button></footer>
 
@@ -92,6 +114,9 @@ let liveText = null;      // the reply being written: { el, text }
 let liveThink = null;     // the thinking being written: { el, text }
 let refreshTimer = null;
 let ticker = null;
+let shown = true;         // the panel is unfolded
+let frameTimer = null;
+let framing = false;
 
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function secs(ms) { const t = Math.max(0, Math.round(ms / 1000)); return t < 60 ? `${t} 秒` : `${Math.floor(t / 60)} 分 ${String(t % 60).padStart(2, '0')} 秒`; }
@@ -131,8 +156,35 @@ function stepHtml(st) {
 	return '';
 }
 
+// The background screen's card, and a fresh picture of it every second while anyone can see it.
+function screenCard() {
+	const b = state?.bg;
+	const on = !!(b?.active && b.pkg);
+	$('#screen').classList.toggle('on', on);
+	if (on) $('#screen-app').textContent = b.app || b.pkg;
+	if (on && shown) frames(); else { clearTimeout(frameTimer); frameTimer = null; }
+}
+async function frames() {
+	clearTimeout(frameTimer); frameTimer = null;
+	if (framing) return;
+	framing = true;
+	try {
+		const w = $('#screen').classList.contains('big') ? 540 : 160;
+		const r = await fetch(`/api/bgscreen/frame?w=${w}`, { cache: 'no-store' });
+		if (r.ok) {
+			const img = $('#shot-img');
+			const old = img.src;
+			img.src = URL.createObjectURL(await r.blob());
+			if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+		}
+	} catch { /* next time */ }
+	framing = false;
+	if (shown && $('#screen').classList.contains('on')) frameTimer = setTimeout(frames, 1000);
+}
+
 function render() {
 	liveText = null; liveThink = null;
+	screenCard();
 	const s = state;
 	if (!s?.id) { feed.innerHTML = '<div class="empty">还没有进行中的任务</div>'; header(); return; }
 	let html = s.steps.map(stepHtml).join('');
@@ -185,6 +237,7 @@ function connect() {
 	es.onerror = () => { $('#state').className = 'state'; $('#sub').textContent = '连接断开，正在重连'; };
 	es.onmessage = (e) => {
 		let m; try { m = JSON.parse(e.data); } catch { return; }
+		if (m.type === 'bgscreen') { if (state) { state.bg = m; screenCard(); } return; }
 		if (!m.sessionId) return;
 		const mine = state?.id === m.sessionId;
 		switch (m.type) {
@@ -214,8 +267,20 @@ $('#btn-open').onclick = async () => {
 	if (state?.id) await fetch('/api/sessions/switch', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: state.id }) }).catch(() => {});
 	location.href = 'k70u://open-chat';
 };
-// The panel is kept alive while folded; the app calls this when it unfolds it.
-window.panelShown = refresh;
+$('#shot').onclick = () => { $('#screen').classList.toggle('big'); frames(); };
+// The owner takes the app: it moves to their screen, and the panel folds so they see it.
+$('#btn-show').onclick = async () => {
+	const r = await fetch('/api/bgscreen/show', { method: 'POST' }).then((x) => x.json()).catch(() => null);
+	if (r?.ok) location.href = 'k70u://close-panel';
+	else refresh();
+};
+$('#btn-bg-stop').onclick = async () => {
+	await fetch('/api/bgscreen/stop', { method: 'POST' }).catch(() => {});
+	refresh();
+};
+// The panel is kept alive while folded; the app calls these when it unfolds and folds it.
+window.panelShown = () => { shown = true; refresh(); };
+window.panelHidden = () => { shown = false; clearTimeout(frameTimer); frameTimer = null; };
 
 connect();
 ticker = setInterval(() => { if (state?.running && !state.waiting) header(); }, 1000);

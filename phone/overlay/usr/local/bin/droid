@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""droid - drive the Android screen from the chroot (screencap / uiautomator / input via ashell).
+"""droid - drive Android apps from the chroot (screencap / uiautomator / input via ashell).
+
+Apps open on a background screen of the assistant's own, which the owner doesn't see: they keep
+using the phone meanwhile. Every command below goes to that screen while it is open.
 
 Observe -> act -> observe again:
   droid ui [--all]            list on-screen controls: number, text, centre in device px
@@ -8,10 +11,15 @@ Observe -> act -> observe again:
   droid tap-id N              tap control N from the last `droid ui`
   droid tap-text TEXT         fresh dump, tap the control whose text/desc matches
   droid tap X Y | longpress X Y [MS] | swipe X1 Y1 X2 Y2 [MS]
-  droid text STRING           type text (non-ASCII needs ADBKeyboard installed)
-  droid key NAME              back home enter recent power del tab esc up down left right ...
-  droid app PKG | apps [FILTER] | top | wake
+  droid text STRING           type into the focused field (any language)
+  droid key NAME              back enter del tab esc up down left right ... (home/recent: owner's screen only)
+  droid app PKG [--front]     open an app: on the background screen, or with --front on the owner's
+  droid apps [FILTER] | top | wake
   droid wait-text TEXT [--timeout SEC]
+The background screen:
+  droid bg                    is it open, and what is on it
+  droid show                  move its app onto the owner's screen (when they want to see or take over)
+  droid bg stop               close it; commands go to the owner's screen again
 Coordinates are always device pixels unless stated otherwise.
 """
 import argparse
@@ -20,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -39,6 +48,10 @@ KEYS = {
     "volup": "VOLUME_UP", "voldown": "VOLUME_DOWN", "wake": "WAKEUP", "sleep": "SLEEP",
     "search": "SEARCH", "space": "SPACE",
 }
+# Keys that act on the whole phone, not on one screen.
+GLOBAL_KEYS = {"POWER", "VOLUME_UP", "VOLUME_DOWN", "WAKEUP", "SLEEP"}
+# Keys only the owner's screen has: the background screen has no home screen or recents.
+OWNER_ONLY_KEYS = {"HOME", "APP_SWITCH"}
 
 
 def ash(*args, check=True, data=None):
@@ -107,25 +120,160 @@ class OverlayHidden:
         return False
 
 
+# ---------- the background screen ----------
+# A virtual display held by BgScreen in the app's APK, which runs as root through app_process and
+# answers on an abstract socket, to root only. Apps start on it with `am start --display`, input
+# goes there with `input -d`, and screenshots, controls and text come from BgScreen itself.
+BG_SOCK = "\0droidagent-bgscreen"
+BG_DIR = "/data/local/tmp/droid-bg"
+BG_CLASS = "com.droidagent.app.BgScreen"
+SETTINGS = os.path.expanduser("~/.claude/agent-settings.json")
+
+
+def bg_call(line, check=True, timeout=30):
+    """One command to BgScreen. None when it isn't running."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(BG_SOCK)
+    except OSError:
+        s.close()
+        return None
+    try:
+        s.sendall((line + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError as e:
+        buf = f"err {e}".encode()
+    finally:
+        s.close()
+    r = buf.decode(errors="replace").strip()
+    if r.startswith("err"):
+        if check:
+            sys.exit(f"droid: background screen: {r[4:]}")
+        return r
+    return r[3:] if r.startswith("ok ") else ("" if r == "ok" else r)
+
+
+_bg = "unknown"
+
+
+def bg():
+    """What is on the background screen, or None when it isn't open. Asked once per command."""
+    global _bg
+    if _bg == "unknown":
+        r = bg_call("info", check=False)
+        try:
+            _bg = json.loads(r) if r and not r.startswith("err") else None
+        except ValueError:
+            _bg = None
+    return _bg
+
+
+def bg_wanted():
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f).get("backgroundScreen", True) is not False
+    except (OSError, ValueError):
+        return True
+
+
+def screen_metrics():
+    def pick(text, kind):
+        found = {}
+        for line in text.splitlines():
+            m = re.match(r"\s*(Physical|Override) \w+:\s*(\S+)", line)
+            if m:
+                found[m.group(1)] = m.group(2)
+        v = found.get("Override") or found.get("Physical")
+        if not v:
+            sys.exit(f"droid: can't read the screen {kind}")
+        return v
+    w, h = pick(out("wm", "size"), "size").split("x")
+    return int(w), int(h), int(pick(out("wm", "density"), "density"))
+
+
+def bg_start():
+    """Open the background screen if it isn't. Returns (info, None) or (None, why not)."""
+    global _bg
+    if bg():
+        return _bg, None
+    paths = [l.split(":", 1)[1] for l in out("pm", "path", APP_PKG).split() if l.startswith("package:")]
+    if not paths:
+        return None, "DroidAgent's APK was not found"
+    w, h, dpi = screen_metrics()
+    os.makedirs(BG_DIR, exist_ok=True)
+    os.chmod(BG_DIR, 0o777)  # BgScreen may have to run as the shell user on some phones
+    log = f"{BG_DIR}/helper.log"
+    subprocess.Popen(
+        ["ashell", "sh", "-c", f'CLASSPATH="$0" exec app_process /system/bin {BG_CLASS} serve {w} {h} {dpi} > {log} 2>&1',
+         paths[0]],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(60):
+        time.sleep(0.25)
+        _bg = "unknown"
+        if bg():
+            return _bg, None
+        try:
+            with open(log) as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        if "Exception" in text or "Error" in text:
+            break
+    try:
+        with open(log) as f:
+            lines = [l.strip() for l in f if l.strip()]
+    except OSError:
+        lines = []
+    why = next((l for l in lines if "Exception" in l or "Error" in l), lines[-1] if lines else "it did not start")
+    return None, why[:300]
+
+
+def bg_display():
+    return bg()["display"]
+
+
+def bg_note():
+    """Said whenever the background screen has nothing on it, so nobody acts on a blank."""
+    info = bg()
+    if not info or info.get("tasks"):
+        return
+    if info.get("takenOver"):
+        print(f"note: the owner moved {info['takenOver']} to their own screen; nothing is open on the background "
+              "screen. Don't work on their screen without asking: `droid app PKG` opens an app here again.")
+    else:
+        print("note: nothing is open on the background screen (the app closed). `droid app PKG` opens one.")
+
+
 # ---------- observe ----------
 
 def dump_ui(show_all=False):
     os.makedirs(STATE, exist_ok=True)
-    err = ""
-    for _ in range(4):
-        if os.path.exists(UI_XML):
-            os.remove(UI_XML)
-        r = ash("uiautomator", "dump", UI_XML, check=False)
-        if os.path.exists(UI_XML) and os.path.getsize(UI_XML) > 0:
-            break
-        err = (r.stderr + r.stdout).decode(errors="replace").strip()
-        time.sleep(0.8)  # "could not get idle state" while animating
+    if bg():
+        xml_path = f"{BG_DIR}/ui.xml"
+        bg_call(f"ui {xml_path}")
     else:
-        sys.exit(f"droid: uiautomator dump failed: {err}")
+        xml_path = UI_XML
+        err = ""
+        for _ in range(4):
+            if os.path.exists(UI_XML):
+                os.remove(UI_XML)
+            r = ash("uiautomator", "dump", UI_XML, check=False)
+            if os.path.exists(UI_XML) and os.path.getsize(UI_XML) > 0:
+                break
+            err = (r.stderr + r.stdout).decode(errors="replace").strip()
+            time.sleep(0.8)  # "could not get idle state" while animating
+        else:
+            sys.exit(f"droid: uiautomator dump failed: {err}")
 
     nodes = []
     pkg = None
-    for n in ET.parse(UI_XML).getroot().iter("node"):
+    for n in ET.parse(xml_path).getroot().iter("node"):
         b = [int(v) for v in re.findall(r"-?\d+", n.get("bounds", ""))]
         if len(b) != 4 or b[2] <= b[0] or b[3] <= b[1]:
             continue
@@ -147,7 +295,7 @@ def dump_ui(show_all=False):
             "x": (b[0] + b[2]) // 2, "y": (b[1] + b[3]) // 2, "bounds": b, "flags": flags,
         })
     with open(UI_JSON, "w") as f:
-        json.dump({"pkg": pkg, "nodes": nodes}, f, ensure_ascii=False)
+        json.dump({"pkg": pkg, "nodes": nodes, "screen": "background" if bg() else "owner"}, f, ensure_ascii=False)
     return pkg, nodes
 
 
@@ -167,9 +315,12 @@ def fmt(d):
 
 def cmd_ui(a):
     pkg, nodes = dump_ui(a.all)
-    print(f"# app={pkg}  {len(nodes)} controls  (device px; tap with `droid tap-id N`)")
+    where = "background screen" if bg() else "owner's screen"
+    print(f"# {where}  app={pkg}  {len(nodes)} controls  (device px; tap with `droid tap-id N`)")
     for d in nodes:
         print(fmt(d))
+    if bg():
+        bg_note()
 
 
 def cmd_shot(a):
@@ -177,10 +328,15 @@ def cmd_shot(a):
 
     os.makedirs(STATE, exist_ok=True)
     full = f"{STATE}/shot_full.png"
-    with OverlayHidden(bool(overlay_windows())):
-        png = ash("screencap", "-p").stdout
-    with open(full, "wb") as f:
-        f.write(png)
+    if bg():
+        src = f"{BG_DIR}/shot.png"
+        bg_call(f"shot {src}")
+        shutil.copyfile(src, full)
+    else:
+        with OverlayHidden(bool(overlay_windows())):
+            png = ash("screencap", "-p").stdout
+        with open(full, "wb") as f:
+            f.write(png)
     im = Image.open(full).convert("RGB")
     w, h = im.size
     dest = a.output or f"{STATE}/shot.png"
@@ -199,19 +355,28 @@ def cmd_shot(a):
                 d.text((3, p + 3), str(dev), fill=(255, 0, 64))
     im.save(dest)
     print(f"{dest}  {im.width}x{im.height}  device {w}x{h}  "
-          f"(device coord = image coord / {a.scale}{'; grid labels are device px' if a.grid else ''})")
+          f"(device coord = image coord / {a.scale}{'; grid labels are device px' if a.grid else ''})"
+          + ("  [background screen]" if bg() else ""))
+    if bg():
+        bg_note()
 
 
 # ---------- act ----------
 
 def tap(x, y):
-    with OverlayHidden(overlay_covers(x, y)):
-        ash("input", "tap", x, y)
+    if bg():
+        ash("input", "-d", bg_display(), "tap", x, y)
+    else:
+        with OverlayHidden(overlay_covers(x, y)):
+            ash("input", "tap", x, y)
     print(f"tapped ({x},{y})")
 
 
 def press(x1, y1, x2, y2, ms):
     """A swipe, or a long press when it starts and ends in one place."""
+    if bg():
+        ash("input", "-d", bg_display(), "swipe", x1, y1, x2, y2, ms)
+        return
     with OverlayHidden(overlay_covers(x1, y1) or overlay_covers(x2, y2)):
         ash("input", "swipe", x1, y1, x2, y2, ms)
 
@@ -219,9 +384,12 @@ def press(x1, y1, x2, y2, ms):
 def load_nodes():
     try:
         with open(UI_JSON) as f:
-            return json.load(f)["nodes"]
+            j = json.load(f)
     except FileNotFoundError:
         sys.exit("droid: no UI dump yet, run `droid ui` first")
+    if j.get("screen", "owner") != ("background" if bg() else "owner"):
+        sys.exit("droid: the last `droid ui` was of the other screen; run `droid ui` again")
+    return j["nodes"]
 
 
 def find_text(nodes, text):
@@ -252,14 +420,27 @@ def cmd_tap_text(a):
     tap(hits[0]["x"], hits[0]["y"])
 
 
+def set_text_once(display, s):
+    """Text into the focused field through accessibility, without the background screen running."""
+    paths = [l.split(":", 1)[1] for l in out("pm", "path", APP_PKG).split() if l.startswith("package:")]
+    if not paths:
+        return "err DroidAgent's APK was not found"
+    r = ash("sh", "-c", f'CLASSPATH="$0" exec app_process /system/bin {BG_CLASS} settext {display} "$1"',
+            paths[0], base64.b64encode(s.encode()).decode(), check=False)
+    lines = [l for l in r.stdout.decode(errors="replace").splitlines() if l.strip()]
+    return lines[-1] if lines else "err " + r.stderr.decode(errors="replace").strip()[-300:]
+
+
 def cmd_text(a):
     s = a.string
-    if s.isascii():
+    if bg():
+        if s.isascii():
+            ash("input", "-d", bg_display(), "text", s.replace(" ", "%s"))
+        else:
+            bg_call("settext " + base64.b64encode(s.encode()).decode())
+    elif s.isascii():
         ash("input", "text", s.replace(" ", "%s"))
-    else:
-        if "package:" not in ash("pm", "path", "com.android.adbkeyboard", check=False).stdout.decode():
-            sys.exit("droid: non-ASCII text needs ADBKeyboard (com.android.adbkeyboard): "
-                     "install it from github.com/senzhk/ADBKeyBoard, then retry")
+    elif "package:" in ash("pm", "path", "com.android.adbkeyboard", check=False).stdout.decode():
         prev = out("settings", "get", "secure", "default_input_method").strip()
         ash("ime", "enable", ADB_IME, check=False)
         ash("ime", "set", ADB_IME)
@@ -269,20 +450,57 @@ def cmd_text(a):
         time.sleep(0.3)
         if prev and prev != ADB_IME and prev != "null":
             ash("ime", "set", prev, check=False)
+    else:
+        r = set_text_once(0, s)
+        if not r.startswith("ok"):
+            sys.exit(f"droid: could not type that: {r[4:] if r.startswith('err ') else r}")
     print(f"typed {len(s)} chars")
 
 
 def cmd_key(a):
     k = KEYS.get(a.name.lower(), a.name.upper())
-    ash("input", "keyevent", k if k.isdigit() or k.startswith("KEYCODE_") else "KEYCODE_" + k)
+    code = k if k.isdigit() or k.startswith("KEYCODE_") else "KEYCODE_" + k
+    if bg() and k in OWNER_ONLY_KEYS:
+        sys.exit(f"droid: the background screen has no {a.name} screen. Open another app with `droid app PKG`, "
+                 "or close the background screen with `droid bg stop`.")
+    if bg() and k not in GLOBAL_KEYS:
+        ash("input", "-d", bg_display(), "keyevent", code)
+    else:
+        ash("input", "keyevent", code)
     print(f"key {k}")
 
 
-def cmd_app(a):
+def launcher_component(pkg):
     res = out("cmd", "package", "resolve-activity", "--brief", "-c",
-              "android.intent.category.LAUNCHER", a.pkg).strip().splitlines()
+              "android.intent.category.LAUNCHER", pkg).strip().splitlines()
     comp = res[-1].strip() if res else ""
-    if "/" in comp:
+    return comp if "/" in comp else None
+
+
+def cmd_app(a):
+    global _bg
+    comp = launcher_component(a.pkg)
+    if not a.front and bg_wanted():
+        info, why = bg_start()
+        if info:
+            if comp is None:
+                sys.exit(f"droid: {a.pkg} has nothing to open (no launcher activity); is it installed? `droid apps`")
+            owner_top = bg_call("top 0", check=False)
+            if owner_top == a.pkg:
+                sys.exit(f"droid: the owner is using {a.pkg} on their screen right now, and opening it on the background "
+                         "screen would take it away from them. Ask them first; to work on their screen instead: "
+                         f"`droid app {a.pkg} --front`.")
+            ash("am", "start", "--display", info["display"], "-n", comp)
+            print(f"started {comp} on the background screen (the owner keeps their screen; "
+                  "`droid show` puts it in front of them)")
+            return
+        print(f"note: no background screen ({why}); opening on the owner's screen")
+    elif bg():
+        # --front, or background work switched off: the commands that follow go to the owner's screen.
+        bg_call("quit", check=False)
+        _bg = None
+        print("note: closed the background screen")
+    if comp:
         ash("am", "start", "-n", comp)
         print(f"started {comp}")
     else:
@@ -298,6 +516,11 @@ def cmd_apps(a):
 
 
 def cmd_top(a):
+    if bg():
+        info = bg()
+        print(f"background screen: {info.get('activity') or 'nothing open'}")
+        print(f"owner's screen: {bg_call('top 0', check=False)}")
+        return
     for l in out("dumpsys", "window").splitlines():
         if "mCurrentFocus" in l or "mFocusedApp" in l:
             print(l.strip())
@@ -319,6 +542,33 @@ def cmd_wait_text(a):
             return
         time.sleep(1)
     sys.exit(f'droid: "{a.text}" did not appear within {a.timeout}s')
+
+
+def cmd_bg(a):
+    info = bg()
+    if a.action == "stop":
+        if info:
+            bg_call("quit", check=False)
+            print("closed the background screen; commands go to the owner's screen again")
+        else:
+            print("the background screen was not open")
+        return
+    if not info:
+        print("background screen: not open (" + ("`droid app PKG` opens it" if bg_wanted()
+                                                  else "switched off in DroidAgent's settings") + ")")
+        return
+    print(f"background screen: display {info['display']}, {info['w']}x{info['h']}, "
+          f"app: {info.get('activity') or 'nothing open'}")
+    bg_note()
+
+
+def cmd_show(a):
+    info = bg()
+    if not info:
+        sys.exit("droid: the background screen is not open; the app is already on the owner's screen")
+    pkg = bg_call("takeover")
+    print(f"moved {pkg} to the owner's screen. Commands still go to the background screen, now empty; "
+          "to keep working on the owner's screen, ask them first, then `droid bg stop`.")
 
 
 def main():
@@ -348,12 +598,15 @@ def main():
     s.set_defaults(f=lambda a: (press(a.x1, a.y1, a.x2, a.y2, a.ms), print("swiped")))
     s = sub.add_parser("text"); s.add_argument("string"); s.set_defaults(f=cmd_text)
     s = sub.add_parser("key"); s.add_argument("name"); s.set_defaults(f=cmd_key)
-    s = sub.add_parser("app"); s.add_argument("pkg"); s.set_defaults(f=cmd_app)
+    s = sub.add_parser("app"); s.add_argument("pkg"); s.add_argument("--front", action="store_true")
+    s.set_defaults(f=cmd_app)
     s = sub.add_parser("apps"); s.add_argument("filter", nargs="?"); s.set_defaults(f=cmd_apps)
     sub.add_parser("top").set_defaults(f=cmd_top)
     sub.add_parser("wake").set_defaults(f=cmd_wake)
     s = sub.add_parser("wait-text"); s.add_argument("text")
     s.add_argument("--timeout", type=float, default=10); s.set_defaults(f=cmd_wait_text)
+    s = sub.add_parser("bg"); s.add_argument("action", nargs="?", choices=["stop"]); s.set_defaults(f=cmd_bg)
+    sub.add_parser("show").set_defaults(f=cmd_show)
 
     a = p.parse_args()
     a.f(a)

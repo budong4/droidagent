@@ -10,7 +10,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=10">
+	<link rel="stylesheet" href="style.css?v=11">
 	<!-- applies the saved theme and font before the first paint -->
 	<script src="themes.js?v=8"></script>
 </head>
@@ -56,6 +56,7 @@
 			<symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
 			<symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 01-12 0zM12 17v4"/></symbol>
 			<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 00-14.7-4.4L4 8M4 4v4h4M4 13a8 8 0 0014.7 4.4L20 16M20 20v-4h-4"/></symbol>
+			<symbol id="i-screen" viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="2.5"/><path d="M10.5 18h3"/></symbol>
 			<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
 			<symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/></symbol>
 			<symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
@@ -94,6 +95,7 @@
 		<footer id="composer">
 			<div id="slash-menu" class="slash-menu hidden"></div>
 			<div id="queue-box" class="queue-box hidden" aria-label="排队的消息"></div>
+			<button id="bg-row" class="bg-row hidden" aria-label="查看后台屏幕"><img id="bg-thumb" class="bg-thumb" alt=""><span class="bg-text"><span class="bg-k">助手在后台使用，不占你的屏幕</span><span id="bg-app" class="bg-app"></span></span><span class="pill-btn">查看</span></button>
 			<div id="activity" class="activity hidden" role="status" aria-live="polite"><svg class="ic act-ic"><use href="#i-spark"/></svg><span id="act-label">正在思考</span><span id="act-time" class="act-time">0 秒</span></div>
 			<div id="scope-container" class="scope-container hidden"></div>
 			<div class="composer-card">
@@ -191,6 +193,7 @@
 			<div class="list">
 				<button class="row" data-page="page-market"><svg class="ic row-ic"><use href="#i-box"/></svg><span class="row-text">扩展市场<small>技能、连接器和插件</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 				<button class="row" data-page="page-prompt"><svg class="ic row-ic"><use href="#i-doc"/></svg><span class="row-text">系统提示词</span><span id="val-prompt" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				<label class="row"><svg class="ic row-ic"><use href="#i-screen"/></svg><span class="row-text">后台操作<small>助手在一块看不见的屏幕上用其他应用，你的屏幕照常用</small></span><span class="sw"><input type="checkbox" id="t-bgscreen"><i></i></span></label>
 			</div>
 
 			<h2 class="group-label">通用</h2>
@@ -288,6 +291,13 @@
 		<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="apps-search" type="search" placeholder="搜索应用名或包名" autocomplete="off"></label>
 		<div id="apps-list" class="sheet-list"></div>
 	</section>
+	<section id="sheet-bgscreen" class="sheet bg-sheet hidden" aria-label="后台屏幕">
+		<div class="grip"></div>
+		<div class="sheet-head"><h3 id="bg-sheet-title">后台屏幕</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
+		<p class="bg-note">助手在一块看不见的屏幕上操作，你的屏幕照常用。想自己看或接着用，点「放到前台」。</p>
+		<div class="bg-live"><img id="bg-live" alt="后台屏幕的实时画面"></div>
+		<div class="bg-acts"><button id="bg-show" class="pill-btn accent">放到前台</button><button id="bg-stop" class="pill-btn">关闭后台屏幕</button></div>
+	</section>
 	<section id="sheet-fs" class="sheet hidden" aria-label="选择文件或文件夹">
 		<div class="grip"></div>
 		<div class="sheet-head"><h3 id="fs-title">选择文件或文件夹</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
@@ -350,7 +360,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=12"></script>
+	<script src="app.js?v=13"></script>
 	<script src="market.js?v=5"></script>
 </body>
 </html>

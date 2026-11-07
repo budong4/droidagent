@@ -54,6 +54,7 @@ const settings = {
 	fastMode: false,          // fast mode toggle
 	mode: 'acceptEdits',      // Claude Code's permission modes: default | acceptEdits | plan | auto | bypassPermissions
 	autoUpdate: true,         // install new releases by itself (off: only report them)
+	backgroundScreen: true,   // droid opens apps on a screen of its own, not on the owner's
 };
 // The modes, as Claude Code names them. Older builds stored their own names.
 const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
@@ -61,7 +62,7 @@ const MODE_MIGRATE = { ask: 'default', autoEdit: 'acceptEdits' };
 // What the client may change through /api/settings. Screen automation, web access, personal
 // data and showing thinking used to be switches; they are simply on now (the mode decides what
 // needs a confirmation), and "read-only" is what Plan mode is for.
-const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate'];
+const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate', 'backgroundScreen'];
 
 // Config files for the Eta-parity features.
 const SYSTEM_PROMPT_FILE = join(homedir(), '.claude', 'agent-system-prompt.md');
@@ -1053,6 +1054,60 @@ async function maybeTitle(id) {
 		titling.delete(id);
 	}
 }
+
+// ---------------------------------------------------------------- the background screen
+// droid opens apps on a screen nobody sees (BgScreen in the APK, run as root), so the owner keeps
+// the phone while the assistant works. It answers on an abstract socket, to root only; this
+// server is root in the same network namespace. The page and the floating panel show that screen
+// live, and can move its app over to the owner's screen.
+const BG_SOCKET = '\0droidagent-bgscreen';
+const BG_DIR = process.env.AGENT_BG_DIR || '/data/local/tmp/droid-bg'; // where BgScreen may write
+function bgCall(line, timeout = 15000) {
+	return new Promise((resolve) => {
+		let buf = '';
+		let finished = false;
+		const s = netConnect({ path: BG_SOCKET });
+		const done = (v) => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timer);
+			s.destroy();
+			resolve(v);
+		};
+		const timer = setTimeout(() => done(null), timeout);
+		s.setEncoding('utf8');
+		s.on('connect', () => s.write(`${line}\n`));
+		s.on('data', (d) => { buf += d; if (buf.includes('\n')) done(buf.trim()); });
+		s.on('error', () => done(null));
+		s.on('close', () => done(buf.trim() || null));
+	});
+}
+async function bgState() {
+	const r = await bgCall('info', 3000);
+	if (!r?.startsWith('ok ')) return { active: false };
+	try {
+		const j = JSON.parse(r.slice(3));
+		return {
+			active: true, pkg: j.top || null, app: j.label || j.top || null,
+			takenOver: j.takenOverLabel || j.takenOver || null, w: j.w, h: j.h,
+		};
+	} catch { return { active: false }; }
+}
+// Pages hear about it opening, changing app and closing. Asked while a conversation works, or
+// while it is open; `info` doesn't keep it open.
+let bgLast = JSON.stringify({ active: false });
+async function watchBgScreen() {
+	const st = await bgState();
+	const key = JSON.stringify(st);
+	if (key !== bgLast) {
+		bgLast = key;
+		broadcast({ type: 'bgscreen', ...st });
+	}
+	return st;
+}
+setInterval(() => {
+	if ([...runtimes.values()].some((rt) => rt.running) || bgLast.includes('"active":true')) watchBgScreen().catch(() => {});
+}, 2000).unref();
 
 // ---------------------------------------------------------------- apps & filesystem helpers
 // Fallback for the "/" command autocomplete before any conversation's runtime exists yet to ask
@@ -2561,7 +2616,37 @@ const server = createServer(async (req, res) => {
 				label: rt?.label || '', since: rt?.since || 0, others: Math.max(0, live.length - 1),
 				steps, liveText: rt?.assistantText || '', liveThinking: rt?.thinking?.text || '',
 				queue: (queues.get(id) || []).map((q) => clip(typedText(q.text), 200)),
+				bg: await bgState(),
 			});
+		}
+
+		if (path === '/api/bgscreen' && req.method === 'GET') {
+			return json(res, { ok: true, ...(await watchBgScreen()) });
+		}
+		// What is on it now, small, for watching it live.
+		if (path === '/api/bgscreen/frame' && req.method === 'GET') {
+			const w = Math.max(120, Math.min(720, parseInt(url.searchParams.get('w'), 10) || 360));
+			const file = `${BG_DIR}/frame-${randomUUID().slice(0, 8)}.jpg`;
+			const r = await bgCall(`frame ${file} ${w}`, 8000);
+			if (!r?.startsWith('ok')) return json(res, { ok: false, error: r ? r.replace(/^err /, '') : '后台屏幕没有打开' }, 404);
+			try {
+				const img = await readFile(file);
+				res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'content-length': img.length });
+				return res.end(img);
+			} finally {
+				await unlink(file).catch(() => {});
+			}
+		}
+		// The owner takes the app: it moves to their screen, where they can see and use it.
+		if (path === '/api/bgscreen/show' && req.method === 'POST') {
+			const r = await bgCall('takeover');
+			watchBgScreen().catch(() => {});
+			if (!r?.startsWith('ok')) return json(res, { ok: false, error: r ? r.replace(/^err /, '') : '后台屏幕没有打开' }, 409);
+			return json(res, { ok: true, pkg: r.slice(3) });
+		}
+		if (path === '/api/bgscreen/stop' && req.method === 'POST') {
+			await bgCall('quit');
+			return json(res, { ok: true, ...(await watchBgScreen()) });
 		}
 
 		// Sessions API
@@ -2749,7 +2834,9 @@ const server = createServer(async (req, res) => {
 			const fixedAtStart = () => JSON.stringify([settings.effort, settings.fastMode, thinkingFor(settings.model)]);
 			const before = fixedAtStart();
 			for (const k of SETTING_KEYS) if (k in next) settings[k] = next[k];
+			settings.backgroundScreen = settings.backgroundScreen !== false;
 			await persistSettings();
+			if (!settings.backgroundScreen) bgCall('quit').then(() => watchBgScreen()).catch(() => {});
 			if (fixedAtStart() !== before) restartRuntimesWhenIdle();
 			for (const rt of runtimes.values()) {
 				tell(() => rt.q.setPermissionMode?.(settings.mode === 'plan' ? 'plan' : 'default'));
