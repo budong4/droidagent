@@ -11,8 +11,20 @@ export const OFFICIAL_MARKETPLACES = [
 	{ name: 'claude-plugins-official', url: 'https://github.com/anthropics/claude-plugins-official.git' },
 	{ name: 'anthropic-agent-skills', url: 'https://github.com/anthropics/skills.git' },
 ];
+// Claude Code 2.1.112 refuses a whole marketplace when one entry uses a kind of source it doesn't
+// know, and the official one now has such an entry. That runtime gets a copy of the official
+// catalog without those entries, under a name of its own: the official name is reserved for
+// GitHub sources from anthropics, and a name that looks official is refused as well.
+export const COMPAT_MARKETPLACE = 'droidagent-plugins';
+export const COMPAT_OF = 'claude-plugins-official';
+const LEGACY_SOURCE_KINDS = new Set(['github', 'url', 'git', 'git-subdir', 'npm', 'pip', 'directory', 'file']);
+export function compatibleMarketplace(j) {
+	const all = Array.isArray(j?.plugins) ? j.plugins : [];
+	const keep = all.filter((p) => typeof p?.source === 'string' || LEGACY_SOURCE_KINDS.has(p?.source?.source));
+	return { json: { ...j, name: COMPAT_MARKETPLACE, plugins: keep }, dropped: all.filter((p) => !keep.includes(p)).map((p) => p?.name) };
+}
 // Listed by Anthropic. Plugin authors can still be third parties, so the UI says "官方目录", never "safe".
-const OFFICIAL_NAMES = new Set(['claude-plugins-official', 'anthropic-agent-skills', 'anthropic-plugin-directory']);
+export const OFFICIAL_NAMES = new Set(['claude-plugins-official', 'anthropic-agent-skills', 'anthropic-plugin-directory', COMPAT_MARKETPLACE]);
 
 const SEGMENT = /^[A-Za-z0-9_][\w.-]*$/;
 

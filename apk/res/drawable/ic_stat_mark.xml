@@ -1,18 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Status-bar icon: the same mark, white on transparent, cropped to its own bounds. -->
+<!-- Status-bar icon: the same face, white on transparent with the eyes cut out, cropped to its bounds. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
-    android:viewportWidth="56"
-    android:viewportHeight="56">
-    <group android:translateX="-26" android:translateY="-26">
+    android:viewportWidth="62"
+    android:viewportHeight="62">
+    <group android:translateX="-23" android:translateY="-19.5">
         <path
-            android:pathData="M43.6,36.4 L39.2,71.6 M56.8,36.4 L52.4,71.6 M32,46.9 H64 M29.8,61.2 H61.8"
+            android:pathData="M54,37 V28"
             android:strokeColor="#FFFFFF"
-            android:strokeWidth="6.8"
+            android:strokeWidth="4"
             android:strokeLineCap="round" />
         <path
-            android:pathData="M70.1,40.8 h8.5 a1.8,1.8 0 0 1 1.8,1.8 v27.2 a1.8,1.8 0 0 1 -1.8,1.8 h-8.5 a1.8,1.8 0 0 1 -1.8,-1.8 v-27.2 a1.8,1.8 0 0 1 1.8,-1.8 z"
+            android:pathData="M48.8,25 a5.2,5.2 0 1,0 10.4,0 a5.2,5.2 0 1,0 -10.4,0 z"
+            android:fillColor="#FFFFFF" />
+        <path
+            android:fillType="evenOdd"
+            android:pathData="M46,37 H62 A19,19 0 0 1 81,56 V62 A19,19 0 0 1 62,81 H46 A19,19 0 0 1 27,62 V56 A19,19 0 0 1 46,37 Z M44.75,51 A3.75,3.75 0 0 1 48.5,54.75 V61.25 A3.75,3.75 0 0 1 41,61.25 V54.75 A3.75,3.75 0 0 1 44.75,51 Z M63.25,51 A3.75,3.75 0 0 1 67,54.75 V61.25 A3.75,3.75 0 0 1 59.5,61.25 V54.75 A3.75,3.75 0 0 1 63.25,51 Z"
             android:fillColor="#FFFFFF" />
     </group>
 </vector>

@@ -14,7 +14,7 @@ import { homedir } from 'node:os';
 import {
 	OFFICIAL_MARKETPLACES, safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
 	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, connectorName, buildMcpEntry, inspectPluginDir,
-	inspectSkillDir, mergeSlashCommands,
+	inspectSkillDir, mergeSlashCommands, OFFICIAL_NAMES, COMPAT_MARKETPLACE, COMPAT_OF, compatibleMarketplace,
 } from './market.mjs';
 import { isReadOnlyBash } from './policy.mjs';
 
@@ -525,8 +525,10 @@ function forgetQueue(id) {
 }
 
 // One user message into its conversation and on to Claude Code.
+let lastWorkedId = null; // what the floating panel shows once nothing runs any more
 async function deliverMessage(id, { text, scopes = [] }, { fromQueue = false } = {}) {
 	delivering.add(id);
+	lastWorkedId = id;
 	try {
 		const sess = await getOrLoadSessionObj(id);
 		if (!sess) throw new Error('session not found: ' + id);
@@ -1406,11 +1408,47 @@ let officialMarkets = null;
 function ensureOfficialMarkets() {
 	officialMarkets ||= (async () => {
 		const have = await cliJson(['plugin', 'marketplace', 'list', '--json']);
+		const has = (name) => have.some((x) => x.name === name);
 		for (const m of OFFICIAL_MARKETPLACES) {
-			if (!have.some((x) => x.name === m.name)) await claudeCli(['plugin', 'marketplace', 'add', m.url], { timeout: 300000 });
+			if (has(m.name) || (m.name === COMPAT_OF && has(COMPAT_MARKETPLACE))) continue;
+			try {
+				await claudeCli(['plugin', 'marketplace', 'add', m.url], { timeout: 300000 });
+			} catch (e) {
+				if (m.name !== COMPAT_OF || !/invalid (input|schema)|plugins\.\d+\.source/i.test(e?.message || '')) throw e;
+				log('[market] this Claude Code refuses the official catalog, using a compatible copy:', e.message);
+				await writeCompatMarket();
+				await claudeCli(['plugin', 'marketplace', 'add', COMPAT_DIR], { timeout: 300000 });
+			}
 		}
 	})().catch((e) => { officialMarkets = null; throw e; });
 	return officialMarkets;
+}
+
+// The official catalog as Claude Code 2.1.112 can read it (see COMPAT_MARKETPLACE), fetched again
+// whole and swapped in, so a failed fetch leaves the last good copy.
+const COMPAT_DIR = join(homedir(), '.claude', 'plugin-catalog-compat');
+async function writeCompatMarket() {
+	const src = OFFICIAL_MARKETPLACES.find((m) => m.name === COMPAT_OF);
+	const tmp = `${COMPAT_DIR}.new-${randomUUID().slice(0, 8)}`;
+	try {
+		await run('git', ['clone', '--depth', '1', '--', src.url, tmp], { timeout: 300000 });
+		const file = join(tmp, '.claude-plugin', 'marketplace.json');
+		const { json, dropped } = compatibleMarketplace(JSON.parse(await readFile(file, 'utf8')));
+		await writeFile(file, JSON.stringify(json, null, '\t'));
+		log('[market] compatible catalog leaves out:', dropped.join(', ') || 'nothing');
+		await rm(COMPAT_DIR, { recursive: true, force: true });
+		await rename(tmp, COMPAT_DIR);
+	} finally {
+		await rm(tmp, { recursive: true, force: true });
+	}
+}
+async function refreshCompatMarket() {
+	const st = await stat(join(COMPAT_DIR, '.claude-plugin', 'marketplace.json')).catch(() => null);
+	if (!st || Date.now() - st.mtimeMs < 24 * 3600 * 1000) return;
+	try {
+		await writeCompatMarket();
+		await claudeCli(['plugin', 'marketplace', 'update', COMPAT_MARKETPLACE], { timeout: 300000 });
+	} catch (e) { log('[market] refreshing the compatible catalog', e?.message); }
 }
 
 // One plugin operation at a time. They all rewrite the same settings file, and each runs a CLI that
@@ -1431,6 +1469,7 @@ function loadPluginCatalog({ force = false } = {}) {
 	if (!force && Date.now() - plugins.loadedAt < CATALOG_TTL) return Promise.resolve();
 	plugins.loading = pluginTask(async () => {
 		await ensureOfficialMarkets();
+		await refreshCompatMarket();
 		const j = await cliJson(['plugin', 'list', '--available', '--json'], { timeout: 180000 });
 		// The CLI leaves installed plugins out of `available`, so an entry seen once is kept:
 		// uninstalling a plugin must bring it back to the list without another slow load.
@@ -2497,6 +2536,34 @@ const server = createServer(async (req, res) => {
 			return res.end(`${state}\t${String(label).replace(/\s+/g, ' ').slice(0, 40)}\t${running.length}`);
 		}
 
+		// What the floating panel shows: the conversation at work (the one waiting on the owner first,
+		// then the busiest), or the one that worked last, with its recent steps and what it waits on.
+		if (path === '/api/overlay/state' && req.method === 'GET') {
+			const live = [...runtimes.entries()].filter(([, rt]) => rt.running || rt.pending.size);
+			live.sort(([, a], [, b]) => (b.pending.size - a.pending.size) || (b.lastActive - a.lastActive));
+			const id = live[0]?.[0] || lastWorkedId || activeSessionId;
+			const sess = id ? await getOrLoadSessionObj(id) : null;
+			if (!sess) return json(res, { ok: true, id: null, steps: [] });
+			const rt = runtimes.get(id);
+			const clip = (t, n) => { const s = String(t || ''); return s.length > n ? `${s.slice(0, n)}…` : s; };
+			const steps = [];
+			for (const m of sess.messages.slice(-40)) {
+				if (m.role === 'user') steps.push({ k: 'user', text: clip(typedText(m.text), 400) });
+				else if (m.role === 'assistant') steps.push({ k: 'reply', text: clip(m.text, 3000) });
+				else if (m.role === 'think') steps.push({ k: 'think', text: clip(m.text, 3000), ms: m.ms || 0 });
+				else if (m.role === 'tool' && m.kind !== 'todo') steps.push({ k: 'tool', title: m.title || m.name, state: m.state || 'ok', category: m.category || '' });
+				else if (m.role === 'perm') steps.push({ k: 'perm', id: m.id, title: m.title || m.name, detail: clip(m.detail, 600), reason: m.reason || '', verdict: m.verdict || (rt?.pending.has(m.id) ? null : 'expired') });
+				else if (m.role === 'sys' || m.role === 'cmdout') steps.push({ k: 'note', text: clip(m.text, 300) });
+			}
+			return json(res, {
+				ok: true, id, title: sess.title || '新对话',
+				running: !!rt?.running, waiting: (rt?.pending.size || 0) > 0,
+				label: rt?.label || '', since: rt?.since || 0, others: Math.max(0, live.length - 1),
+				steps, liveText: rt?.assistantText || '', liveThinking: rt?.thinking?.text || '',
+				queue: (queues.get(id) || []).map((q) => clip(typedText(q.text), 200)),
+			});
+		}
+
 		// Sessions API
 		if (path === '/api/sessions' && req.method === 'GET') {
 			const idx = await loadSessionsIndex();
@@ -2874,8 +2941,7 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/market/marketplaces' && req.method === 'GET') {
 			try {
 				const list = await cliJson(['plugin', 'marketplace', 'list', '--json']);
-				const official = new Set(OFFICIAL_MARKETPLACES.map((m) => m.name));
-				return json(res, { ok: true, marketplaces: list.map((m) => ({ name: m.name, url: m.url || m.repo || '', official: official.has(m.name) })) });
+				return json(res, { ok: true, marketplaces: list.map((m) => ({ name: m.name, url: m.url || m.repo || '', official: OFFICIAL_NAMES.has(m.name) })) });
 			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
 		}
 		if (path === '/api/market/marketplaces/add' && req.method === 'POST') {
@@ -2891,7 +2957,7 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/market/marketplaces/remove' && req.method === 'POST') {
 			const { name } = await body(req);
 			if (!safeId(name)) return json(res, { ok: false, error: '名称无效' }, 400);
-			if (OFFICIAL_MARKETPLACES.some((m) => m.name === name)) return json(res, { ok: false, error: '官方市场不能移除' }, 400);
+			if (OFFICIAL_NAMES.has(name)) return json(res, { ok: false, error: '官方市场不能移除' }, 400);
 			try {
 				await pluginTask(() => claudeCli(['plugin', 'marketplace', 'remove', name]));
 				plugins.known.clear();

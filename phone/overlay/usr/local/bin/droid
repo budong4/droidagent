@@ -53,6 +53,60 @@ def out(*args):
     return ash(*args).stdout.decode(errors="replace")
 
 
+# ---------- the app's floating windows ----------
+# DroidAgent shows a floating face while it works in other apps. It must not end up in a screenshot
+# or catch a tap meant for the app underneath, so it is hidden for those moments. The app writes
+# where its windows are; /data is the same directory inside the chroot.
+APP_PKG = "com.droidagent.app"
+OVERLAY_STATE = f"/data/user_de/0/{APP_PKG}/overlay.state"
+OVERLAY_HIDE = f"{APP_PKG}.OVERLAY_HIDE"
+
+
+def overlay_windows():
+    """[(x, y, w, h)] of the floating windows on screen now, in device px."""
+    try:
+        with open(OVERLAY_STATE) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    wins = []
+    for line in lines:
+        p = line.split()
+        if len(p) == 6 and p[0] in ("bubble", "panel") and p[1] == "1":
+            try:
+                wins.append(tuple(int(v) for v in p[2:]))
+            except ValueError:
+                pass
+    return wins
+
+
+def overlay_covers(x, y, margin=12):
+    return any(wx - margin <= x <= wx + w + margin and wy - margin <= y <= wy + h + margin
+               for wx, wy, w, h in overlay_windows())
+
+
+class OverlayHidden:
+    """with OverlayHidden(needed): ...  hides the floating windows for what runs inside.
+    `am broadcast` returns once the app has handled it; a short pause lets the next frame land."""
+
+    def __init__(self, needed):
+        self.needed = needed
+
+    def __enter__(self):
+        if self.needed:
+            ash("am", "broadcast", "-a", OVERLAY_HIDE, "-p", APP_PKG, "--ez", "hide", "true",
+                "--el", "ms", "8000", check=False)
+            time.sleep(0.15)
+        return self
+
+    def __exit__(self, *exc):
+        if self.needed:
+            # Not waited for: the app brings them back by itself after `ms` anyway.
+            subprocess.Popen(["ashell", "am", "broadcast", "-a", OVERLAY_HIDE, "-p", APP_PKG,
+                              "--ez", "hide", "false"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+
 # ---------- observe ----------
 
 def dump_ui(show_all=False):
@@ -123,8 +177,10 @@ def cmd_shot(a):
 
     os.makedirs(STATE, exist_ok=True)
     full = f"{STATE}/shot_full.png"
+    with OverlayHidden(bool(overlay_windows())):
+        png = ash("screencap", "-p").stdout
     with open(full, "wb") as f:
-        f.write(ash("screencap", "-p").stdout)
+        f.write(png)
     im = Image.open(full).convert("RGB")
     w, h = im.size
     dest = a.output or f"{STATE}/shot.png"
@@ -149,8 +205,15 @@ def cmd_shot(a):
 # ---------- act ----------
 
 def tap(x, y):
-    ash("input", "tap", x, y)
+    with OverlayHidden(overlay_covers(x, y)):
+        ash("input", "tap", x, y)
     print(f"tapped ({x},{y})")
+
+
+def press(x1, y1, x2, y2, ms):
+    """A swipe, or a long press when it starts and ends in one place."""
+    with OverlayHidden(overlay_covers(x1, y1) or overlay_covers(x2, y2)):
+        ash("input", "swipe", x1, y1, x2, y2, ms)
 
 
 def load_nodes():
@@ -277,12 +340,12 @@ def main():
     s.set_defaults(f=lambda a: tap(a.x, a.y))
     s = sub.add_parser("longpress"); s.add_argument("x", type=int); s.add_argument("y", type=int)
     s.add_argument("ms", type=int, nargs="?", default=800)
-    s.set_defaults(f=lambda a: (ash("input", "swipe", a.x, a.y, a.x, a.y, a.ms), print("long-pressed")))
+    s.set_defaults(f=lambda a: (press(a.x, a.y, a.x, a.y, a.ms), print("long-pressed")))
     s = sub.add_parser("swipe")
     for k in ("x1", "y1", "x2", "y2"):
         s.add_argument(k, type=int)
     s.add_argument("ms", type=int, nargs="?", default=300)
-    s.set_defaults(f=lambda a: (ash("input", "swipe", a.x1, a.y1, a.x2, a.y2, a.ms), print("swiped")))
+    s.set_defaults(f=lambda a: (press(a.x1, a.y1, a.x2, a.y2, a.ms), print("swiped")))
     s = sub.add_parser("text"); s.add_argument("string"); s.set_defaults(f=cmd_text)
     s = sub.add_parser("key"); s.add_argument("name"); s.set_defaults(f=cmd_key)
     s = sub.add_parser("app"); s.add_argument("pkg"); s.set_defaults(f=cmd_app)

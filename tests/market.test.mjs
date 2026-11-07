@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import {
 	safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
 	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, buildMcpEntry, inspectPluginDir,
-	resolveInside, inspectSkillDir, mergeSlashCommands,
+	resolveInside, inspectSkillDir, mergeSlashCommands, compatibleMarketplace, COMPAT_MARKETPLACE,
 } from '../app/server/market.mjs';
 
 async function tmp() { return mkdtemp(join(tmpdir(), 'market-test-')); }
@@ -319,4 +319,25 @@ test('mergeSlashCommands puts what is on disk over a stale or missing list', () 
 
 	// Plugin skills arrive namespaced from Claude Code.
 	assert.equal(mergeSlashCommands([{ name: 'pdemo:pone', description: 'p' }], [])[0].kind, 'skill');
+});
+
+test('compatibleMarketplace keeps only what Claude Code 2.1.112 can read, under its own name', () => {
+	const official = {
+		name: 'claude-plugins-official', owner: { name: 'Anthropic' },
+		plugins: [
+			{ name: 'local', source: './plugins/local' },
+			{ name: 'gh', source: { source: 'github', repo: 'a/b' } },
+			{ name: 'sub', source: { source: 'git-subdir', url: 'https://x/y.git', path: 'p' } },
+			{ name: 'xcode', source: { source: 'command', command: 'xcrun agent plugin path' } },
+			{ name: 'nosource' },
+		],
+	};
+	const { json, dropped } = compatibleMarketplace(official);
+	assert.equal(json.name, COMPAT_MARKETPLACE);
+	assert.ok(!/official|anthropic|claude/i.test(COMPAT_MARKETPLACE));
+	assert.deepEqual(json.plugins.map((p) => p.name), ['local', 'gh', 'sub']);
+	assert.deepEqual(dropped, ['xcode', 'nosource']);
+	assert.deepEqual(json.owner, official.owner);
+	assert.equal(official.plugins.length, 5); // the input is left alone
+	assert.deepEqual(compatibleMarketplace(null).json.plugins, []);
 });

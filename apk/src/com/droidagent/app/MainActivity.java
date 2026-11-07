@@ -121,6 +121,31 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (!prefs.getBoolean(KEY_OVERLAY, true)) return;
 
+        if (!OverlayService.canDraw(this) || !notificationsAllowed()) {
+            // This app has root: grant itself both permissions instead of sending the owner to
+            // settings. Only if that fails does it ask, once.
+            if (!granting) {
+                granting = true;
+                new Thread(new GrantTask(this), "grant").start();
+            }
+            return;
+        }
+        if (!OverlayService.isRunning) {
+            startForegroundService(new Intent(this, OverlayService.class));
+        }
+    }
+
+    boolean granting = false;
+
+    boolean notificationsAllowed() {
+        return Build.VERSION.SDK_INT < 33 || checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** After the root grant: start the bubble, or fall back to asking. */
+    void afterGrant() {
+        granting = false;
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (!OverlayService.canDraw(this)) {
             if (!prefs.getBoolean(KEY_ASKED, false)) {
                 prefs.edit().putBoolean(KEY_ASKED, true).apply();
@@ -130,13 +155,23 @@ public class MainActivity extends Activity {
             }
             return;
         }
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+        if (!notificationsAllowed()) {
             requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1002);
         }
         if (!OverlayService.isRunning) {
             startForegroundService(new Intent(this, OverlayService.class));
+        }
+    }
+
+    public static class GrantTask implements Runnable {
+        final MainActivity a;
+        GrantTask(MainActivity a) { this.a = a; }
+        @Override
+        public void run() {
+            String pkg = a.getPackageName();
+            Su.run("appops set " + pkg + " SYSTEM_ALERT_WINDOW allow; "
+                    + "pm grant " + pkg + " android.permission.POST_NOTIFICATIONS 2>/dev/null; true", 20);
+            a.runOnUiThread(new UiTask(a, UiTask.AFTER_GRANT));
         }
     }
 
@@ -678,6 +713,7 @@ public class MainActivity extends Activity {
         static final int SHOW_SETUP = 4;
         static final int SCREEN_ON = 5;
         static final int SCREEN_OFF = 6;
+        static final int AFTER_GRANT = 7;
 
         private final MainActivity activity;
         private final int what;
@@ -710,6 +746,9 @@ public class MainActivity extends Activity {
                     break;
                 case SCREEN_OFF:
                     a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    break;
+                case AFTER_GRANT:
+                    a.afterGrant();
                     break;
                 default:
                     break;

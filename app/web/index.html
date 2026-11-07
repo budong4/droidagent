@@ -18,6 +18,9 @@
 	<!-- icon sprite: one stroke style everywhere -->
 	<svg width="0" height="0" style="position:absolute" aria-hidden="true">
 		<defs>
+			<!-- the app mark, as in brand/icon.svg -->
+			<linearGradient id="brand-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1F6B51"/><stop offset="1" stop-color="#0D3527"/></linearGradient>
+			<symbol id="brand-mark" viewBox="0 0 108 108"><rect width="108" height="108" rx="24" fill="url(#brand-bg)"/><g transform="translate(54 54) scale(0.94) translate(-54 -54)"><path d="M54 37 V28" fill="none" stroke="#F4F1E8" stroke-width="4" stroke-linecap="round"/><circle cx="54" cy="25" r="5.2" fill="#E9B949"/><rect x="27" y="37" width="54" height="44" rx="19" fill="#F4F1E8"/><rect x="41" y="51" width="7.5" height="14" rx="3.75" fill="#123F30"/><rect x="59.5" y="51" width="7.5" height="14" rx="3.75" fill="#123F30"/></g></symbol>
 			<!-- Liquid glass: a lens map that bends what lies behind the composer toward its middle at
 			     the edges (red = horizontal shift, green = vertical; mid-grey = none). -->
 			<filter id="glass-lens" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB" primitiveUnits="objectBoundingBox">
@@ -153,7 +156,7 @@
 	<div id="drawer-scrim" class="scrim hidden"></div>
 	<aside id="drawer" class="drawer hidden" aria-label="对话列表">
 		<div class="drawer-top">
-			<div class="brand"><svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg><span>DroidAgent</span></div>
+			<div class="brand"><svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><use href="#brand-mark"/></svg><span>DroidAgent</span></div>
 			<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="search-input" type="search" placeholder="搜索对话" autocomplete="off"></label>
 			<button id="drawer-new" class="drawer-new"><svg class="ic"><use href="#i-new"/></svg>新对话</button>
 		</div>
@@ -203,7 +206,7 @@
 		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>版本与更新</h1></header>
 		<div class="page-body">
 			<div class="ver-hero">
-				<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>
+				<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><use href="#brand-mark"/></svg>
 				<div class="ver-name">DroidAgent <span id="update-line"></span></div>
 				<div id="update-sub" class="ver-sub">正在读取</div>
 				<button id="btn-check-update" class="pill-btn">检查更新</button>
@@ -310,7 +313,7 @@
 	<!-- ===== login ===== -->
 	<div id="login" class="login hidden">
 		<div class="login-card">
-			<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="24" fill="#0F3B2D"/><path d="M43.6 36.4 L39.2 71.6 M56.8 36.4 L52.4 71.6 M32 46.9 H64 M29.8 61.2 H61.8" fill="none" stroke="#F3F5EF" stroke-width="6.8" stroke-linecap="round"/><rect x="68.3" y="40.8" width="12.1" height="30.8" rx="1.8" fill="#E2B33C"/></svg>
+			<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><use href="#brand-mark"/></svg>
 			<h2>登录 Claude 账号</h2>
 			<p class="lede">使用你的 Claude 订阅（Pro 或 Max），不需要 API Key。</p>
 			<div id="login-step1">
