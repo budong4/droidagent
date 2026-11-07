@@ -11,7 +11,7 @@ Observe -> act -> observe again:
   droid tap-id N              tap control N from the last `droid ui`
   droid tap-text TEXT         fresh dump, tap the control whose text/desc matches
   droid tap X Y | longpress X Y [MS] | swipe X1 Y1 X2 Y2 [MS]
-  droid text STRING           type into the focused field (any language)
+  droid text STRING           type into the field just tapped (any language, no keyboard)
   droid key NAME              back enter del tab esc up down left right ... (home/recent: owner's screen only)
   droid app PKG [--front]     open an app: on the background screen, or with --front on the owner's
   droid apps [FILTER] | top | wake
@@ -36,6 +36,7 @@ import xml.etree.ElementTree as ET
 
 STATE = "/tmp/droid"
 UI_JSON = f"{STATE}/ui.json"
+LAST_TAP = f"{STATE}/last_tap.json"
 # /data is bind-mounted into the chroot at the same path, so the dump is readable directly.
 UI_XML = "/data/local/tmp/droid_ui.xml"
 ADB_IME = "com.android.adbkeyboard/.AdbIME"
@@ -127,7 +128,6 @@ class OverlayHidden:
 BG_SOCK = "\0droidagent-bgscreen"
 BG_DIR = "/data/local/tmp/droid-bg"
 BG_CLASS = "com.droidagent.app.BgScreen"
-SETTINGS = os.path.expanduser("~/.claude/agent-settings.json")
 
 
 def bg_call(line, check=True, timeout=30):
@@ -172,14 +172,6 @@ def bg():
         except ValueError:
             _bg = None
     return _bg
-
-
-def bg_wanted():
-    try:
-        with open(SETTINGS) as f:
-            return json.load(f).get("backgroundScreen", True) is not False
-    except (OSError, ValueError):
-        return True
 
 
 def screen_metrics():
@@ -369,7 +361,22 @@ def tap(x, y):
     else:
         with OverlayHidden(overlay_covers(x, y)):
             ash("input", "tap", x, y)
+    # `droid text` finds the field here when nothing has focus.
+    os.makedirs(STATE, exist_ok=True)
+    with open(LAST_TAP, "w") as f:
+        json.dump({"screen": "background" if bg() else "owner", "x": x, "y": y}, f)
     print(f"tapped ({x},{y})")
+
+
+def last_tap():
+    try:
+        with open(LAST_TAP) as f:
+            j = json.load(f)
+        if j.get("screen") == ("background" if bg() else "owner"):
+            return int(j["x"]), int(j["y"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return -1, -1
 
 
 def press(x1, y1, x2, y2, ms):
@@ -420,41 +427,45 @@ def cmd_tap_text(a):
     tap(hits[0]["x"], hits[0]["y"])
 
 
-def set_text_once(display, s):
-    """Text into the focused field through accessibility, without the background screen running."""
+def type_once(display, s):
+    """Text into a field through BgScreen's `type`, without the background screen running."""
     paths = [l.split(":", 1)[1] for l in out("pm", "path", APP_PKG).split() if l.startswith("package:")]
     if not paths:
         return "err DroidAgent's APK was not found"
-    r = ash("sh", "-c", f'CLASSPATH="$0" exec app_process /system/bin {BG_CLASS} settext {display} "$1"',
+    x, y = last_tap()
+    r = ash("sh", "-c", f'CLASSPATH="$0" exec app_process /system/bin {BG_CLASS} type {display} {x} {y} "$1"',
             paths[0], base64.b64encode(s.encode()).decode(), check=False)
-    lines = [l for l in r.stdout.decode(errors="replace").splitlines() if l.strip()]
-    return lines[-1] if lines else "err " + r.stderr.decode(errors="replace").strip()[-300:]
+    lines = [l for l in r.stdout.decode(errors="replace").splitlines() if l.startswith(("ok", "err"))]
+    return lines[-1] if lines else "err " + (r.stderr or r.stdout).decode(errors="replace").strip()[-300:]
 
 
 def cmd_text(a):
+    """Into the field without a keyboard: BgScreen sets it through accessibility (or pastes, or
+    presses keys aimed at that screen), checks it arrived, and says how."""
     s = a.string
     if bg():
-        if s.isascii():
-            ash("input", "-d", bg_display(), "text", s.replace(" ", "%s"))
-        else:
-            bg_call("settext " + base64.b64encode(s.encode()).decode())
+        x, y = last_tap()
+        r = bg_call(f"type {x} {y} " + base64.b64encode(s.encode()).decode(), check=False)
+        if r is not None and not r.startswith("err"):
+            r = "ok " + r  # bg_call leaves the "ok" off
     elif s.isascii():
         ash("input", "text", s.replace(" ", "%s"))
-    elif "package:" in ash("pm", "path", "com.android.adbkeyboard", check=False).stdout.decode():
-        prev = out("settings", "get", "secure", "default_input_method").strip()
-        ash("ime", "enable", ADB_IME, check=False)
-        ash("ime", "set", ADB_IME)
-        time.sleep(0.4)
-        ash("am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg",
-            base64.b64encode(s.encode()).decode())
-        time.sleep(0.3)
-        if prev and prev != ADB_IME and prev != "null":
-            ash("ime", "set", prev, check=False)
+        r = "ok keys"
     else:
-        r = set_text_once(0, s)
-        if not r.startswith("ok"):
-            sys.exit(f"droid: could not type that: {r[4:] if r.startswith('err ') else r}")
-    print(f"typed {len(s)} chars")
+        r = type_once(0, s)
+        if not r.startswith("ok") and "package:" in ash("pm", "path", "com.android.adbkeyboard", check=False).stdout.decode():
+            prev = out("settings", "get", "secure", "default_input_method").strip()
+            ash("ime", "enable", ADB_IME, check=False)
+            ash("ime", "set", ADB_IME)
+            time.sleep(0.4)
+            ash("am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", base64.b64encode(s.encode()).decode())
+            time.sleep(0.3)
+            if prev and prev != ADB_IME and prev != "null":
+                ash("ime", "set", prev, check=False)
+            r = "ok ADBKeyboard"
+    if not r or not r.startswith("ok"):
+        sys.exit(f"droid: could not type that: {r[4:] if r and r.startswith('err ') else r}")
+    print(f"typed {len(s)} chars ({r[3:] or 'ok'})")
 
 
 def cmd_key(a):
@@ -480,7 +491,7 @@ def launcher_component(pkg):
 def cmd_app(a):
     global _bg
     comp = launcher_component(a.pkg)
-    if not a.front and bg_wanted():
+    if not a.front:
         info, why = bg_start()
         if info:
             if comp is None:
@@ -496,7 +507,7 @@ def cmd_app(a):
             return
         print(f"note: no background screen ({why}); opening on the owner's screen")
     elif bg():
-        # --front, or background work switched off: the commands that follow go to the owner's screen.
+        # --front: the commands that follow go to the owner's screen.
         bg_call("quit", check=False)
         _bg = None
         print("note: closed the background screen")
@@ -554,8 +565,7 @@ def cmd_bg(a):
             print("the background screen was not open")
         return
     if not info:
-        print("background screen: not open (" + ("`droid app PKG` opens it" if bg_wanted()
-                                                  else "switched off in DroidAgent's settings") + ")")
+        print("background screen: not open (`droid app PKG` opens it)")
         return
     print(f"background screen: display {info['display']}, {info['w']}x{info['h']}, "
           f"app: {info.get('activity') or 'nothing open'}")

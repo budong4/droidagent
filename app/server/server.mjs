@@ -54,7 +54,6 @@ const settings = {
 	fastMode: false,          // fast mode toggle
 	mode: 'acceptEdits',      // Claude Code's permission modes: default | acceptEdits | plan | auto | bypassPermissions
 	autoUpdate: true,         // install new releases by itself (off: only report them)
-	backgroundScreen: true,   // droid opens apps on a screen of its own, not on the owner's
 };
 // The modes, as Claude Code names them. Older builds stored their own names.
 const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
@@ -62,7 +61,7 @@ const MODE_MIGRATE = { ask: 'default', autoEdit: 'acceptEdits' };
 // What the client may change through /api/settings. Screen automation, web access, personal
 // data and showing thinking used to be switches; they are simply on now (the mode decides what
 // needs a confirmation), and "read-only" is what Plan mode is for.
-const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate', 'backgroundScreen'];
+const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate'];
 
 // Config files for the Eta-parity features.
 const SYSTEM_PROMPT_FILE = join(homedir(), '.claude', 'agent-system-prompt.md');
@@ -73,6 +72,11 @@ const SKILLS_OFF_DIR = join(homedir(), '.claude', 'skills-disabled');
 const SKILL_DRAFTS_DIR = join(homedir(), '.claude', 'skill-drafts');
 const SKILLS_STATE_FILE = join(homedir(), '.claude', 'agent-skills.json');
 const MCP_FILE = join(homedir(), '.claude', 'agent-mcp.json');
+// The assistant's own notes, kept across conversations: how tools turned out to work, what an error
+// meant, what this phone does differently. Outside ~/.claude so writing it needs no confirmation
+// from Claude Code itself; the policy below lets it through in every mode.
+const MEMORY_FILE = join(homedir(), '.droidagent', 'memory.md');
+const MEMORY_MAX = 16000;
 
 try {
 	if (existsSync(SETTINGS_FILE)) {
@@ -460,6 +464,8 @@ function policy(toolName, input) {
 
 	// Full access: nothing is asked, by the owner's explicit choice of that mode.
 	if (mode === 'bypassPermissions') return allow(title, detail);
+	// Its own notes: written in every mode, Plan included, so a lesson is never lost to a prompt.
+	if (isWrite && target && normalize(target) === MEMORY_FILE) return allow(title, detail);
 
 	// Leaving Plan mode means "go ahead with this plan" — always the owner's call.
 	if (name === 'ExitPlanMode') return ask('计划已就绪', '按这个计划开始执行？', String(input?.plan || ''));
@@ -637,12 +643,28 @@ function getSdkModel(m) {
 const APP_PROMPT = `## 在 DroidAgent App 里工作
 - 用户在手机 App 里看着你的每一步，大多数人看不懂命令行。调用 Bash 工具时，description 参数一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「统计下载文件夹大小」「打开微信」，不要把命令本身写进去。
 - 用户用什么语言提问，就用什么语言回答。
-- 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。`;
+- 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。
+
+## 经验笔记
+你有一份跨对话保留的经验笔记：\`${MEMORY_FILE}\`。它现在的内容附在下面「你的经验笔记」里。
+- 动手前先看笔记。有现成的做法就直接照做，不要再去查用法或重新试错。
+- 遇到这些情况，当场用 Edit 或 Write 工具往笔记里加一条，不用问用户：查过或试过才弄清的工具、命令用法；报错的原因和解决办法；这台手机、系统或某个应用的特殊之处；用户明确说过的偏好。
+- 一条一行，以「- 」开头，写清什么情况下怎么做，例如「- 查电池温度：dumpsys battery 的 temperature 要除以 10」。
+- 不记一次性的内容（这次任务的具体数据、临时文件名）。旧条目过时或写错了就改掉或删掉，不要重复记同一件事。
+- 笔记保持在 150 条以内，接近时把相近的条目合并。`;
 // Older models take a fixed budget instead of adaptive thinking.
 function thinkingFor(model) {
 	const m = String(model || '');
 	if (/haiku-4|sonnet-4\.5|opus-4\.[015]\b/.test(m)) return { type: 'enabled', budgetTokens: 8000, display: 'summarized' };
 	return { type: 'adaptive', display: 'summarized' };
+}
+
+mkdir(dirname(MEMORY_FILE), { recursive: true }).catch(() => {});
+function loadMemory() {
+	let t = '';
+	try { t = readFileSync(MEMORY_FILE, 'utf8').trim(); } catch { /* none yet */ }
+	if (t.length > MEMORY_MAX) t = `${t.slice(0, MEMORY_MAX)}\n…（笔记太长，后面的没有附上：请合并条目，把它缩短）`;
+	return `## 你的经验笔记\n${t || '（还是空的）'}`;
 }
 
 function loadSystemPromptAppend() {
@@ -823,7 +845,7 @@ async function startRuntime(id) {
 		});
 	};
 
-	const append = [APP_PROMPT, loadSystemPromptAppend()].filter(Boolean).join('\n\n');
+	const append = [APP_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n');
 	const mcpServers = await loadMcpServers();
 	const queryOpts = {
 		cwd: CWD,
@@ -2834,9 +2856,7 @@ const server = createServer(async (req, res) => {
 			const fixedAtStart = () => JSON.stringify([settings.effort, settings.fastMode, thinkingFor(settings.model)]);
 			const before = fixedAtStart();
 			for (const k of SETTING_KEYS) if (k in next) settings[k] = next[k];
-			settings.backgroundScreen = settings.backgroundScreen !== false;
 			await persistSettings();
-			if (!settings.backgroundScreen) bgCall('quit').then(() => watchBgScreen()).catch(() => {});
 			if (fixedAtStart() !== before) restartRuntimesWhenIdle();
 			for (const rt of runtimes.values()) {
 				tell(() => rt.q.setPermissionMode?.(settings.mode === 'plan' ? 'plan' : 'default'));
@@ -2844,6 +2864,19 @@ const server = createServer(async (req, res) => {
 			}
 			broadcast({ type: 'settings', settings });
 			return json(res, { ok: true, settings });
+		}
+
+		// ---- The assistant's notes ----
+		if (path === '/api/memory' && req.method === 'GET') {
+			let text = '';
+			try { text = await readFile(MEMORY_FILE, 'utf8'); } catch { /* none */ }
+			return json(res, { ok: true, text, path: MEMORY_FILE });
+		}
+		if (path === '/api/memory' && req.method === 'POST') {
+			const { text } = await body(req);
+			await mkdir(dirname(MEMORY_FILE), { recursive: true });
+			await writeFile(MEMORY_FILE, String(text || ''), 'utf8');
+			return json(res, { ok: true });
 		}
 
 		// ---- System prompt (AgentMD) ----

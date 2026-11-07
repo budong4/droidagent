@@ -61,11 +61,11 @@ import java.util.concurrent.TimeoutException;
  *   shot PATH                ok W H [empty]      PNG of what is on it
  *   frame PATH MAXW          ok W H [empty]      a smaller JPEG, for watching it live
  *   ui PATH                  ok COUNT            its controls, in uiautomator's XML format
- *   settext BASE64           ok | err WHY        put text into the focused field
+ *   type X Y BASE64          ok HOW | err WHY    put text into the field (focused, or at X Y)
  *   takeover                 ok PACKAGE          move its app to the owner's screen
  *   quit                     ok                  close it, and the apps on it
  *
- * It closes by itself after IDLE_MS without a command. `settext DISPLAY BASE64` as arguments
+ * It closes by itself after IDLE_MS without a command. `type DISPLAY X Y BASE64` as arguments
  * instead of `serve` does that one job on any display (0 is the owner's screen) and exits.
  *
  * No lambdas, anonymous classes or generic interfaces implemented here: the build's d8 can't
@@ -98,13 +98,13 @@ public final class BgScreen {
                 System.out.println(call(join(args, 1)));
                 System.exit(0);
             }
-            if (args.length == 3 && args[0].equals("settext")) {
+            if (args.length == 5 && args[0].equals("type")) {
                 setup();
-                System.out.println(setText(Integer.parseInt(args[1]), decode(args[2])));
+                System.out.println(typeText(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]), decode(args[4])));
                 System.exit(0);
             }
             if (args.length != 4 || !args[0].equals("serve")) {
-                System.err.println("usage: BgScreen serve W H DPI | settext DISPLAY TEXT_BASE64");
+                System.err.println("usage: BgScreen serve W H DPI | type DISPLAY X Y TEXT_BASE64");
                 System.exit(2);
             }
             width = Integer.parseInt(args[1]);
@@ -232,7 +232,14 @@ public final class BgScreen {
             case "shot": return picture(path(a[1]), 0);
             case "frame": return picture(path(a[1]), Integer.parseInt(a[2]));
             case "ui": return dumpUi(displayId, path(a[1]));
-            case "settext": return setText(displayId, decode(a[1]));
+            case "type": { // type X Y BASE64
+                String[] t = line.split(" ", 4);
+                return typeText(displayId, Integer.parseInt(t[1]), Integer.parseInt(t[2]), decode(t[3]));
+            }
+            case "typewith": { // typewith set|paste|keys X Y BASE64, for tests
+                String[] t = line.split(" ", 5);
+                return typeText(displayId, Integer.parseInt(t[2]), Integer.parseInt(t[3]), decode(t[4]), t[1]);
+            }
             case "takeover": return takeover();
             case "quit": return "ok";
             default: return "err unknown command: " + a[0];
@@ -410,35 +417,188 @@ public final class BgScreen {
     }
 
     /**
-     * Text into the focused field, at the cursor, through accessibility: any language, no keyboard
-     * needed, and nothing on the clipboard.
+     * Text into a field on display d, at its cursor, without any keyboard: the owner's own keyboard
+     * is never involved. The field is the one with focus, else the editable one at (x, y), where
+     * droid last tapped. Three ways, each checked by reading the field back: accessibility sets the
+     * text; else it pastes it; else, for plain ASCII only, key presses addressed to display d.
+     * Says which way worked, or why each one didn't.
      */
-    static String setText(int d, String s) throws Exception {
+    static String typeText(int d, int x, int y, String s) throws Exception {
+        return typeText(d, x, y, s, "all");
+    }
+
+    /** `only` (set, paste or keys) tries that way alone: for testing the other two. */
+    static String typeText(int d, int x, int y, String s, String only) throws Exception {
+        boolean all = only.equals("all");
         Ua u = Ua.open();
         try {
-            AccessibilityNodeInfo f = null;
-            for (AccessibilityWindowInfo w : u.windows(d)) {
-                AccessibilityNodeInfo r = w.getRoot();
-                if (r != null && (f = r.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)) != null) break;
+            AccessibilityNodeInfo f = findField(u.windows(d), x, y);
+            if (f == null) {
+                return "err no text field: nothing has focus" + (x >= 0 ? " and nothing editable is at " + x + "," + y : "")
+                        + ". Tap the field first (droid ui lists it with [edit])";
             }
-            if (f == null) return "err no text field has focus: tap one first";
-            if (!f.isEditable()) return "err the focused control does not take text";
-            boolean hint = Build.VERSION.SDK_INT >= 26 && f.isShowingHintText();
-            String cur = f.getText() == null || hint || f.isPassword() ? "" : f.getText().toString();
-            int a = f.getTextSelectionStart(), b = f.getTextSelectionEnd();
-            if (a < 0 || a > cur.length()) a = cur.length();
-            if (b < a || b > cur.length()) b = a;
-            String next = cur.substring(0, a) + s + cur.substring(b);
+            if (!f.isFocused()) f.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            String before = textOf(f);
+            StringBuilder why = new StringBuilder();
+
+            String next = insertAt(f, before, s);
             Bundle args = new Bundle();
             args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, next);
-            if (!f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return "err the field did not take the text";
-            Bundle sel = new Bundle();
-            sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, a + s.length());
-            sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, a + s.length());
-            f.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel);
-            return "ok";
+            if (!all && !only.equals("set")) {
+                why.append("set: skipped; ");
+            } else if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                if (changed(f, before)) {
+                    cursorTo(f, next.length() - (before.length() - selEnd(f, before)));
+                    return done("ok set", s);
+                }
+                why.append("set: the field kept its text; ");
+            } else {
+                why.append("set: refused; ");
+            }
+
+            String clip = all || only.equals("paste") ? paste(f, s) : "skipped";
+            if (clip == null && changed(f, before)) return done("ok paste", s);
+            why.append("paste: ").append(clip == null ? "the field kept its text" : clip).append("; ");
+
+            if (!all && !only.equals("keys")) {
+                why.append("keys: skipped");
+            } else if (isAscii(s)) {
+                String keys = pressKeys(d, s);
+                if (keys == null && changed(f, before)) return done("ok keys", s);
+                why.append("keys: ").append(keys == null ? "the field kept its text" : keys);
+            } else {
+                why.append("keys: only for plain ASCII");
+            }
+            return done("err the field did not take the text (" + why + ")", s);
         } finally {
             u.close();
+        }
+    }
+
+    static String done(String result, String s) {
+        System.out.println("type " + s.length() + " chars: " + result);
+        return result;
+    }
+
+    /** The focused input field, or the smallest editable one under (x, y), or the only one there is. */
+    static AccessibilityNodeInfo findField(List<AccessibilityWindowInfo> wins, int x, int y) {
+        List<AccessibilityNodeInfo> editable = new ArrayList<AccessibilityNodeInfo>();
+        for (AccessibilityWindowInfo w : wins) {
+            AccessibilityNodeInfo r = w.getRoot();
+            if (r == null) continue;
+            AccessibilityNodeInfo f = r.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if (f != null && f.isEditable()) return f;
+            collectEditable(r, editable, 0);
+        }
+        AccessibilityNodeInfo best = null;
+        long bestArea = Long.MAX_VALUE;
+        Rect b = new Rect();
+        for (AccessibilityNodeInfo n : editable) {
+            n.getBoundsInScreen(b);
+            if (x >= 0 && b.contains(x, y) && (long) b.width() * b.height() < bestArea) {
+                best = n;
+                bestArea = (long) b.width() * b.height();
+            }
+        }
+        if (best == null && editable.size() == 1) best = editable.get(0);
+        return best;
+    }
+
+    static void collectEditable(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> out, int depth) {
+        if (n.isEditable() && n.isVisibleToUser()) out.add(n);
+        for (int i = 0; i < n.getChildCount() && depth < 60 && out.size() < 50; i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
+            if (c != null) collectEditable(c, out, depth + 1);
+        }
+    }
+
+    static String textOf(AccessibilityNodeInfo f) {
+        boolean hint = Build.VERSION.SDK_INT >= 26 && f.isShowingHintText();
+        return f.getText() == null || hint ? "" : f.getText().toString();
+    }
+
+    static int selEnd(AccessibilityNodeInfo f, String cur) {
+        int b = f.getTextSelectionEnd();
+        return b < 0 || b > cur.length() ? cur.length() : b;
+    }
+
+    /** cur with s at the cursor, replacing any selection; a password field's text can't be read, so s alone. */
+    static String insertAt(AccessibilityNodeInfo f, String cur, String s) {
+        if (f.isPassword()) return s;
+        int a = f.getTextSelectionStart(), b = selEnd(f, cur);
+        if (a < 0 || a > cur.length()) a = cur.length();
+        if (b < a) b = a;
+        return cur.substring(0, a) + s + cur.substring(b);
+    }
+
+    static boolean changed(AccessibilityNodeInfo f, String before) {
+        SystemClockSleep.ms(120);
+        f.refresh();
+        return !textOf(f).equals(before);
+    }
+
+    static void cursorTo(AccessibilityNodeInfo f, int at) {
+        Bundle sel = new Bundle();
+        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, at);
+        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, at);
+        f.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel);
+    }
+
+    static boolean isAscii(String s) {
+        for (int i = 0; i < s.length(); i++) if (s.charAt(i) > 126 || s.charAt(i) < 32 && s.charAt(i) != '\n') return false;
+        return true;
+    }
+
+    /** Through the clipboard, put back as it was afterwards. Null when pasted, else why not. */
+    static String paste(AccessibilityNodeInfo f, String s) {
+        android.content.ClipboardManager cm;
+        try {
+            Constructor<android.content.ClipboardManager> k =
+                    android.content.ClipboardManager.class.getDeclaredConstructor(Context.class, Handler.class);
+            k.setAccessible(true);
+            cm = k.newInstance(ctx, new Handler(Looper.getMainLooper()));
+        } catch (Throwable t) {
+            return "no clipboard (" + why(t) + ")";
+        }
+        android.content.ClipData old = null;
+        try { old = cm.getPrimaryClip(); } catch (Throwable ignored) { /* can't keep it then */ }
+        try {
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("DroidAgent", s));
+            if (!f.performAction(AccessibilityNodeInfo.ACTION_PASTE)) return "refused";
+            return null;
+        } catch (Throwable t) {
+            return why(t);
+        } finally {
+            SystemClockSleep.ms(150);
+            try {
+                if (old != null) cm.setPrimaryClip(old);
+                else if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip();
+            } catch (Throwable ignored) { /* left as it is */ }
+        }
+    }
+
+    /** Key presses addressed to display d only. Null when sent, else why not. */
+    static String pressKeys(int d, String s) {
+        try {
+            android.view.KeyEvent[] evs = android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
+                    .getEvents(s.toCharArray());
+            if (evs == null) return "no keys for these characters";
+            Object im;
+            try {
+                im = Class.forName("android.hardware.input.InputManagerGlobal").getMethod("getInstance").invoke(null);
+            } catch (Throwable t) {
+                im = Class.forName("android.hardware.input.InputManager").getMethod("getInstance").invoke(null);
+            }
+            Method inject = im.getClass().getMethod("injectInputEvent", android.view.InputEvent.class, int.class);
+            Method setDisplay = android.view.KeyEvent.class.getMethod("setDisplayId", int.class);
+            for (android.view.KeyEvent e : evs) {
+                android.view.KeyEvent k = android.view.KeyEvent.changeTimeRepeat(e, android.os.SystemClock.uptimeMillis(), 0);
+                setDisplay.invoke(k, d);
+                inject.invoke(im, k, 2); // wait until it has been handled
+            }
+            return null;
+        } catch (Throwable t) {
+            return why(t);
         }
     }
 

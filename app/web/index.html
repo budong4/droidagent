@@ -192,8 +192,8 @@
 			<h2 class="group-label">助手</h2>
 			<div class="list">
 				<button class="row" data-page="page-market"><svg class="ic row-ic"><use href="#i-box"/></svg><span class="row-text">扩展市场<small>技能、连接器和插件</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				<button class="row" data-page="page-memory"><svg class="ic row-ic"><use href="#i-spark"/></svg><span class="row-text">经验笔记<small>助手做事时记下的用法和教训，下次直接用</small></span><span id="val-memory" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 				<button class="row" data-page="page-prompt"><svg class="ic row-ic"><use href="#i-doc"/></svg><span class="row-text">系统提示词</span><span id="val-prompt" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<label class="row"><svg class="ic row-ic"><use href="#i-screen"/></svg><span class="row-text">后台操作<small>助手在一块看不见的屏幕上用其他应用，你的屏幕照常用</small></span><span class="sw"><input type="checkbox" id="t-bgscreen"><i></i></span></label>
 			</div>
 
 			<h2 class="group-label">通用</h2>
@@ -259,6 +259,14 @@
 			</div>
 			<div id="wall-groups"></div>
 			<p class="foot-note">动漫风和渐变为本应用原创绘制。浮世绘：歌川广重《名所江户百景》（1856–1859）；名画：梵高《柏树》《麦田与柏树》（1889），均来自大都会艺术博物馆开放资源，公有领域。极光：NASA 国际空间站拍摄，公有领域。你自己的图片只保存在这台手机里。</p>
+		</div>
+	</section>
+
+	<section id="page-memory" class="page hidden" aria-label="经验笔记">
+		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>经验笔记</h1><button id="memory-save" class="pill-btn accent">保存</button></header>
+		<div class="page-body fill">
+			<p class="hint">助手查过、试过才弄明白的事，会自己记在这里，每次新对话开始时都会读。写错的、不想要的，直接改掉或删掉。</p>
+			<textarea id="memory-text" class="editor" placeholder="还没有笔记。助手做事时学到的用法和教训会出现在这里。"></textarea>
 		</div>
 	</section>
 
@@ -360,7 +368,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=13"></script>
+	<script src="app.js?v=14"></script>
 	<script src="market.js?v=5"></script>
 </body>
 </html>

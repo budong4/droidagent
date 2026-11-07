@@ -13,7 +13,6 @@ description: 屏幕自动化。用户让你在别的应用里操作（打开应�
 - 用户正在前台使用的应用，droid 不会把它拿到后台，会报错提示；先问用户，同意后用 `droid app 包名 --front` 在用户屏幕上操作。
 - 后台屏幕没有桌面、最近任务、通知栏：换应用直接 `droid app`，`home`/`recent` 键不可用。
 - 应用在后台黑屏或打不开时（少数游戏、视频、银行类应用），告诉用户，征得同意后再用 `--front`。
-- 用户在设置里关掉「后台操作」后，`droid app` 会直接开在用户屏幕上。
 
 ## 基本循环
 
@@ -31,7 +30,7 @@ description: 屏幕自动化。用户让你在别的应用里操作（打开应�
 | 打开应用 | `droid app <包名>`（不知道包名：`droid apps 关键词`） |
 | 当前前台 | `droid top` |
 | 后台屏幕状态 | `droid bg`；给用户看：`droid show`；关掉：`droid bg stop` |
-| 输入文字 | 先点中输入框，再 `droid text "内容"`（中文、表情都可以） |
+| 输入文字 | 先点中输入框，再 `droid text "内容"`（中文、表情都可以；不用键盘，直接填进去，输出会说明用的哪种方式） |
 | 按键 | `droid key back` / `enter` / `del`（`home` / `recent` 只在用户屏幕上有） |
 | 滑动 | `droid swipe X1 Y1 X2 Y2 300`；向下翻一屏：从屏幕 75% 高度滑到 25% |
 | 长按 | `droid longpress X Y 800` |

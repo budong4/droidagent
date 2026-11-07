@@ -1,5 +1,5 @@
 // App-shell cache so the UI installs and opens instantly. API calls never touch the cache.
-const CACHE = 'droidagent-v18';
+const CACHE = 'droidagent-v19';
 const SHELL = ['.', 'index.html', 'style.css', 'themes.js', 'app.js', 'market.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png'];
 
 self.addEventListener('install', (e) => {

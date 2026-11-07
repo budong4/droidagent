@@ -364,7 +364,7 @@ $('#file-bg').addEventListener('change', async (e) => {
 });
 
 /* ================================================================ settings state */
-const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true, backgroundScreen: true };
+const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true };
 const MODES = [
 	{ id: 'default', label: 'Ask', desc: '只读操作直接做，其他每一步都先问你' },
 	{ id: 'acceptEdits', label: 'Accept edits', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
@@ -392,7 +392,6 @@ function applySettings(s) {
 	if (prevMode !== SETTINGS.mode) { chip.classList.remove('flash'); void chip.offsetWidth; chip.classList.add('flash'); }
 	$('#model-label').textContent = SETTINGS.modelName || 'Sonnet 5.5';
 	$('#t-autoupdate').checked = SETTINGS.autoUpdate !== false;
-	$('#t-bgscreen').checked = SETTINGS.backgroundScreen !== false;
 	$('#t-fast').checked = !!SETTINGS.fastMode;
 }
 function pushSettings(patch) {
@@ -1099,7 +1098,7 @@ const APP_COMMANDS = [
 	{ name: 'market', aliases: ['plugin', 'plugins'], desc: '打开扩展市场：技能、连接器和插件', run: () => openMarket('skills') },
 	{ name: 'mcp', desc: '管理连接器（MCP）', run: () => openMarket('connectors', 'installed') },
 	{ name: 'skills', desc: '管理技能', run: () => openMarket('skills', 'installed') },
-	{ name: 'memory', desc: '编辑系统提示词', run: () => openPage('page-prompt') },
+	{ name: 'memory', desc: '查看和编辑助手的经验笔记', run: () => openPage('page-memory') },
 	{ name: 'config', aliases: ['settings'], desc: '打开设置', run: () => openPage('page-settings') },
 	{ name: 'theme', desc: '更换主题', run: () => openPage('page-theme') },
 	{ name: 'release-notes', aliases: ['version', 'changelog'], desc: '版本与更新记录', run: () => openPage('page-version') },
@@ -1559,11 +1558,32 @@ PAGE_OPEN['page-settings'] = async () => {
 	updateLookValues();
 	refreshAccount();
 	loadUpdate();
+	refreshMemoryRow();
 	const sp = await getJSON('/api/systemprompt');
 	$('#val-prompt').textContent = sp.ok && sp.text && sp.text.trim() ? '已设置' : '未设置';
 };
 $('#t-autoupdate').addEventListener('change', (e) => pushSettings({ autoUpdate: e.target.checked }));
-$('#t-bgscreen').addEventListener('change', (e) => pushSettings({ backgroundScreen: e.target.checked }));
+
+/* ---------------- the assistant's notes ---------------- */
+const noteCount = (t) => String(t || '').split('\n').filter((l) => /^\s*[-*]\s+\S/.test(l)).length;
+async function refreshMemoryRow() {
+	const r = await getJSON('/api/memory');
+	const n = r.ok ? noteCount(r.text) : 0;
+	$('#val-memory').textContent = n ? `${n} 条` : '';
+}
+PAGE_OPEN['page-memory'] = async () => {
+	$('#memory-text').value = '';
+	const r = await getJSON('/api/memory');
+	$('#memory-text').value = r.ok ? (r.text || '') : '';
+};
+$('#memory-save').addEventListener('click', async () => {
+	const text = $('#memory-text').value;
+	const r = await api('/api/memory', { text });
+	if (r.ok === false) { toast('保存失败'); return; }
+	refreshMemoryRow();
+	closePage('page-memory');
+	toast('已保存，从新对话开始生效');
+});
 
 /* ---------------- system prompt ---------------- */
 PAGE_OPEN['page-prompt'] = async () => {
