@@ -11,7 +11,9 @@ Observe -> act -> observe again:
   droid tap-id N              tap control N from the last `droid ui`
   droid tap-text TEXT         fresh dump, tap the control whose text/desc matches
   droid tap X Y | longpress X Y [MS] | swipe X1 Y1 X2 Y2 [MS]
-  droid text STRING           type into the field just tapped (any language, no keyboard)
+  droid text STRING [--id N | --at X Y]
+                              type into a field: the one just tapped, or control N / the one at X Y
+                              (any language; on the background screen no keyboard ever shows)
   droid key NAME              back enter del tab esc up down left right ... (home/recent: owner's screen only)
   droid app PKG [--front]     open an app: on the background screen, or with --front on the owner's
   droid apps [FILTER] | top | wake
@@ -309,6 +311,8 @@ def cmd_ui(a):
     pkg, nodes = dump_ui(a.all)
     where = "background screen" if bg() else "owner's screen"
     print(f"# {where}  app={pkg}  {len(nodes)} controls  (device px; tap with `droid tap-id N`)")
+    if bg():
+        print("# no keyboard ever shows here, that is normal: type with `droid text \"...\" --id N` (N = an [edit] control)")
     for d in nodes:
         print(fmt(d))
     if bg():
@@ -443,6 +447,16 @@ def cmd_text(a):
     """Into the field without a keyboard: BgScreen sets it through accessibility (or pastes, or
     presses keys aimed at that screen), checks it arrived, and says how."""
     s = a.string
+    if a.id is not None or a.at:
+        # Aimed at a field: tap it (that gives it focus where the app allows), then type into it.
+        if a.id is not None:
+            nodes = load_nodes()
+            if not 0 <= a.id < len(nodes):
+                sys.exit(f"droid: no control [{a.id}] in last dump ({len(nodes)} controls)")
+            tap(nodes[a.id]["x"], nodes[a.id]["y"])
+        else:
+            tap(*a.at)
+        time.sleep(0.4)
     if bg():
         x, y = last_tap()
         r = bg_call(f"type {x} {y} " + base64.b64encode(s.encode()).decode(), check=False)
@@ -606,7 +620,11 @@ def main():
         s.add_argument(k, type=int)
     s.add_argument("ms", type=int, nargs="?", default=300)
     s.set_defaults(f=lambda a: (press(a.x1, a.y1, a.x2, a.y2, a.ms), print("swiped")))
-    s = sub.add_parser("text"); s.add_argument("string"); s.set_defaults(f=cmd_text)
+    s = sub.add_parser("text"); s.add_argument("string")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--id", type=int, help="control number from `droid ui`")
+    g.add_argument("--at", type=int, nargs=2, metavar=("X", "Y"))
+    s.set_defaults(f=cmd_text)
     s = sub.add_parser("key"); s.add_argument("name"); s.set_defaults(f=cmd_key)
     s = sub.add_parser("app"); s.add_argument("pkg"); s.add_argument("--front", action="store_true")
     s.set_defaults(f=cmd_app)

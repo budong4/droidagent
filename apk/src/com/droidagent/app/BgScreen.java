@@ -427,16 +427,14 @@ public final class BgScreen {
         return typeText(d, x, y, s, "all");
     }
 
-    /** `only` (set, paste or keys) tries that way alone: for testing the other two. */
+    /** `only` (set, paste, pastekey or keys) tries that way alone: for testing the others. */
     static String typeText(int d, int x, int y, String s, String only) throws Exception {
         boolean all = only.equals("all");
         Ua u = Ua.open();
         try {
-            AccessibilityNodeInfo f = findField(u.windows(d), x, y);
-            if (f == null) {
-                return "err no text field: nothing has focus" + (x >= 0 ? " and nothing editable is at " + x + "," + y : "")
-                        + ". Tap the field first (droid ui lists it with [edit])";
-            }
+            List<AccessibilityWindowInfo> wins = u.windows(d);
+            AccessibilityNodeInfo f = findField(wins, x, y);
+            if (f == null) return typeBlind(u, d, x, y, s, only, wins);
             if (!f.isFocused()) f.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
             String before = textOf(f);
             StringBuilder why = new StringBuilder();
@@ -460,6 +458,10 @@ public final class BgScreen {
             if (clip == null && changed(f, before)) return done("ok paste", s);
             why.append("paste: ").append(clip == null ? "the field kept its text" : clip).append("; ");
 
+            String pk = all || only.equals("pastekey") ? pasteKey(d, s) : "skipped";
+            if (pk == null && changed(f, before)) return done("ok paste key", s);
+            why.append("paste key: ").append(pk == null ? "the field kept its text" : pk).append("; ");
+
             if (!all && !only.equals("keys")) {
                 why.append("keys: skipped");
             } else if (isAscii(s)) {
@@ -473,6 +475,63 @@ public final class BgScreen {
         } finally {
             u.close();
         }
+    }
+
+    /**
+     * No field accessibility can name, yet something there may still take keys: apps that draw their
+     * own input box. Sent to whatever has focus on display d (after a tap at x, y), and counted as
+     * typed only when the text then shows up on that screen.
+     */
+    static String typeBlind(Ua u, int d, int x, int y, String s, String only, List<AccessibilityWindowInfo> wins) {
+        boolean all = only.equals("all");
+        String fields = describeFields(wins);
+        if (x < 0) {
+            return done("err no text field has focus. " + fields + " Tap the box first, or aim at it: droid text --id N", s);
+        }
+        int seen = countText(wins, s);
+        StringBuilder why = new StringBuilder();
+        String pk = all || only.equals("pastekey") ? pasteKey(d, s) : "skipped";
+        if (pk == null && countText(u.windows(d), s) > seen) return done("ok paste key", s);
+        why.append("paste key: ").append(pk == null ? "nothing showed up" : pk).append("; ");
+        if (isAscii(s) && (all || only.equals("keys"))) {
+            String keys = pressKeys(d, s);
+            if (keys == null && countText(u.windows(d), s) > seen) return done("ok keys", s);
+            why.append("keys: ").append(keys == null ? "nothing showed up" : keys);
+        }
+        return done("err nothing editable at " + x + "," + y + " took the text (" + why + "). " + fields, s);
+    }
+
+    /** Where the input boxes on the screen are, for the next try; or why there may be none. */
+    static String describeFields(List<AccessibilityWindowInfo> wins) {
+        List<AccessibilityNodeInfo> editable = new ArrayList<AccessibilityNodeInfo>();
+        for (AccessibilityWindowInfo w : wins) {
+            AccessibilityNodeInfo r = w.getRoot();
+            if (r != null) collectEditable(r, editable, 0);
+        }
+        if (editable.isEmpty()) {
+            return "No input box is visible on this screen (a chat may be in voice mode: tap its keyboard button first).";
+        }
+        StringBuilder b = new StringBuilder("Input boxes on this screen:");
+        Rect r = new Rect();
+        for (AccessibilityNodeInfo n : editable) {
+            n.getBoundsInScreen(r);
+            CharSequence t = n.getText();
+            b.append(" (").append(r.centerX()).append(',').append(r.centerY()).append(')');
+            if (t != null && t.length() > 0) b.append(" '").append(t.length() > 20 ? t.subSequence(0, 20) + "..." : t).append('\'');
+        }
+        return b.append('.').toString();
+    }
+
+    /** How many nodes on the screen show s: to tell whether blind typing arrived anywhere. */
+    static int countText(List<AccessibilityWindowInfo> wins, String s) {
+        int n = 0;
+        for (AccessibilityWindowInfo w : wins) {
+            AccessibilityNodeInfo r = w.getRoot();
+            if (r == null) continue;
+            List<AccessibilityNodeInfo> hits = r.findAccessibilityNodeInfosByText(s);
+            if (hits != null) n += hits.size();
+        }
+        return n;
     }
 
     static String done(String result, String s) {
@@ -549,14 +608,67 @@ public final class BgScreen {
         return true;
     }
 
+    static android.content.ClipboardManager clipboard() throws Exception {
+        Constructor<android.content.ClipboardManager> k =
+                android.content.ClipboardManager.class.getDeclaredConstructor(Context.class, Handler.class);
+        k.setAccessible(true);
+        return k.newInstance(ctx, new Handler(Looper.getMainLooper()));
+    }
+
+    /**
+     * Through the clipboard and the paste key, addressed to display d: for fields that take neither
+     * accessibility's text nor its paste. The clipboard is put back afterwards. Null when sent.
+     */
+    static String pasteKey(int d, String s) {
+        android.content.ClipboardManager cm;
+        try {
+            cm = clipboard();
+        } catch (Throwable t) {
+            return "no clipboard (" + why(t) + ")";
+        }
+        android.content.ClipData old = null;
+        try { old = cm.getPrimaryClip(); } catch (Throwable ignored) { /* can't keep it then */ }
+        try {
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("DroidAgent", s));
+            return sendKey(d, android.view.KeyEvent.KEYCODE_PASTE);
+        } catch (Throwable t) {
+            return why(t);
+        } finally {
+            SystemClockSleep.ms(250);
+            try {
+                if (old != null) cm.setPrimaryClip(old);
+                else if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip();
+            } catch (Throwable ignored) { /* left as it is */ }
+        }
+    }
+
+    static String sendKey(int d, int code) throws Exception {
+        long now = android.os.SystemClock.uptimeMillis();
+        android.view.KeyEvent down = new android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_DOWN, code, 0);
+        android.view.KeyEvent up = new android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_UP, code, 0);
+        Object im = inputManager();
+        Method inject = im.getClass().getMethod("injectInputEvent", android.view.InputEvent.class, int.class);
+        Method setDisplay = android.view.KeyEvent.class.getMethod("setDisplayId", int.class);
+        setDisplay.invoke(down, d);
+        setDisplay.invoke(up, d);
+        inject.invoke(im, down, 2);
+        inject.invoke(im, up, 2);
+        return null;
+    }
+
+    static Object inputManager() throws Exception {
+        try {
+            return Class.forName("android.hardware.input.InputManagerGlobal").getMethod("getInstance").invoke(null);
+        } catch (Throwable t) {
+            return Class.forName("android.hardware.input.InputManager").getMethod("getInstance").invoke(null);
+        }
+    }
+
     /** Through the clipboard, put back as it was afterwards. Null when pasted, else why not. */
     static String paste(AccessibilityNodeInfo f, String s) {
         android.content.ClipboardManager cm;
         try {
-            Constructor<android.content.ClipboardManager> k =
-                    android.content.ClipboardManager.class.getDeclaredConstructor(Context.class, Handler.class);
-            k.setAccessible(true);
-            cm = k.newInstance(ctx, new Handler(Looper.getMainLooper()));
+            cm = clipboard();
         } catch (Throwable t) {
             return "no clipboard (" + why(t) + ")";
         }
@@ -583,12 +695,7 @@ public final class BgScreen {
             android.view.KeyEvent[] evs = android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
                     .getEvents(s.toCharArray());
             if (evs == null) return "no keys for these characters";
-            Object im;
-            try {
-                im = Class.forName("android.hardware.input.InputManagerGlobal").getMethod("getInstance").invoke(null);
-            } catch (Throwable t) {
-                im = Class.forName("android.hardware.input.InputManager").getMethod("getInstance").invoke(null);
-            }
+            Object im = inputManager();
             Method inject = im.getClass().getMethod("injectInputEvent", android.view.InputEvent.class, int.class);
             Method setDisplay = android.view.KeyEvent.class.getMethod("setDisplayId", int.class);
             for (android.view.KeyEvent e : evs) {
