@@ -99,6 +99,7 @@ public class MainActivity extends Activity {
     protected void onStart() {
         super.onStart();
         chatVisible = true;
+        if (webView != null) webView.onResume();
         OverlayService.refresh();
     }
 
@@ -106,6 +107,9 @@ public class MainActivity extends Activity {
     protected void onStop() {
         super.onStop();
         chatVisible = false;
+        // Out of sight: the page counts as hidden and its own timers stand down. Not pauseTimers():
+        // that would stop the floating panel's page too, which lives in this process.
+        if (webView != null) webView.onPause();
         OverlayService.refresh();
     }
 

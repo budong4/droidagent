@@ -15,8 +15,10 @@ Observe -> act -> observe again:
                               type into a field: the one just tapped, or control N / the one at X Y
                               (any language; on the background screen no keyboard ever shows)
   droid key NAME              back enter del tab esc up down left right ... (home/recent: owner's screen only)
-  droid app PKG [--front]     open an app: on the background screen, or with --front on the owner's
-  droid apps [FILTER] | top | wake
+  droid app NAME [--front]    open an app by its name (微信) or package: on the background screen,
+                              or with --front on the owner's
+  droid apps [WORD]           installed apps: name, package (WORD searches both)
+  droid top | wake
   droid wait-text TEXT [--timeout SEC]
 The background screen:
   droid bg                    is it open, and what is on it
@@ -502,9 +504,63 @@ def launcher_component(pkg):
     return comp if "/" in comp else None
 
 
+APPS_JSON = f"{STATE}/apps.json"
+
+
+def installed_apps(fresh=False):
+    """[{package, name, activity, system, installed}] for every app with a launcher icon, by the name
+    the owner sees, from BgScreen. Kept a minute; a name that isn't found asks again (a new install)."""
+    if not fresh:
+        try:
+            if time.time() - os.path.getmtime(APPS_JSON) < 60:
+                with open(APPS_JSON) as f:
+                    return json.load(f)
+        except (OSError, ValueError):
+            pass
+    apps = None
+    paths = [l.split(":", 1)[1] for l in out("pm", "path", APP_PKG).split() if l.startswith("package:")]
+    if paths:
+        r = ash("sh", "-c", f'CLASSPATH="$0" exec app_process /system/bin {BG_CLASS} apps', paths[0], check=False)
+        line = next((l for l in r.stdout.decode(errors="replace").splitlines() if l.startswith("[")), None)
+        try:
+            apps = json.loads(line) if line else None
+        except ValueError:
+            apps = None
+    if not apps:
+        apps = [{"package": l.split(":", 1)[1], "name": l.split(":", 1)[1], "system": False}
+                for l in out("pm", "list", "packages", "-3").split() if ":" in l]
+    os.makedirs(STATE, exist_ok=True)
+    with open(APPS_JSON, "w") as f:
+        json.dump(apps, f, ensure_ascii=False)
+    return apps
+
+
+def match_apps(apps, word):
+    """Exact name or package first, then names and packages containing the word."""
+    w = word.casefold()
+    exact = [x for x in apps if w in (x["name"].casefold(), x["package"].casefold())]
+    return exact or [x for x in apps if w in x["name"].casefold() or w in x["package"].casefold()]
+
+
+def resolve_app(word):
+    """A package for what the agent called the app: its package, or its name as the owner sees it."""
+    for fresh in (False, True):
+        hits = match_apps(installed_apps(fresh), word)
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            names = "\n  ".join(f"{x['name']}  {x['package']}" for x in hits[:12])
+            sys.exit(f'droid: "{word}" could be any of these; say which with its package:\n  {names}')
+    if "package:" in ash("pm", "path", word, check=False).stdout.decode(errors="replace"):
+        return {"package": word, "name": word}
+    sys.exit(f'droid: no app called "{word}" is installed. `droid apps` lists them all, `droid apps WORD` searches.')
+
+
 def cmd_app(a):
     global _bg
-    comp = launcher_component(a.pkg)
+    found = resolve_app(a.pkg)
+    a.pkg = found["package"]
+    comp = found.get("activity") or launcher_component(a.pkg)
     if not a.front:
         info, why = bg_start()
         if info:
@@ -534,10 +590,14 @@ def cmd_app(a):
 
 
 def cmd_apps(a):
-    pkgs = sorted(l.split(":", 1)[1] for l in out("pm", "list", "packages", "-3").split() if ":" in l)
-    for p in pkgs:
-        if not a.filter or a.filter.lower() in p.lower():
-            print(p)
+    apps = installed_apps(fresh=True)
+    if a.filter:
+        apps = match_apps(apps, a.filter)
+    apps = sorted(apps, key=lambda x: (x.get("system", False), x["name"].casefold()))
+    for x in apps:
+        print(f"{x['name']}\t{x['package']}" + ("\t(system)" if x.get("system") else ""))
+    if not apps:
+        print(f'no app matches "{a.filter}"' if a.filter else "no apps found")
 
 
 def cmd_top(a):

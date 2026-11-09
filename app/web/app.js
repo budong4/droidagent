@@ -218,7 +218,7 @@ renderMainArt();
 // The default theme follows the system's dark mode.
 const refollow = () => { if (look.theme === 'default') LOOK.apply(look); };
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', refollow);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refollow(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refollow(); if (activity.on) renderActivity(); } });
 
 function miniPreview(themeId) {
 	const scheme = LOOK.schemeOf(themeId);
@@ -975,6 +975,7 @@ function renderActivity() {
 }
 const doing = (title) => (/^(正在|等你)/.test(title) ? title : '正在' + title);
 setInterval(() => {
+	if (document.hidden) return; // drawn again when the page comes back
 	if (activity.on) renderActivity();
 	if (curThink) $('.think-time', curThink.card).textContent = fmtSecs(Date.now() - curThink.start);
 }, 1000);
@@ -1272,7 +1273,8 @@ function renderApps(apps) {
 	const frag = document.createDocumentFragment();
 	apps.forEach((a) => {
 		const row = el('div', 'pick-row');
-		row.innerHTML = `<div class="pick-ic">${esc((a.name || a.package || '?').trim()[0] || '?')}</div><div class="pick-main"><div class="pick-name">${esc(a.name)}</div><div class="pick-sub">${esc(a.package)}</div></div>`;
+		const fresh = !a.system && a.installed && Date.now() - a.installed < 7 * 24 * 3600 * 1000;
+		row.innerHTML = `<div class="pick-ic">${esc((a.name || a.package || '?').trim()[0] || '?')}</div><div class="pick-main"><div class="pick-name">${esc(a.name)}</div><div class="pick-sub">${fresh ? '新安装 · ' : ''}${esc(a.package)}</div></div>`;
 		row.addEventListener('click', () => { addScope({ type: 'app', name: a.name, package: a.package }); closeLayer('sheet'); });
 		frag.appendChild(row);
 	});

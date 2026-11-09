@@ -110,10 +110,15 @@ const sessionCache = new Map(); // id -> session object
 let activeSessionId = null;
 
 async function getOrLoadSessionObj(id) {
-	if (sessionCache.has(id)) return sessionCache.get(id);
+	if (sessionCache.has(id)) {
+		const s = sessionCache.get(id);
+		Object.defineProperty(s, 'lastUsed', { value: Date.now(), writable: true, enumerable: false, configurable: true });
+		return s;
+	}
 	const loaded = await loadSession(id);
 	if (loaded) {
 		markInterrupted(loaded);
+		Object.defineProperty(loaded, 'lastUsed', { value: Date.now(), writable: true, enumerable: false, configurable: true });
 		sessionCache.set(id, loaded);
 	}
 	return loaded;
@@ -614,19 +619,31 @@ async function transcriptExists(claudeSessionId) {
 	return false;
 }
 
-// Free the underlying `claude` process for conversations nobody has touched in a while — their
-// history and `claudeSessionId` stay on disk, so the next message just resumes it transparently.
-// Not a hard cap: a 16GB phone can hold many of these; this is a safety net against unbounded growth.
-const IDLE_REAP_MS = 20 * 60 * 1000;
-setInterval(() => {
+// A finished conversation's `claude` process (and the connectors it started) is let go once it has
+// sat idle a while: its history and `claudeSessionId` stay on disk, and the next message resumes it
+// in a new process, a few seconds' start. The one on screen is kept longer, as the owner is likely
+// to go on with it; others go soon; and only a couple of idle ones are ever kept at all.
+const IDLE_ON_SCREEN_MS = Number(process.env.AGENT_IDLE_ON_SCREEN_MS) || 10 * 60 * 1000;
+const IDLE_OTHER_MS = Number(process.env.AGENT_IDLE_OTHER_MS) || 3 * 60 * 1000;
+const IDLE_KEEP = 2;
+const isIdle = (id, rt) => !rt.running && rt.pending.size === 0 && !delivering.has(id) && !queues.get(id)?.length;
+function reapIdle() {
 	const now = Date.now();
-	for (const [id, rt] of runtimes) {
-		if (!rt.running && rt.pending.size === 0 && now - rt.lastActive > IDLE_REAP_MS) {
-			log('idle-reap', id);
+	const idle = [...runtimes.entries()].filter(([id, rt]) => isIdle(id, rt)).sort(([, a], [, b]) => b.lastActive - a.lastActive);
+	idle.forEach(([id, rt], i) => {
+		const limit = id === activeSessionId ? IDLE_ON_SCREEN_MS : IDLE_OTHER_MS;
+		if (i >= IDLE_KEEP || now - rt.lastActive > limit) {
+			log('idle-reap', id.slice(0, 8), i >= IDLE_KEEP ? '(too many idle)' : `(idle ${Math.round((now - rt.lastActive) / 1000)}s)`);
 			teardownRuntime(id);
 		}
+	});
+	// A conversation nobody has open or running needn't stay in memory: it is all on disk.
+	for (const [id, sess] of sessionCache) {
+		if (id === activeSessionId || runtimes.has(id) || delivering.has(id) || queues.has(id) || titling.has(id)) continue;
+		if (now - (sess.lastUsed || 0) > 10 * 60 * 1000) sessionCache.delete(id);
 	}
-}, 5 * 60 * 1000);
+}
+setInterval(reapIdle, Math.min(30000, IDLE_OTHER_MS / 2)).unref();
 
 function getSdkModel(m) {
 	if (!m) return 'sonnet';
@@ -1127,8 +1144,22 @@ async function watchBgScreen() {
 	}
 	return st;
 }
+// The app left open there keeps running unseen, so the screen closes once nothing has worked for
+// a while and nobody is watching it.
+const BG_IDLE_MS = Number(process.env.AGENT_BG_IDLE_MS) || 5 * 60 * 1000;
+let lastWorkAt = Date.now();
+let lastWatchedAt = 0;
 setInterval(() => {
-	if ([...runtimes.values()].some((rt) => rt.running) || bgLast.includes('"active":true')) watchBgScreen().catch(() => {});
+	const busy = [...runtimes.values()].some((rt) => rt.running || rt.pending.size > 0);
+	if (busy) lastWorkAt = Date.now();
+	const open = bgLast.includes('"active":true');
+	if (open && !busy && Date.now() - Math.max(lastWorkAt, lastWatchedAt) > BG_IDLE_MS) {
+		log('[bgscreen] closing it: nothing has run there for a while');
+		lastWorkAt = Date.now();
+		bgCall('quit').then(() => watchBgScreen()).catch(() => {});
+		return;
+	}
+	if (busy || open) watchBgScreen().catch(() => {});
 }, 2000).unref();
 
 // ---------------------------------------------------------------- apps & filesystem helpers
@@ -1180,34 +1211,37 @@ const KNOWN_APPS = {
 let cachedApps = null;
 let cachedAppsTime = 0;
 
-function getInstalledApps() {
-	return new Promise((resolve) => {
+// The phone's apps by the names the owner sees: every app with a launcher icon, system ones too,
+// asked of the package manager through BgScreen (`pm list packages` has no names and can be too
+// slow on a busy phone). Asked again when the list is more than a few seconds old, so a new
+// install shows up; the newest installs come first.
+let appsLoading = null;
+const RECENT_INSTALL_MS = 7 * 24 * 3600 * 1000;
+async function getInstalledApps() {
+	if (cachedApps && Date.now() - cachedAppsTime < 15000) return cachedApps;
+	appsLoading ||= (async () => {
+		let apps = null;
+		try {
+			const out = await run('ashell', ['sh', '-c', 'p=$(pm path com.droidagent.app | head -n 1); CLASSPATH="${p#package:}" exec app_process /system/bin com.droidagent.app.BgScreen apps'], { timeout: 30000 });
+			const line = out.split('\n').find((l) => l.startsWith('['));
+			apps = JSON.parse(line).map((a) => ({ package: a.package, name: a.name || a.package, system: !!a.system, installed: a.installed || 0 }));
+		} catch (e) { log('[apps] by name:', e?.message); }
+		if (!apps?.length) {
+			try {
+				const out = await run('ashell', ['pm', 'list', 'packages', '-3'], { timeout: 20000 });
+				apps = out.split('\n').map((l) => l.trim().replace(/^package:/, '')).filter(Boolean)
+					.map((pkg) => ({ package: pkg, name: KNOWN_APPS[pkg] || pkg.split('.').pop(), system: false, installed: 0 }));
+			} catch (e) { log('[apps] packages:', e?.message); }
+		}
+		if (!apps?.length) return cachedApps || Object.keys(KNOWN_APPS).map((pkg) => ({ package: pkg, name: KNOWN_APPS[pkg], system: false, installed: 0 }));
 		const now = Date.now();
-		if (cachedApps && now - cachedAppsTime < 60000) return resolve(cachedApps);
-		exec('ashell pm list packages -3', { timeout: 4000 }, (err, stdout) => {
-			let lines = [];
-			if (!err && stdout) {
-				lines = stdout.split('\n').map((l) => l.trim().replace(/^package:/, '')).filter(Boolean);
-			}
-			if (lines.length === 0) {
-				lines = Object.keys(KNOWN_APPS);
-			}
-			const apps = lines.map((pkg) => {
-				const friendly = KNOWN_APPS[pkg] || pkg.split('.').pop();
-				return { package: pkg, name: friendly };
-			});
-			// Sort known/common apps first
-			apps.sort((a, b) => {
-				const aKnown = KNOWN_APPS[a.package] ? 1 : 0;
-				const bKnown = KNOWN_APPS[b.package] ? 1 : 0;
-				if (aKnown !== bKnown) return bKnown - aKnown;
-				return a.name.localeCompare(b.name, 'zh-CN');
-			});
-			cachedApps = apps;
-			cachedAppsTime = now;
-			resolve(apps);
-		});
-	});
+		const recent = (a) => (!a.system && now - a.installed < RECENT_INSTALL_MS ? 1 : 0);
+		apps.sort((a, b) => (recent(b) - recent(a)) || (a.system - b.system) || a.name.localeCompare(b.name, 'zh-CN'));
+		cachedApps = apps;
+		cachedAppsTime = Date.now();
+		return apps;
+	})().finally(() => { appsLoading = null; });
+	return appsLoading;
 }
 
 // ---------------------------------------------------------------- filesystem item helpers
@@ -2648,6 +2682,7 @@ const server = createServer(async (req, res) => {
 		// What is on it now, small, for watching it live.
 		if (path === '/api/bgscreen/frame' && req.method === 'GET') {
 			const w = Math.max(120, Math.min(720, parseInt(url.searchParams.get('w'), 10) || 360));
+			lastWatchedAt = Date.now();
 			const file = `${BG_DIR}/frame-${randomUUID().slice(0, 8)}.jpg`;
 			const r = await bgCall(`frame ${file} ${w}`, 8000);
 			if (!r?.startsWith('ok')) return json(res, { ok: false, error: r ? r.replace(/^err /, '') : '后台屏幕没有打开' }, 404);

@@ -98,13 +98,18 @@ public final class BgScreen {
                 System.out.println(call(join(args, 1)));
                 System.exit(0);
             }
+            if (args.length == 1 && args[0].equals("apps")) {
+                setup();
+                System.out.println(listApps());
+                System.exit(0);
+            }
             if (args.length == 5 && args[0].equals("type")) {
                 setup();
                 System.out.println(typeText(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]), decode(args[4])));
                 System.exit(0);
             }
             if (args.length != 4 || !args[0].equals("serve")) {
-                System.err.println("usage: BgScreen serve W H DPI | type DISPLAY X Y TEXT_BASE64");
+                System.err.println("usage: BgScreen serve W H DPI | type DISPLAY X Y TEXT_BASE64 | apps");
                 System.exit(2);
             }
             width = Integer.parseInt(args[1]);
@@ -260,6 +265,36 @@ public final class BgScreen {
         j.put("takenOverLabel", takenOver == null ? JSONObject.NULL : label(takenOver));
         j.put("idleMs", System.currentTimeMillis() - lastUse);
         return j.toString();
+    }
+
+    /**
+     * Every app with a launcher icon, by the name the owner sees, as JSON:
+     * [{"package","name","activity","system","installed"}]. `pm list packages` has no names, and
+     * on a busy phone is slow enough to time out; this asks the package manager directly.
+     */
+    static String listApps() throws Exception {
+        android.content.pm.PackageManager pm = ctx.getPackageManager();
+        android.content.Intent launcher = new android.content.Intent(android.content.Intent.ACTION_MAIN)
+                .addCategory(android.content.Intent.CATEGORY_LAUNCHER);
+        List<android.content.pm.ResolveInfo> found = pm.queryIntentActivities(launcher, 0);
+        org.json.JSONArray out = new org.json.JSONArray();
+        java.util.HashSet<String> seen = new java.util.HashSet<String>();
+        for (android.content.pm.ResolveInfo ri : found) {
+            android.content.pm.ActivityInfo a = ri.activityInfo;
+            if (a == null || !seen.add(a.packageName)) continue;
+            JSONObject j = new JSONObject();
+            CharSequence name = null;
+            try { name = ri.loadLabel(pm); } catch (Throwable ignored) { /* the package name will do */ }
+            long installed = 0;
+            try { installed = pm.getPackageInfo(a.packageName, 0).firstInstallTime; } catch (Throwable ignored) { /* unknown */ }
+            j.put("package", a.packageName);
+            j.put("name", name == null || name.length() == 0 ? a.packageName : name.toString().trim());
+            j.put("activity", a.packageName + "/" + a.name);
+            j.put("system", a.applicationInfo != null && (a.applicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0);
+            j.put("installed", installed);
+            out.put(j);
+        }
+        return out.toString();
     }
 
     /** The app's name as the launcher shows it, or its package when that can't be read. */

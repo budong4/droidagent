@@ -18,6 +18,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
@@ -74,6 +75,8 @@ public class OverlayService extends Service {
     static final String PANEL_URL = BASE + "/overlay.html";
     static final String PREFS = "droidagent";
     static final long POLL_MS = 1500;
+    // Nothing to show: the server is asked less often, and rarely with the screen off.
+    static final long POLL_IDLE_MS = 4000, POLL_SCREEN_OFF_MS = 15000;
     /** After a task ends the face says "done" for this long, then goes. */
     static final long DONE_MS = 6000;
     static final long BLINK_EVERY_MS = 3600;
@@ -85,6 +88,8 @@ public class OverlayService extends Service {
 
     WindowManager wm;
     Handler handler;
+    HandlerThread fetcher; // one thread for the status requests, not one each time
+    Handler fetch;
     SharedPreferences prefs;
     File stateFile;
     int screenW, screenH, bubbleSize, pad;
@@ -147,6 +152,9 @@ public class OverlayService extends Service {
         // Only senders holding DUMP (shell, root, system) may hide the face.
         registerReceiver(receiver, f, "android.permission.DUMP", null);
 
+        fetcher = new HandlerThread("status");
+        fetcher.start();
+        fetch = new Handler(fetcher.getLooper());
         poller = new Poller(this);
         handler.post(poller);
         blinker = new Blink(this, false);
@@ -794,9 +802,15 @@ public class OverlayService extends Service {
         final OverlayService s;
         Poller(OverlayService s) { this.s = s; }
         @Override public void run() {
-            new Thread(new StatusFetch(s)).start();
-            s.handler.postDelayed(this, POLL_MS);
+            s.fetch.post(new StatusFetch(s));
+            s.handler.postDelayed(this, s.pollDelay());
         }
+    }
+
+    long pollDelay() {
+        if (busy || bubbleShown || panelOpen) return POLL_MS;
+        android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        return pm != null && !pm.isInteractive() ? POLL_SCREEN_OFF_MS : POLL_IDLE_MS;
     }
 
     public static class StatusFetch implements Runnable {
@@ -834,6 +848,7 @@ public class OverlayService extends Service {
         isRunning = false;
         instance = null;
         handler.removeCallbacksAndMessages(null);
+        if (fetcher != null) fetcher.quitSafely();
         try { unregisterReceiver(receiver); } catch (Exception ignored) { }
         hideTarget();
         closePanel(false);
