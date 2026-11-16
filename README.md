@@ -143,23 +143,23 @@ debian retools                               装逆向分析工具链
 
 | | Claude | Antigravity |
 |---|---|---|
-| 运行的程序 | Claude Code（Agent SDK 驱动，常驻进程） | Google 官方的 `agy`，每轮对话运行一次无头模式（`agy -p … --output-format stream-json`），用 `--conversation` 接续上下文 |
-| 登录 | `claude auth login` | agy 自己的登录（`agy acp --login`，粘贴授权码）。App 不保存也不读取凭据，只看 agy 的凭据文件在不在 |
+| 运行的程序 | Claude Code（Agent SDK 驱动，常驻进程） | Google 官方的 `agy`，通过它的 Agent Client Protocol 服务（`agy acp`）驱动，每段对话一个常驻进程，用会话编号续接（`app/server/backends/agy_acp.mjs`） |
+| 登录 | `claude auth login` | 和 [dsh-agy-link](https://github.com/amlyczz/dsh-agy-link) 一样：App 用 Antigravity 自带的公开 OAuth 客户端走 Google 登录（PKCE，浏览器回到本机 `localhost:51121`；回不来时粘贴地址），把凭据按 agy 自己的格式写进 `~/.gemini/antigravity-cli/antigravity-oauth-token`，由官方 agy 使用（`app/server/backends/agy_oauth.mjs`） |
 | 模型 | Opus / Sonnet / Haiku / Fable | `agy models` 列出的全部（Gemini 等，取决于 Google AI 套餐） |
-| 执行命令、写文件 | Claude Code 的工具，经确认卡片 | agy 无头模式没法逐步确认，所以 App 通过 MCP 给它提供 `shell`、`write_file`、`remember` 三个工具（`app/server/agy_bridge.mjs`），调用回到 App 的同一套权限规则和确认卡片。agy 自带的命令工具只有 Full access 下才放行 |
+| 执行命令、写文件 | Claude Code 的工具，经确认卡片 | agy 自己的工具。需要确认的每一步，agy 都会通过 ACP 的 `session/request_permission` 来问，App 用同一套权限规则和确认卡片回答。Full access 下 agy 以 `--dangerously-skip-permissions` 启动，不再问 |
 | 技能 | `~/.claude/skills` | 同一批技能，链接到 `~/.gemini/skills` |
 | 连接器（MCP） | App 的连接器配置 | 同一批连接器，同步到 `~/.gemini/config/mcp_config.json`（agy 不支持旧的 SSE 连接方式，这类连接器会跳过） |
-| 系统提示词、经验笔记 | 追加到系统提示词 | agy 没有系统提示词参数，放在每段对话第一条消息的前面 |
+| 系统提示词、经验笔记 | 追加到系统提示词 | agy 支持会话系统提示词时作为系统提示词传入，否则放在每段新会话第一条消息的前面 |
 | 用量 | claude.ai 的用量接口 | `agy -p /usage` |
 | 插件 | 扩展与插件 → 插件，和 Antigravity 共用（`claude plugin`） | 同一页（`agy plugin`）。两边插件里的技能和连接器互相可用：Claude 插件的技能链接到 `~/.gemini/skills`、连接器写进 agy 的 MCP 配置；agy 插件生成一个本地 Claude 插件（`~/.droidagent/agy-plugins/`）交给 Agent SDK。Claude 插件的命令、子代理、hooks 和 agy 插件的规则不互通 |
-| 斜杠命令 | Claude Code 的全部命令 | App 自己的命令、`/plan` 和各个技能。agy 交互界面里才有的命令（`/mcp`、`/config` 等）在无头模式下没有 |
-| 思考过程 | 显示摘要 | 无头模式不输出思考内容，App 从 agy 自己的对话记录（`~/.gemini/antigravity-cli/conversations/<id>.db`）里只读地取出来，在每一步之前显示。格式参考 dsh-agy-link 的实测；读不到时只是不显示 |
+| 斜杠命令 | Claude Code 的全部命令 | App 自己的命令、各个技能，以及 agy 通过 ACP 报给 App 的它自己的命令 |
+| 思考过程 | 显示摘要 | ACP 实时推送的思考内容（`agent_thought_chunk`），和 Claude 一样边想边显示 |
 
 同一段对话可以换到另一个账号的模型继续，但两边各记各的：接手的一方看不到另一方做过的事，对话里会有一行说明。
 
-App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json` 里的 `droidagent` 和同步过去的连接器、`settings.json` 里的 `mcp(...)` 放行规则、`~/.gemini/skills` 里的链接），你自己写的条目不会被改动；记录在 `~/.droidagent/agy-managed.json`。
+App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json` 里同步过去的连接器、`~/.gemini/skills` 里的链接），你自己写的条目不会被改动；记录在 `~/.droidagent/agy-managed.json`。旧版本加过的 `droidagent` 工具服务和 `mcp(...)` 放行规则会被自动清理。
 
-第三方工具驱动官方 `agy` 是否符合 Antigravity 的服务条款，Google 没有明确说法，请自行判断。本项目不使用 Antigravity 的 OAuth 客户端自行登录，也不直接调用它的内部接口。无头模式的事件格式和几处细节参考了 [dsh-agy-link](https://github.com/amlyczz/dsh-agy-link)（MIT）的实测记录。
+**关于账号风险**：Antigravity 的服务条款禁止第三方软件使用它的登录，已经有不少账号因此被停用（多数是把凭据拿去给其他工具调用 Google 接口的情况）。本项目按 dsh-agy-link 的做法自己完成登录，这一点同样在条款禁止的范围内，是否使用请自行权衡；登录之后的对话只由官方 agy 完成，App 不直接调用 Google 的接口。ACP 的消息格式参照 agentclientprotocol.com，登录流程和 agy 凭据文件格式参考了 [dsh-agy-link](https://github.com/amlyczz/dsh-agy-link)（MIT）。
 
 测试（不需要手机、账号和真正的 agy，用 `tests/fake-agy.mjs` 模拟）：`node --test tests/*.test.mjs`。
 

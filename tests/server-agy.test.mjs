@@ -1,7 +1,8 @@
 // Run: node --test tests/server-agy.test.mjs
 // The real server, with a throwaway home and tests/fake-agy.mjs standing in for the Antigravity
-// CLI: an Antigravity conversation from the page's side — messages, tool cards, confirmation
-// cards answered through our MCP tools, stopping, usage, plugins, signing out.
+// CLI (its ACP server): an Antigravity conversation from the page's side — messages, tool cards,
+// agy's own permission requests answered by the confirmation cards, thoughts, stopping, usage,
+// plugins, signing out.
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -50,7 +51,14 @@ async function storedWhen(id, ready) {
 	return stored(id);
 }
 
+let google, oauthPort;
 before(async () => {
+	// A stand-in for Google's token and userinfo endpoints, for signing in to Antigravity.
+	const { createServer: httpServer } = await import('node:http');
+	const g = httpServer((req, res) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => { const f = Object.fromEntries(new URLSearchParams(b)); res.writeHead(req.url === '/token' && f.code !== 'good' ? 400 : 200, { 'content-type': 'application/json' }); res.end(JSON.stringify(req.url === '/token' ? (f.code === 'good' ? { access_token: 'ya29.x', refresh_token: '1//r', expires_in: 3600 } : { error: 'invalid_grant' }) : { email: 'owner@example.com' })); }); });
+	await new Promise((r) => g.listen(0, '127.0.0.1', r));
+	google = { base: `http://127.0.0.1:${g.address().port}`, close: () => g.close() };
+	oauthPort = await freePort();
 	// A PATH with node and the system tools but no `claude`: this server has Antigravity only.
 	const bin = join(home, 'bin');
 	mkdirSync(bin, { recursive: true });
@@ -62,6 +70,7 @@ before(async () => {
 		env: {
 			HOME: home, PATH: `${bin}:/usr/bin:/bin`, AGENT_PORT: String(port), AGENT_CWD: work, AGENT_PROXY_FILE: join(home, 'proxy.env'),
 			DROIDAGENT_NO_UPDATE: '1', AGENT_AGY_BIN: join(HERE, 'fake-agy.mjs'), FAKE_AGY_LOG: agyLog, AGENT_BG_DIR: join(home, 'bg'),
+			AGY_OAUTH_TOKEN_URL: `${google.base}/token`, AGY_OAUTH_USERINFO_URL: `${google.base}/userinfo`, AGY_OAUTH_PORT: String(oauthPort),
 		},
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
@@ -92,6 +101,7 @@ before(async () => {
 });
 after(() => {
 	server?.kill('SIGKILL');
+	google?.close();
 	rmSync(home, { recursive: true, force: true });
 });
 
@@ -110,42 +120,40 @@ test('nobody is signed in; then an Antigravity login appears', async () => {
 	assert.equal(r.settings.model, 'agy:gemini-3.8-flash');
 });
 
-test('a conversation: streamed reply, kept on disk, resumed by its id on the next message', async () => {
+test('a conversation: streamed reply, kept on disk, one session across messages', async () => {
 	const id = await newSession();
 	const first = await say(id, '你好');
 	assert.equal(first.result.ok, true);
 	assert.equal(first.result.subtype, 'success');
-	assert.equal(first.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), 'echo(gemini-3.8-flash): 你好');
-	assert.deepEqual(first.events.find((e) => e.type === 'session'), { type: 'session', sessionId: id, claudeSessionId: null, backend: 'agy', model: 'gemini-3.8-flash' });
+	assert.equal(first.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), 'echo(gemini-3.8-flash/extra): 你好');
+	const ses = first.events.find((e) => e.type === 'session');
+	assert.deepEqual({ claudeSessionId: ses.claudeSessionId, backend: ses.backend }, { claudeSessionId: null, backend: 'agy' });
 	await say(id, '第二句');
 	const sess = await storedWhen(id, (x) => x.messages.filter((m) => m.role === 'assistant').length === 2);
 	assert.equal(sess.backend, 'agy');
 	assert.ok(sess.agyConversationId);
 	assert.equal(sess.claudeSessionId ?? null, null);
 	assert.deepEqual(sess.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => [m.role, m.text]),
-		[['user', '你好'], ['assistant', 'echo(gemini-3.8-flash): 你好'], ['user', '第二句'], ['assistant', 'echo(gemini-3.8-flash): 第二句']]);
-	const mine = runs().filter((r) => r.env.session === id);
+		[['user', '你好'], ['assistant', 'echo(gemini-3.8-flash/extra): 你好'], ['user', '第二句'], ['assistant', 'echo(gemini-3.8-flash/extra): 第二句']]);
+	const mine = runs().filter((r) => r.acp && r.sessionId === sess.agyConversationId && r.prompt);
 	assert.equal(mine.length, 2);
 	// The first message carries the app's instructions and the notes; the second is the owner's words.
 	assert.match(mine[0].prompt, /你在 DroidAgent 里工作/);
-	assert.match(mine[0].prompt, /droidagent/);
 	assert.match(mine[0].prompt, /你的经验笔记/);
 	assert.ok(mine[0].prompt.endsWith('【用户的消息】\n你好'));
 	assert.equal(mine[1].prompt, '第二句');
-	assert.equal(mine[1].argv[mine[1].argv.indexOf('--conversation') + 1], sess.agyConversationId);
 	assert.equal(mine[0].cwd, work);
-	// Before the turn, agy was given our tools and this mode's approvals.
-	const mcp = JSON.parse(readFileSync(join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers;
-	assert.equal(mcp.droidagent.env.DROIDAGENT_BRIDGE_URL, base);
-	assert.deepEqual(JSON.parse(readFileSync(join(home, '.gemini', 'antigravity-cli', 'settings.json'), 'utf8')).permissions.allow, ['mcp(droidagent/*)', 'mcp(*)']);
+	// Below Full access, agy asks; nothing of the old MCP workaround is left in its configuration.
+	assert.deepEqual(runs().find((r) => r.newSession === sess.agyConversationId).argv, ['acp']);
+	assert.ok(!('droidagent' in (JSON.parse(readFileSync(join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers || {})));
 	assert.ok(existsSync(join(home, '.gemini', 'skills', 'phone-health', 'SKILL.md')), "the app's skills are where agy looks");
 });
 
-test('a command through our tool: allowed by the mode, shown as a command card', async () => {
+test('a command: allowed by the mode, shown as a command card', async () => {
 	const id = await newSession();
 	const t = await say(id, 'shell: echo hi-from-the-phone && pwd');
 	const use = t.events.find((e) => e.type === 'tool_use');
-	assert.deepEqual({ name: use.name, title: use.title, detail: use.detail, category: use.category }, { name: 'Bash', title: '运行测试命令', detail: 'echo hi-from-the-phone && pwd', category: '命令' });
+	assert.deepEqual({ name: use.name, detail: use.detail, category: use.category }, { name: 'Bash', detail: 'echo hi-from-the-phone && pwd', category: '命令' });
 	const res = t.events.find((e) => e.type === 'tool_result');
 	assert.equal(res.ok, true);
 	assert.equal(res.summary, `hi-from-the-phone\n${work}`);
@@ -157,10 +165,10 @@ test('a command through our tool: allowed by the mode, shown as a command card',
 	const bad = await say(id, 'shell: echo oops >&2; exit 3');
 	const failed = bad.events.find((e) => e.type === 'tool_result');
 	assert.equal(failed.ok, false);
-	assert.equal(failed.summary, 'oops\n（退出码 3）');
+	assert.equal(failed.summary, 'oops');
 });
 
-test('Ask mode: the same tool puts a card to the owner and waits for the answer', async () => {
+test('Ask mode: agy asks, a card goes to the owner, and agy waits for the answer', async () => {
 	await api('/api/settings', { mode: 'default' });
 	const id = await newSession();
 	const target = join(work, 'made-by-agy.txt');
@@ -175,7 +183,7 @@ test('Ask mode: the same tool puts a card to the owner and waits for the answer'
 	let result = await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
 	assert.ok(!existsSync(target));
 	const refused = events.slice(from).find((e) => e.type === 'tool_result' && e.sessionId === id);
-	assert.deepEqual({ ok: refused.ok, summary: refused.summary }, { ok: false, summary: '用户拒绝了这个操作' });
+	assert.deepEqual({ ok: refused.ok, summary: refused.summary }, { ok: false, summary: 'denied by the user' });
 	assert.equal(result.ok, true);
 
 	// Allowed: it runs.
@@ -205,38 +213,24 @@ test('Ask mode: the same tool puts a card to the owner and waits for the answer'
 	assert.deepEqual({ name: use.name, title: use.title }, { name: 'Write', title: '新建或覆盖 a.txt' });
 });
 
-test("a catastrophic command is asked about even in Auto, and agy's own tools cannot get round the card", async () => {
+test('a catastrophic command is asked about even in Auto; Full access lets agy go without asking', async () => {
 	await api('/api/settings', { mode: 'auto' });
 	const id = await newSession();
-	let from = events.length;
+	const from = events.length;
 	await api('/api/send', { text: 'shell: echo would-reboot; : reboot', sessionId: id });
 	const card = await waitFor((e) => e.type === 'permission' && e.sessionId === id, { from });
 	assert.equal(card.reason, '高危操作');
 	await api('/api/permission', { id: card.id, decision: 'deny', sessionId: id });
 	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
-	// Its own run_command is refused by agy itself below Full access; the owner is told why.
-	const native = await say(id, 'native: rm -rf /sdcard/x');
-	assert.equal(native.events.find((e) => e.type === 'tool_result').ok, false);
-	assert.match(native.events.find((e) => e.type === 'notice').text, /Full access/);
-	assert.ok(!runs().some((r) => r.argv.includes('--dangerously-skip-permissions')), 'no mode below Full access passes that flag');
-	// Full access: agy runs its own tools, by the owner's explicit choice.
+	assert.ok(!runs().some((r) => r.newSession && r.argv.includes('--dangerously-skip-permissions')), 'no mode below Full access passes that flag');
+	// Full access: a new conversation's agy is told not to ask, by the owner's explicit choice.
 	await api('/api/settings', { mode: 'bypassPermissions' });
-	const free = await say(id, 'native: ls');
-	assert.equal(free.events.find((e) => e.type === 'tool_result').summary, 'ran natively');
-	assert.ok(runs().at(-1).argv.includes('--dangerously-skip-permissions'));
+	const id2 = await newSession();
+	const free = await say(id2, 'shell: echo free');
+	assert.ok(!free.events.some((e) => e.type === 'permission'));
+	assert.equal(free.events.find((e) => e.type === 'tool_result').summary, 'free');
+	assert.ok(runs().filter((r) => r.newSession).at(-1).argv.includes('--dangerously-skip-permissions'));
 	await api('/api/settings', { mode: 'acceptEdits' });
-});
-
-test('a tool call that is not ours to answer is turned away', async () => {
-	const call = (b) => api('/api/agy-bridge/call', b);
-	assert.deepEqual(await call({ token: 'wrong', sessionId: 'x', tool: 'shell', arguments: { command: `touch ${join(work, 'pwned')}` } }), { ok: false, text: '这次调用没有通过验证' });
-	const token = JSON.parse(readFileSync(join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers.droidagent.env.DROIDAGENT_BRIDGE_TOKEN;
-	// The right token, but no turn in progress to act for.
-	assert.equal((await call({ token, sessionId: 'no-such-conversation', tool: 'shell', arguments: { command: `touch ${join(work, 'pwned')}` } })).ok, false);
-	assert.ok(!existsSync(join(work, 'pwned')));
-	// A page in a browser cannot call it: wrong origin, like every other endpoint.
-	const res = await fetch(base + '/api/agy-bridge/call', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://evil.example' }, body: '{}' });
-	assert.equal(res.status, 403);
 });
 
 test('Stop ends the turn and the command it was running', async () => {
@@ -291,19 +285,16 @@ test('the title of an Antigravity conversation is made by Antigravity', async ()
 	await say(id, '帮我看看电池');
 	const title = await waitFor((e) => e.type === 'title' && e.sessionId === id, { from });
 	assert.equal(title.title, "查看电池状态");
-	assert.ok(runs().some((r) => r.argv.includes('json') && /起一个标题/.test(r.prompt) && !r.env.session));
+	assert.ok(runs().some((r) => r.oneShot && r.argv.includes('json') && /起一个标题/.test(r.prompt)), 'named by a one-off question, outside the conversation');
 });
 
-test("Antigravity's thoughts are shown, before the steps they led to, and only this turn's", async () => {
+test("Antigravity's thoughts are shown as they stream, before the step they led to", async () => {
 	const id = await newSession();
-	const kinds = (t) => t.events.filter((e) => ['thinking_delta', 'tool_use', 'assistant_delta'].includes(e.type)).map((e) => (e.type === 'thinking_delta' ? `think:${e.text}` : e.type));
+	const kinds = (t) => t.events.filter((e) => ['thinking_start', 'thinking_delta', 'tool_use', 'assistant_delta'].includes(e.type)).map((e) => (e.type === 'thinking_delta' ? `think:${e.text}` : e.type));
 	const first = await say(id, 'think: the battery');
-	assert.deepEqual(kinds(first), ['think:first thought about the battery', 'think:I should look at the files', 'tool_use', 'assistant_delta', 'assistant_delta']);
+	assert.deepEqual(kinds(first), ['thinking_start', 'think:first thought about the battery', 'tool_use', 'thinking_start', 'think:I should', 'think: look at the files', 'assistant_delta', 'assistant_delta']);
 	const saved = await storedWhen(id, (x) => x.messages.filter((m) => m.role === 'think').length === 2);
 	assert.deepEqual(saved.messages.filter((m) => m.role === 'think').map((m) => m.text), ['first thought about the battery', 'I should look at the files']);
-	// The next turn shows its own thoughts, not the last one's again.
-	const second = await say(id, 'think: storage');
-	assert.deepEqual(kinds(second).filter((k) => k.startsWith('think:')), ['think:first thought about storage', 'think:I should look at the files'], JSON.stringify(second.events.map((e) => [e.type, e.text]).slice(0, 40)));
 });
 
 test("a Claude plugin's skills and connectors reach Antigravity too", async () => {
@@ -333,4 +324,25 @@ test('signing out of Antigravity', async () => {
 	const auth = await waitFor((e) => e.type === 'auth', { from });
 	assert.deepEqual(auth.accounts, { claude: false, agy: false });
 	assert.ok(!existsSync(join(home, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')));
+});
+
+test('signing in to Antigravity: the link, the browser coming back to the phone, the account shown', async () => {
+	const from = events.length;
+	await api('/api/login/start', { provider: 'agy' });
+	const link = await waitFor((e) => e.type === 'login_url' && e.provider === 'agy', { from });
+	assert.equal(link.mode, 'auto');
+	const u = new URL(link.url);
+	assert.equal(u.searchParams.get('redirect_uri'), `http://localhost:${oauthPort}/oauth-callback`);
+	// What the phone's browser does after "Allow".
+	await fetch(`http://127.0.0.1:${oauthPort}/oauth-callback?code=good&state=${u.searchParams.get('state')}`);
+	const done = await waitFor((e) => e.type === 'login_done' && e.provider === 'agy', { from });
+	assert.equal(done.ok, true);
+	await waitFor((e) => e.type === 'auth' && e.accounts?.agy, { from });
+	const tok = JSON.parse(readFileSync(join(home, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8'));
+	assert.equal(tok.token.refresh_token, '1//r');
+	assert.equal((await api('/api/agy/status')).email, 'owner@example.com');
+	// And a pasted address from a stale attempt is told apart; a cancel stops listening.
+	await api('/api/login/start', { provider: 'agy' });
+	await api('/api/login/cancel', {});
+	await assert.rejects(fetch(`http://127.0.0.1:${oauthPort}/oauth-callback?code=x`));
 });

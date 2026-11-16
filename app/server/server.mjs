@@ -9,7 +9,7 @@ import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open, cp } from 'node:fs/promises';
 import { readFileSync, existsSync, createReadStream, createWriteStream } from 'node:fs';
-import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -21,7 +21,9 @@ import {
 import { isReadOnlyBash } from './policy.mjs';
 import { AGY_PREFIX, BACKEND_NAMES, backendOf, agySlug } from './backends/common.mjs';
 import { createClaudeBackend, thinkingFor } from './backends/claude.mjs';
-import { createAgyBackend, usageGroupFor, BRIDGE_SERVER } from './backends/antigravity.mjs';
+import { createAgyBackend, usageGroupFor } from './backends/antigravity.mjs';
+import { startSignIn } from './backends/agy_oauth.mjs';
+import { configOption, levelsOf } from './backends/agy_acp.mjs';
 import { enabledClaudePlugins, claudePluginsForAgy, agyPluginsForClaude } from './backends/shared_plugins.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -443,7 +445,6 @@ function toolTitle(name, input) {
 	if (name === 'WebSearch') return `上网搜索「${String(input?.query || '').slice(0, 30)}」`;
 	if (name === 'WebFetch') { try { return `打开网页 ${new URL(input?.url).hostname}`; } catch { return '打开网页'; } }
 	if (name === 'TodoWrite') return '更新待办清单';
-	if (name === `mcp__${BRIDGE_SERVER}__remember`) return '记一条经验笔记';
 	if (name === 'Skill') {
 		const id = String(input?.skill || input?.command || input?.name || '').replace(/^\//, '');
 		return `使用技能「${skillNames.get(id) || id || '技能'}」`;
@@ -519,7 +520,6 @@ function teardownRuntime(id) {
 	if (!rt) return;
 	try { rt.end(); } catch { /* already done */ }
 	tell(() => rt.q?.interrupt?.());
-	killBridgeJobs(rt);
 	for (const [, p] of rt.pending) p.resolve({ behavior: 'deny', message: '会话已重置', interrupt: false });
 	runtimes.delete(id);
 }
@@ -590,7 +590,6 @@ function drainQueue(id) {
 function interruptTurn(id) {
 	const rt = runtimes.get(id);
 	tell(() => rt?.q?.interrupt?.());
-	killBridgeJobs(rt);
 	for (const [permId, p] of rt?.pending || []) {
 		p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
 		closePermission(id, permId, 'stop');
@@ -671,16 +670,14 @@ const notesPrompt = (how) => `## 经验笔记
 - 笔记保持在 150 条以内，接近时把相近的条目合并。`;
 const NOTES_PROMPT = notesPrompt('用 Edit 或 Write 工具往笔记里加一条');
 
-// Antigravity has no flag for a system prompt: this goes ahead of the first message of each of
-// its conversations, with the phone's own instructions (written for Claude Code) and the notes.
+// What Antigravity is told about where it works: as the session's system prompt where agy takes
+// one, else ahead of the first message of a conversation. With the phone's own instructions
+// (written for Claude Code) and the notes.
 const AGY_PROMPT = `# 你在 DroidAgent 里工作
 你通过 Antigravity CLI 运行在一台已 Root 的 Android 手机上的 Debian 环境里，身份是真 root。用户在手机上的聊天 App「DroidAgent」里和你对话，看着你的每一步；大多数人看不懂命令行。
 - 用户用什么语言提问，就用什么语言回答。
-- 执行命令、操作手机，一律用 MCP 服务 \`${BRIDGE_SERVER}\` 的 \`shell\` 工具；写文件用它的 \`write_file\` 工具。它们会按用户选的执行模式自动放行，或者先在 App 里请用户确认。
-- 你自带的命令和写文件工具在这里没法请用户确认，需要确认时会被直接拒绝。被拒绝后不要重复尝试，改用上面两个工具。
-- 调用 \`shell\` 时，description 一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「打开微信」，不要把命令本身写进去。
-- 读文件优先用你自带的读取工具；读不了（比如文件不在工作目录里）就用 \`shell\` 执行 cat。
-- 下面的「手机环境说明」原本是写给 Claude Code 的：里面说的 Bash 工具就是这里的 \`shell\`，Read 就是你自带的读取工具，形如 mcp__名字__工具 的是对应 MCP 服务的工具。
+- 用你自带的工具执行命令、读写文件。需要确认的步骤，App 会按用户选的执行模式自动放行，或者先请用户确认；被拒绝了就不要换个办法重试同一件事，先问用户。
+- 下面的「手机环境说明」原本是写给 Claude Code 的：里面说的 Bash 工具就是你执行命令的工具，Read、Write、Edit 是你读写文件的工具，形如 mcp__名字__工具 的是对应 MCP 服务的工具。
 - 安装技能时，SKILL.md 放在 \`~/.claude/skills/<技能名>/SKILL.md\`，App 会把它同步给你。`;
 const PHONE_GUIDE_FILE = join(homedir(), '.claude', 'CLAUDE.md');
 function agyPreamble() {
@@ -689,7 +686,7 @@ function agyPreamble() {
 	return [
 		AGY_PROMPT,
 		guide && `# 手机环境说明\n${guide}`,
-		notesPrompt(`用 \`${BRIDGE_SERVER}\` 的 \`remember\` 工具往笔记里加一条（改写或删除旧条目用 \`write_file\` 重写整份笔记）`),
+		notesPrompt('用你写文件的工具往笔记里加一条（这份笔记不用确认）'),
 		loadMemory(),
 		loadSystemPromptAppend(),
 	].filter(Boolean).join('\n\n');
@@ -885,7 +882,7 @@ async function startRuntime(id) {
 	const handle = backend === 'agy'
 		? agy.open({
 			tag, cwd: CWD, settings, conversation: sess.agyConversationId || null,
-			preamble: agyPreamble, prepareTurn: prepareAgy, turnEnv: () => ({ DROIDAGENT_SESSION: id }),
+			preamble: agyPreamble, prepareTurn: prepareAgy, canUseTool,
 		})
 		: await claude.open({
 			tag, cwd: CWD, settings, resume: sess.claudeSessionId || null, canUseTool,
@@ -896,7 +893,7 @@ async function startRuntime(id) {
 
 	rt = {
 		pushUser: handle.send, end: handle.close, q: handle.control, pending, running: false, assistantText: '', lastActive: Date.now(),
-		chatSpec: handle.spec, backend, canUseTool, jobs: new Set(),
+		chatSpec: handle.spec, backend,
 	};
 	runtimes.set(id, rt);
 	const started = rt;
@@ -2297,18 +2294,6 @@ const agy = createAgyBackend({
 	stateDir: dirname(MEMORY_FILE), cacheDir: join(homedir(), '.cache', 'droidagent'),
 });
 
-// ---------------------------------------------------------------- our tools, for Antigravity
-// A headless agy run cannot ask before it acts. So commands and file writes are offered to it
-// as MCP tools of ours (agy_bridge.mjs, started by agy): each call comes back here and goes
-// through the conversation's own policy and confirmation cards, exactly as Claude's steps do.
-// The token is new on every start and reaches the bridge through agy's MCP configuration.
-const BRIDGE_TOKEN = randomBytes(24).toString('hex');
-const BRIDGE_URL = `http://127.0.0.1:${PORT}`;
-const tokenMatches = (t) => {
-	const a = Buffer.from(String(t || ''));
-	const b = Buffer.from(BRIDGE_TOKEN);
-	return a.length === b.length && timingSafeEqual(a, b);
-};
 // Before every Antigravity turn: its MCP list, approvals and skills follow the app's.
 // One plugin store for both (backends/shared_plugins.mjs): Claude plugins' skills and connectors
 // are offered to Antigravity too, and Antigravity plugins' to Claude.
@@ -2317,101 +2302,11 @@ async function prepareAgy() {
 	const fromPlugins = await claudePluginsForAgy(claudePlugins).catch(() => ({ skills: [], connectors: {} }));
 	await agy.prepare({
 		mode: settings.mode, connectors: { ...fromPlugins.connectors, ...await loadMcpServers() }, skillsDir: SKILLS_DIR,
-		bridge: { url: BRIDGE_URL, token: BRIDGE_TOKEN }, pluginSkills: fromPlugins.skills, pluginRoots: claudePlugins.map((p) => p.root),
+		pluginSkills: fromPlugins.skills, pluginRoots: claudePlugins.map((p) => p.root),
 	});
 }
 const AGY_PLUGIN_WRAPPERS = join(dirname(MEMORY_FILE), 'agy-plugins');
 const agyPluginsForClaudeNow = () => agyPluginsForClaude(join(homedir(), '.gemini'), AGY_PLUGIN_WRAPPERS).catch((e) => { log('[plugins] agy plugins for Claude:', e?.message); return []; });
-function killGroup(child) {
-	try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
-	setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 3000).unref();
-}
-function killBridgeJobs(rt) {
-	for (const c of rt?.jobs || []) killGroup(c);
-}
-const BRIDGE_OUTPUT_MAX = 60000;
-function bridgeShell(rt, command, timeoutMs) {
-	return new Promise((resolve) => {
-		const limit = Math.min(Math.max(Number(timeoutMs) || 120000, 1000), 30 * 60 * 1000);
-		let out = '';
-		let cut = 0;
-		let timedOut = false;
-		const child = spawn('bash', ['-c', command], { cwd: CWD, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-		rt.jobs.add(child);
-		const add = (d) => {
-			out += d.toString('utf8');
-			// The start and the end both matter; the middle of a flood does not.
-			if (out.length > BRIDGE_OUTPUT_MAX * 2) { cut += out.length - BRIDGE_OUTPUT_MAX * 1.5; out = out.slice(0, BRIDGE_OUTPUT_MAX / 2) + out.slice(-BRIDGE_OUTPUT_MAX); }
-		};
-		child.stdout.on('data', add);
-		child.stderr.on('data', add);
-		const timer = setTimeout(() => { timedOut = true; killGroup(child); }, limit);
-		const done = (code, signal, error) => {
-			clearTimeout(timer);
-			rt.jobs.delete(child);
-			let text = out.length > BRIDGE_OUTPUT_MAX ? `${out.slice(0, BRIDGE_OUTPUT_MAX / 2)}\n…（中间省略了一部分输出）…\n${out.slice(-BRIDGE_OUTPUT_MAX / 2)}` : out;
-			if (cut && out.length <= BRIDGE_OUTPUT_MAX) text += '\n…（输出太长，中间省略了一部分）';
-			text = text.replace(/\s+$/, '');
-			if (error) text += `\n无法执行：${error.message}`;
-			else if (timedOut) text += `\n（超过 ${Math.round(limit / 1000)} 秒，已终止）`;
-			else if (signal) text += `\n（被信号 ${signal} 终止）`;
-			else if (code) text += `\n（退出码 ${code}）`;
-			resolve({ ok: !error && !timedOut && !signal && code === 0, text: text.trim() });
-		};
-		child.on('error', (e) => done(null, null, e));
-		child.on('close', (code, signal) => done(code, signal));
-	});
-}
-async function bridgeCall({ token, sessionId, tool, arguments: args }) {
-	if (!tokenMatches(token)) return { ok: false, text: '这次调用没有通过验证' };
-	let id = String(sessionId || '');
-	let rt = runtimes.get(id);
-	if (!rt || rt.backend !== 'agy') {
-		// The conversation's id did not come through: the one Antigravity turn in progress, if it is the only one.
-		const live = [...runtimes.entries()].filter(([, r]) => r.backend === 'agy' && r.running);
-		if (live.length !== 1) return { ok: false, text: '找不到这次调用属于哪个对话' };
-		[id, rt] = live[0];
-	}
-	if (!rt.running) return { ok: false, text: '这个对话现在没有在进行的任务' };
-	const a = args && typeof args === 'object' ? args : {};
-	const decide = async (name, input) => {
-		const d = await rt.canUseTool(name, input);
-		if (d.behavior === 'allow') return null;
-		if (d.interrupt) interruptTurn(id); // "stop" on the card ends the turn, as it does for Claude
-		return { ok: false, text: d.message || '用户拒绝了这个操作' };
-	};
-	if (tool === 'shell') {
-		const command = String(a.command || '');
-		if (!command.trim()) return { ok: false, text: '没有给出要执行的命令' };
-		const refused = await decide('Bash', { command, description: a.description ? String(a.description) : undefined });
-		if (refused) return refused;
-		if (runtimes.get(id) !== rt || !rt.running) return { ok: false, text: '任务已经停止' };
-		return bridgeShell(rt, command, a.timeout_ms);
-	}
-	if (tool === 'write_file') {
-		const file = String(a.path || '');
-		if (!file.startsWith('/')) return { ok: false, text: '请给出文件的绝对路径' };
-		const content = String(a.content ?? '');
-		const refused = await decide('Write', { file_path: file, content });
-		if (refused) return refused;
-		await mkdir(dirname(file), { recursive: true });
-		await writeFile(file, content, 'utf8');
-		return { ok: true, text: `已写入 ${file}（${Buffer.byteLength(content)} 字节）` };
-	}
-	if (tool === 'remember') {
-		// The assistant's own notes: written in every mode, as for Claude.
-		const note = String(a.note || '').replace(/\s*\n\s*/g, ' ').trim().replace(/^-\s*/, '');
-		if (!note) return { ok: false, text: '没有给出要记的内容' };
-		let text = '';
-		try { text = await readFile(MEMORY_FILE, 'utf8'); } catch { /* the first one */ }
-		await mkdir(dirname(MEMORY_FILE), { recursive: true });
-		await writeFile(MEMORY_FILE, `${text.replace(/\n*$/, text ? '\n' : '')}- ${note}\n`, 'utf8');
-		broadcast({ type: 'tool_note', sessionId: id, name: 'remember', title: '记一条经验笔记', auto: true });
-		return { ok: true, text: '已记下' };
-	}
-	return { ok: false, text: `没有这个工具：${tool}` };
-}
-
 // Who is signed in, for the page: either account is enough to chat.
 async function authState() {
 	const [c, a] = [await isLoggedIn(), agy.loggedIn()];
@@ -2437,8 +2332,11 @@ async function settleModel() {
 // ---------------------------------------------------------------- login (pty)
 let login = null;
 let loginRequest = 0;
-// `provider`: 'claude' (`claude auth login`, login_pty.py) or 'agy' (agy's own sign-in, agy_login_pty.py).
-// Both scripts speak the same lines, so the page shows one flow for the two.
+// `provider`: 'claude' (`claude auth login`, login_pty.py) or 'agy' (backends/agy_oauth.mjs).
+// Both speak to the page the same way, so it shows one flow for the two.
+let agySignIn = null;
+const AGY_ACCOUNT_FILE = join(dirname(MEMORY_FILE), 'agy-account.json');
+const agyAccount = () => { try { return JSON.parse(readFileSync(AGY_ACCOUNT_FILE, 'utf8')); } catch { return {}; } };
 async function startLogin(provider = 'claude') {
 	cancelLogin();
 	const request = ++loginRequest;
@@ -2456,17 +2354,28 @@ async function startLogin(provider = 'claude') {
 	if (request !== loginRequest) return;
 	if (route.changed) status(`已自动改用本机代理 ${route.proxy}`, { proxy: route.proxy, kind: 'ok' });
 	else if (!route.ok) status(`连不上 ${net.name} 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方填写代理软件的 HTTP 端口。`, { kind: 'warn' });
-	let child;
 	if (provider === 'agy') {
-		const e = agy.env();
-		child = spawn('python3', [join(HERE, 'agy_login_pty.py')], {
-			stdio: ['pipe', 'pipe', 'pipe'],
-			env: {
-				...process.env, AGY_BIN: agy.find() || '', AGY_TOKEN_FILE: agy.paths.TOKEN_FILE,
-				AGY_ENV: JSON.stringify({ DBUS_SESSION_BUS_ADDRESS: e.DBUS_SESSION_BUS_ADDRESS, AGY_CLI_DISABLE_AUTO_UPDATE: e.AGY_CLI_DISABLE_AUTO_UPDATE }),
+		agySignIn = startSignIn({
+			tokenFile: agy.paths.TOKEN_FILE, proxy: readProxySetting() || null, log,
+			onStatus: (text) => status(text, { kind: 'cli' }),
+			onDone: async (err, result) => {
+				if (request !== loginRequest) return;
+				agySignIn = null;
+				if (err) { log('[agy-login]', err.message); return fail(err.message); }
+				await writeFile(AGY_ACCOUNT_FILE, JSON.stringify({ email: result.email || '', at: Date.now() }), 'utf8').catch(() => {});
+				log('[agy-login] signed in', result.email ? 'as ' + result.email.replace(/^(.).*@/, '$1…@') : '');
+				broadcast({ type: 'login_done', ok: true, message: '', provider });
+				restartRuntimesWhenIdle();
+				usageCache = { t: 0, data: null };
+				agy.models({ fresh: true }).then(() => broadcast({ type: 'agy_updated' }));
+				settleModel().catch((e) => log('[login] model:', e?.message)).then(broadcastAuth);
 			},
 		});
-	} else {
+		broadcast({ type: 'login_url', url: agySignIn.url, mode: 'auto', provider });
+		return;
+	}
+	let child;
+	{
 		const rt = await claudeRuntime();
 		if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
 		// The program chat uses first, then anything else that starts. With nothing that passed
@@ -2531,12 +2440,14 @@ async function startLogin(provider = 'claude') {
 }
 // Replacing or cancelling a login on purpose must not surface as "login failed" in the UI.
 function cancelLogin() {
+	if (agySignIn) { agySignIn.cancel(); agySignIn = null; }
 	if (!login) return;
 	login.cancelled = true;
 	try { login.kill('SIGKILL'); } catch { /* */ }
 	login = null;
 }
 function sendLoginCode(code) {
+	if (agySignIn) return agySignIn.submit(code);
 	if (login && login.stdin.writable) { login.stdin.write(String(code).trim() + '\n'); return true; }
 	return false;
 }
@@ -3420,7 +3331,13 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/commands' && req.method === 'GET') {
 			const sid = url.searchParams.get('sessionId') || activeSessionId;
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
-			if (backendOf(settings.model) === 'agy') return json(res, { ok: true, commands: await slashCommandsWith(AGY_SLASH_COMMANDS) });
+			if (backendOf(settings.model) === 'agy') {
+				const art = sid && runtimes.get(sid);
+				let live = [];
+				if (art?.backend === 'agy') live = await art.q.supportedCommands().catch(() => []);
+				const have = new Set(AGY_SLASH_COMMANDS.map((c) => c.name));
+				return json(res, { ok: true, commands: await slashCommandsWith([...AGY_SLASH_COMMANDS, ...live.filter((c) => !have.has(c.name))]) });
+			}
 			const rt = (sid && runtimes.get(sid)) || anyRuntime();
 			if (!rt && sid && url.searchParams.get('probe')) {
 				ensureRuntime(sid)
@@ -3560,7 +3477,10 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/agy/status' && req.method === 'GET') {
 			const st = await agy.status();
 			const m = st.installed && st.loggedIn ? await agy.models({ fresh: url.searchParams.get('fresh') === '1' }) : { models: [] };
-			return json(res, { ok: true, ...st, models: m.models.map((x) => ({ id: AGY_PREFIX + x.slug, name: x.label })), modelsError: m.error || null });
+			// The thinking levels agy offers for the model in use, read from a live conversation when there is one.
+			const live = [...runtimes.values()].find((r) => r.backend === 'agy' && r.q?.options);
+			const levels = live ? levelsOf(configOption(live.q.options(), 'thought_level')) : [];
+			return json(res, { ok: true, ...st, email: st.loggedIn ? agyAccount().email || '' : '', levels, models: m.models.map((x) => ({ id: AGY_PREFIX + x.slug, name: x.label })), modelsError: m.error || null });
 		}
 		if (path === '/api/agy/install' && req.method === 'POST') {
 			const { force } = await body(req);
@@ -3573,6 +3493,7 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/api/agy/logout' && req.method === 'POST') {
 			await agy.logout();
+			await rm(AGY_ACCOUNT_FILE, { force: true });
 			// A turn in progress would carry on with the login it started with.
 			for (const [id, rt] of [...runtimes]) if (rt.backend === 'agy') { forgetQueue(id); broadcastQueue(id); teardownRuntime(id); }
 			await settleModel().catch(() => {});
@@ -3586,15 +3507,6 @@ const server = createServer(async (req, res) => {
 			if (r.ok) restartRuntimesWhenIdle();
 			return json(res, r);
 		}
-		// A tool call from agy_bridge.mjs. It may wait a long time: for the owner's answer, then for the command.
-		if (path === '/api/agy-bridge/call' && req.method === 'POST') {
-			const b = await body(req);
-			req.setTimeout(0); res.setTimeout(0);
-			let r;
-			try { r = await bridgeCall(b); } catch (e) { log('[bridge]', e?.stack || e); r = { ok: false, text: `出错了：${e?.message || e}` }; }
-			return json(res, { ok: !!r.ok, text: String(r.text ?? '') });
-		}
-
 		// ---- Fonts (fetched slice by slice on first use, then served from disk) ----
 		const fm = path.match(/^\/fonts\/([a-z0-9-]+)\/(.+)$/);
 		if (fm && req.method === 'GET') {
