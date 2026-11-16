@@ -13,7 +13,7 @@
 //   anything else          echoed back in two chunks: "echo(<model>/<level>): <text>"
 // Signed out (no token file, or FAKE_AGY_LOGGED_OUT): session requests fail with -32000.
 // FAKE_AGY_LOG: one JSON line per prompt (and per one-off run) for the tests to read.
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
 import { appendFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -95,7 +95,49 @@ async function prompt(id, p) {
 		await say(sid, ['planned']);
 		return done('end_turn');
 	}
-	if (last.startsWith('think: ')) {
+	// One call to an MCP server the client gave this session, the way agy makes it.
+function mcpCall(s, server, tool, args) {
+	return new Promise((resolve, reject) => {
+		const cfg = s.mcp.find((m) => m.name === server);
+		if (!cfg) return reject(new Error(`no MCP server ${server}`));
+		const env = { ...process.env, ...Object.fromEntries((cfg.env || []).map((e) => [e.name, e.value])) };
+		const child = spawn(cfg.command, cfg.args || [], { env, stdio: ['pipe', 'pipe', 'inherit'] });
+		const rl2 = createInterface({ input: child.stdout });
+		const out = (o) => child.stdin.write(JSON.stringify(o) + '\n');
+		rl2.on('line', (line) => {
+			const m = JSON.parse(line);
+			if (m.id === 1) { out({ jsonrpc: '2.0', method: 'notifications/initialized' }); out({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: tool, arguments: args } }); }
+			if (m.id === 2) { child.stdin.end(); resolve(m.result || { isError: true, content: [{ type: 'text', text: m.error?.message }] }); }
+		});
+		child.on('error', reject);
+		out({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fake-agy', version: '0' } } });
+	});
+}
+async function mcpStep(sid, s, tool, args) {
+	const tc = { toolCallId: `t${seq++}`, title: tool, kind: 'other', status: 'in_progress', rawInput: { ServerName: 'droidagent', ToolName: tool, Arguments: args }, name: 'call_mcp_tool' };
+	update(sid, { sessionUpdate: 'tool_call', ...tc });
+	const r = await mcpCall(s, 'droidagent', tool, args);
+	const text = (r.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+	update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: r.isError ? 'failed' : 'completed', content: [{ type: 'content', content: { type: 'text', text } }] });
+	return { text, images: (r.content || []).filter((c) => c.type === 'image').length };
+}
+
+if (last.startsWith('ask: ')) {
+	// ask: question|option1|option2
+	const [question, ...options] = last.slice(5).split('|');
+	const r = await mcpStep(sid, s, 'ask_user', { questions: [{ question, header: '选择', options: options.map((label) => ({ label, description: '' })), multiSelect: false }] });
+	await say(sid, ['You said: ', r.text]);
+	return done('end_turn');
+}
+if (last.startsWith('tool: ')) {
+	// tool: <name> <json args> — any of the app's tools, its answer echoed
+	const rest = last.slice(6);
+	const sp = rest.indexOf(' ');
+	const r = await mcpStep(sid, s, sp < 0 ? rest : rest.slice(0, sp), sp < 0 ? {} : JSON.parse(rest.slice(sp + 1)));
+	await say(sid, [`${r.text}${r.images ? ` [${r.images} image]` : ''}`]);
+	return done('end_turn');
+}
+if (last.startsWith('think: ')) {
 		update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `first thought about ${last.slice(7)}` } });
 		update(sid, { sessionUpdate: 'tool_call', toolCallId: `t${seq++}`, title: 'List /sdcard', kind: 'read', status: 'completed', locations: [{ path: '/sdcard' }], rawInput: { DirectoryPath: '/sdcard' }, name: 'list_dir', content: [{ type: 'content', content: { type: 'text', text: 'a\nb' } }] });
 		update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'I should' } });
@@ -156,16 +198,16 @@ rl.on('line', (line) => {
 		case 'session/new': {
 			if (!signedIn()) return send({ jsonrpc: '2.0', id: m.id, error: noAuth });
 			const sessionId = `sess-${process.pid}-${seq++}`;
-			const s = { model: 'gemini-3.8-flash', level: 'high' };
+			const s = { model: 'gemini-3.8-flash', level: 'high', mcp: p.mcpServers || [] };
 			sessions.set(sessionId, s);
-			note({ acp: true, newSession: sessionId, cwd: p.cwd, argv });
+			note({ acp: true, newSession: sessionId, cwd: p.cwd, argv, mcp: (p.mcpServers || []).map((m) => m.name) });
 			ok({ sessionId, configOptions: options(s) });
 			setTimeout(() => update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compress', description: 'Shorten the conversation' }, { name: 'plan', description: 'Plan first', input: { hint: 'task' } }] }), 5);
 			return;
 		}
 		case 'session/resume': {
 			if (!signedIn()) return send({ jsonrpc: '2.0', id: m.id, error: noAuth });
-			const s = { model: 'gemini-3.8-flash', level: 'high' };
+			const s = { model: 'gemini-3.8-flash', level: 'high', mcp: p.mcpServers || [] };
 			sessions.set(p.sessionId, s);
 			note({ acp: true, resumed: p.sessionId, argv });
 			return ok({ configOptions: options(s) });

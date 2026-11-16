@@ -154,6 +154,8 @@ debian retools                               装逆向分析工具链
 | 插件 | 扩展与插件 → 插件，和 Antigravity 共用（`claude plugin`） | 同一页（`agy plugin`）。两边插件里的技能和连接器互相可用：Claude 插件的技能链接到 `~/.gemini/skills`、连接器写进 agy 的 MCP 配置；agy 插件生成一个本地 Claude 插件（`~/.droidagent/agy-plugins/`）交给 Agent SDK。Claude 插件的命令、子代理、hooks 和 agy 插件的规则不互通 |
 | 斜杠命令 | Claude Code 的全部命令 | App 自己的命令、各个技能，以及 agy 通过 ACP 报给 App 的它自己的命令 |
 | 思考过程 | 显示摘要 | ACP 实时推送的思考内容（`agent_thought_chunk`），和 Claude 一样边想边显示 |
+| 反问 | Claude Code 的 `AskUserQuestion`，App 弹出选择框，答案作为工具输入的 `answers` 交回 | App 提供的 `ask_user` 工具（`app/server/agent_tools.mjs`，通过 ACP 的 `mcpServers` 传给每段对话），同一个选择框 |
+| 浏览器 | App 提供的 `browser_*` 工具（同上） | 同一组工具，两边共用一个浏览器 |
 
 同一段对话可以换到另一个账号的模型继续，但两边各记各的：接手的一方看不到另一方做过的事，对话里会有一行说明。
 
@@ -163,12 +165,20 @@ App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json`
 
 测试（不需要手机、账号和真正的 agy，用 `tests/fake-agy.mjs` 模拟）：`node --test tests/*.test.mjs`。
 
+## 助手的附加能力
+
+- **反问**：两边的反问都汇到同一个选择框（单选 / 多选 / 其他 / 跳过），回答前对话暂停。
+- **内置浏览器**（`app/server/browser.mjs`）：chroot 里的 Chromium 以无头方式运行，用 Chrome DevTools 协议驱动，按手机尺寸（412×860）渲染。助手的工具 `browser_open / read / click / type / scroll / back / screenshot` 由 `app/server/agent_tools.mjs` 这个本地 MCP 服务提供；它只接受带本次启动随机令牌的请求。你在 App 里看到的是浏览器的实时画面（MJPEG），点按和输入会转发给浏览器。第一次使用时用 apt 装 `chromium` 和中文字体；15 分钟没人用、也没人在看就自动关掉。
+- **搜索来源**（`app/server/sources.mjs`）：从 WebSearch 的链接列表、WebFetch 和浏览器打开的网址、其他工具输出里的链接中提取来源，去重后挂在这一轮回答下面。
+- **思考翻译**：展开思考时调用 `/api/translate`，Claude 对话用 Haiku、Antigravity 对话用当前的 agy 模型翻译成中文；已经是中文的不翻译，结果缓存在 `~/.claude/agent-translations.json`。
+- **改动和图片**：Edit / Write 等工具的输入转成行级差异显示；工具返回的图片存到 `~/.droidagent/media/`，经 `/api/media/` 显示。
+
 ## 配置
 
 - **代理**（访问 Anthropic 或 Google）：登录前自动检测；检测不到时在登录页手动填写（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录、对话、字体下载和自动更新都会使用）。
 - **执行模式**（输入框左下角）：Ask（只读操作直接做，其余逐步确认）、Accept edits（自动改文件和跑常规命令，有风险的先问，默认）、Plan（只读分析，先出计划，同意后执行）、Auto（只有刷机、重启、格式化等高危操作才问）、Full access（不再询问，切换时确认一次）。
 - **系统提示词 / 技能 / MCP**：在 App 的设置里管理，下一条消息生效。内置 8 个安卓常用技能（手机体检、存储清理、应用管理、屏幕自动化、日志诊断、网络诊断、APK 分析、备份与恢复），首次启动自动启用；关掉或改过的不会被更新覆盖。
-- **外观**：设置 → 外观 里选主题、字体和聊天背景。背景有 14 张预设（原创动漫风场景和渐变、歌川广重浮世绘、梵高名画、NASA 极光照片，均为原创或公有领域，来源见 `tools/background_photos.py`），也可以用自己的图片，都带可调遮罩。输入框是液态玻璃效果。字体第一次使用时按需下载用到的字，之后缓存在 `~/.claude/fonts`。
+- **外观**：设置 → 外观 里选主题、字体和聊天背景。背景有 14 张预设（原创动漫风场景和渐变、歌川广重浮世绘、梵高名画、NASA 极光照片，均为原创或公有领域，来源见 `tools/background_photos.py`），也可以用自己的图片，都带可调遮罩。字体第一次使用时按需下载用到的字，之后缓存在 `~/.claude/fonts`。
 - **扩展市场**：设置 → 助手 → 扩展市场（或 `/market`）。技能和连接器的精选目录在 `app/server/catalog/`（`app/` 下只有 `server`、`web`、`skills` 会同步到手机）；插件通过官方 `claude plugin` 命令安装，下载后默认不启用，列出内容经确认才启用，因为插件的 hooks 和本地命令会以 root 运行。关闭的技能放在 `~/.claude/skills-disabled/`，和 Claude 一起创建的技能草稿放在 `~/.claude/skill-drafts/`。市场逻辑的测试：`node --test tests/market.test.mjs`。
 - **斜杠命令**：输入 `/` 列出全部命令。Claude Code 终端界面里才有的 `/status`、`/usage`、`/doctor` 等由 App 自己实现；`/compact`、`/context`、`/cost`、`/init` 和自定义命令、技能交给 Claude Code，输出显示在对话里。
 - **对话标题**：第一次回复之后，用一次 Haiku 调用根据对话内容生成标题；手动改过名的不会被覆盖。
@@ -184,7 +194,7 @@ App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json`
 |---|---|
 | `apk/` | 原生 APK（`build.py` 纯脚本构建，不依赖 Gradle）、源码、资源；`apk/assets/setup/` 是首次启动的进度页面 |
 | `brand/` | 图标源文件（`icon.svg`）和重新生成 PNG 图标的脚本 |
-| `app/server/` | Node 后端 `server.mjs`（Agent SDK + HTTP/SSE）、OAuth 登录 pty |
+| `app/server/` | Node 后端 `server.mjs`（HTTP/SSE、会话、权限）、`backends/`（Claude 和 agy 两个后端）、`agent_tools.mjs`（反问和浏览器工具）、`browser.mjs`（内置浏览器）、`sources.mjs`（来源提取） |
 | `app/web/` | PWA 前端（聊天界面、悬浮窗面板） |
 | `phone/debian` | 安卓侧启动器脚本（挂载 / chroot / 管理后端） |
 | `phone/overlay/` | 叠加进 rootfs 的内容：工具（ashell/droid/pdata/clip）、agent 的 `CLAUDE.md`、设备档案模板 |

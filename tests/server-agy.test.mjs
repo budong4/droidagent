@@ -5,7 +5,7 @@
 // plugins, signing out.
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -70,6 +70,7 @@ before(async () => {
 		env: {
 			HOME: home, PATH: `${bin}:/usr/bin:/bin`, AGENT_PORT: String(port), AGENT_CWD: work, AGENT_PROXY_FILE: join(home, 'proxy.env'),
 			DROIDAGENT_NO_UPDATE: '1', AGENT_AGY_BIN: join(HERE, 'fake-agy.mjs'), FAKE_AGY_LOG: agyLog, AGENT_BG_DIR: join(home, 'bg'),
+			AGENT_CHROMIUM: process.env.AGENT_CHROMIUM || '/usr/bin/google-chrome', AGENT_BROWSER_IDLE_MS: '600000',
 			AGY_OAUTH_TOKEN_URL: `${google.base}/token`, AGY_OAUTH_USERINFO_URL: `${google.base}/userinfo`, AGY_OAUTH_PORT: String(oauthPort),
 		},
 		stdio: ['ignore', 'pipe', 'pipe'],
@@ -99,10 +100,15 @@ before(async () => {
 	})().catch(() => {});
 	await waitFor((e) => e.type === 'auth');
 });
-after(() => {
+after(async () => {
+	await api('/api/browser/stop', {}).catch(() => {});
 	server?.kill('SIGKILL');
 	google?.close();
-	rmSync(home, { recursive: true, force: true });
+	// Chromium can still be flushing its profile for a moment after the server is gone.
+	try { execFileSync('pkill', ['-KILL', '-f', `--user-data-dir=${join(home, '.droidagent', 'browser-profile')}`]); } catch { /* none left */ }
+	for (let i = 0; ; i++) {
+		try { rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); break; } catch (e) { if (i > 10) throw e; await new Promise((r) => setTimeout(r, 300)); }
+	}
 });
 
 test('nobody is signed in; then an Antigravity login appears', async () => {
@@ -345,4 +351,85 @@ test('signing in to Antigravity: the link, the browser coming back to the phone,
 	await api('/api/login/start', { provider: 'agy' });
 	await api('/api/login/cancel', {});
 	await assert.rejects(fetch(`http://127.0.0.1:${oauthPort}/oauth-callback?code=x`));
+});
+
+test('Antigravity asks the owner a question: a sheet with choices, the answer goes back to it', async () => {
+	await api('/api/settings', { model: 'agy:gemini-3.8-flash', modelName: 'Gemini 3.8 Flash', mode: 'default' });
+	const id = await newSession();
+	const from = events.length;
+	await api('/api/send', { text: 'ask: 清理哪些文件？|只清缓存|缓存和下载', sessionId: id });
+	const q = await waitFor((e) => e.type === 'question' && e.sessionId === id, { from });
+	assert.deepEqual(q.questions, [{ question: '清理哪些文件？', header: '选择', multiSelect: false, options: [{ label: '只清缓存', description: '' }, { label: '缓存和下载', description: '' }] }]);
+	assert.ok(!events.slice(from).some((e) => e.type === 'permission'), 'asking is not a step that needs approval, even in Ask mode');
+	assert.deepEqual(await api('/api/answer', { id: q.id, sessionId: id, answers: { '清理哪些文件？': '只清缓存' } }), { ok: true });
+	const done = await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
+	assert.equal(done.ok, true);
+	const reply = events.slice(from).filter((e) => e.type === 'assistant_delta' && e.sessionId === id).map((e) => e.text).join('');
+	assert.match(reply, /清理哪些文件？\n→ 只清缓存/);
+	assert.ok(!events.slice(from).some((e) => e.type === 'tool_use' && e.sessionId === id && e.name !== 'mcp__droidagent__ask_user'));
+	const saved = await storedWhen(id, (x) => x.messages.some((m) => m.role === 'ask' && m.verdict));
+	assert.deepEqual(saved.messages.find((m) => m.role === 'ask').answers, { '清理哪些文件？': '只清缓存' });
+	// Skipped: the assistant hears so.
+	const from2 = events.length;
+	await api('/api/send', { text: 'ask: 继续吗？|继续|算了', sessionId: id });
+	const q2 = await waitFor((e) => e.type === 'question' && e.sessionId === id, { from: from2 });
+	await api('/api/answer', { id: q2.id, sessionId: id });
+	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from: from2 });
+	assert.match(events.slice(from2).filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), /跳过/);
+	// The tool server refuses a caller without the token.
+	const r = await api('/api/agent-tools/call', { token: 'nope', sessionId: id, tool: 'ask_user', arguments: {} });
+	assert.deepEqual(r, { ok: false, text: '这次调用没有通过验证' });
+	await api('/api/settings', { mode: 'acceptEdits' });
+});
+
+test('thinking translated into Chinese by the model in use, once, and not when it already is', async () => {
+	const id = await newSession();
+	await say(id, 'hello');
+	const en = 'Let me check the battery temperature first.';
+	const r = await api('/api/translate', { text: en, sessionId: id });
+	assert.equal(r.ok, true);
+	assert.match(r.text, /^echo: 你是翻译。[\s\S]*Let me check the battery temperature first\.$/, 'the one-off question carries the instruction and the text');
+	const before = runs().filter((x) => x.oneShot).length;
+	assert.deepEqual(await api('/api/translate', { text: en, sessionId: id }), r, 'the same text again: from the kept translations');
+	assert.equal(runs().filter((x) => x.oneShot).length, before);
+	assert.deepEqual(await api('/api/translate', { text: '先看一下电池温度，然后再决定。', sessionId: id }), { ok: true, text: '先看一下电池温度，然后再决定。', same: true });
+});
+
+const hasChromium = existsSync(process.env.AGENT_CHROMIUM || '/usr/bin/google-chrome');
+test('the built-in browser: the agent opens, reads, clicks and types; the owner watches it live', { skip: !hasChromium && 'no Chromium here' }, async () => {
+	const { createServer: httpServer } = await import('node:http');
+	const site = httpServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end('<!doctype html><title>Shop</title><h1>Welcome</h1><input placeholder="Search"><button onclick="document.title=\'pressed\'">Buy now</button>'); });
+	await new Promise((r) => site.listen(0, '127.0.0.1', r));
+	const url = `http://127.0.0.1:${site.address().port}/`;
+	try {
+		const id = await newSession();
+		let from = events.length;
+		const opened = await say(id, `tool: browser_open ${JSON.stringify({ url })}`);
+		const use = opened.events.find((e) => e.type === 'tool_use');
+		assert.deepEqual({ name: use.name, title: use.title, category: use.category }, { name: 'mcp__droidagent__browser_open', title: `打开 127.0.0.1`, category: '浏览器' });
+		assert.ok(!opened.events.some((e) => e.type === 'permission'), "the app's own tools are not asked about");
+		const text = opened.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join('');
+		assert.match(text, /标题：Shop[\s\S]*Welcome[\s\S]*\[1\] 输入框 Search[\s\S]*\[2\] 按钮 Buy now/);
+		assert.deepEqual(opened.result.sources, [{ title: 'Shop', url }]);
+		assert.ok(events.slice(from).some((e) => e.type === 'browser' && e.running && e.url === url), 'the page hears where the browser is');
+		const clicked = await say(id, 'tool: browser_click {"text":"buy now"}');
+		assert.match(clicked.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), /已点击「Buy now」[\s\S]*标题：pressed/);
+		const shot = await say(id, 'tool: browser_screenshot {}');
+		assert.match(shot.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), /\[1 image\]/);
+		// The owner's view: a multipart stream of JPEG frames.
+		const ctl = new AbortController();
+		const res = await fetch(base + '/api/browser/stream', { signal: ctl.signal });
+		assert.match(res.headers.get('content-type'), /multipart\/x-mixed-replace/);
+		const reader = res.body.getReader();
+		let got = Buffer.alloc(0);
+		while (got.indexOf(Buffer.from([0xff, 0xd8])) < 0) { const { value } = await reader.read(); got = Buffer.concat([got, Buffer.from(value)]); }
+		ctl.abort();
+		// And the owner's taps and typing reach it.
+		assert.deepEqual(await api('/api/browser/input', { type: 'navigate', url: url + '?q=1' }), { ok: true });
+		assert.equal((await api('/api/browser')).url, url + '?q=1');
+		from = events.length;
+	} finally {
+		await api('/api/browser/stop', {});
+		site.close();
+	}
 });

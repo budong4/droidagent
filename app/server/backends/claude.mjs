@@ -74,7 +74,9 @@ export function createClaudeMapper() {
 			for (const block of m.message?.content || []) {
 				if (block.type !== 'tool_result') continue;
 				const text = Array.isArray(block.content) ? block.content.map((c) => c.text || '').join('') : String(block.content ?? '');
-				yield { type: 'tool_result', id: block.tool_use_id, ok: !block.is_error, text };
+				// Pictures a step returned (a screenshot, an image it read), to show with the step.
+				const images = Array.isArray(block.content) ? block.content.filter((c) => c?.type === 'image' && c.source?.type === 'base64' && c.source.data).map((c) => ({ mime: c.source.media_type || 'image/png', data: c.source.data })) : [];
+				yield { type: 'tool_result', id: block.tool_use_id, ok: !block.is_error, text, ...(images.length ? { images } : {}) };
 			}
 		} else if (m.type === 'result') {
 			thinking = false; // stopped mid-thought: no block_stop will come

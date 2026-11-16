@@ -67,6 +67,14 @@ export function contentText(c) {
 	return '';
 }
 const PLAN_STATUS = { pending: 'pending', in_progress: 'in_progress', completed: 'completed' };
+// A file change in a step's content, as { diff: { path, old, new } }; pictures as [{ mime, data }].
+export function diffOf(content) {
+	const d = (Array.isArray(content) ? content : []).find((c) => c?.type === 'diff' && c.newText != null);
+	return d ? { diff: { path: String(d.path || ''), old: String(d.oldText ?? ''), new: String(d.newText ?? '') } } : {};
+}
+export function imagesOf(content) {
+	return (Array.isArray(content) ? content : []).map((c) => (c?.type === 'content' ? c.content : c)).filter((c) => c?.type === 'image' && c.data).map((c) => ({ mime: c.mimeType || 'image/png', data: c.data }));
+}
 
 // A step as the cards and the policy know steps: Claude Code's tool names and arguments.
 // `normalize(name, rawInput)` is agy's own tool-name mapping (antigravity.mjs).
@@ -100,7 +108,8 @@ const withPath = (t, path) => (path && t.input && 'file_path' in t.input && !t.i
 // `spawnSpec`: { bin, args, env }. `settings` is the live object (model, effort, mode), read at
 // every turn. `canUseTool(name, input)` is the app's policy and cards, as for Claude:
 // resolves { behavior: 'allow' | 'deny', interrupt? }.
-export function openAcp({ spawnSpec, cwd, tag, log, settings, conversation = null, systemPrompt, prepareTurn, canUseTool, normalize, modelSlug, errorText }) {
+// `mcpServers`: MCP servers for this session only, in ACP's shape (the app's own tools).
+export function openAcp({ spawnSpec, cwd, tag, log, settings, conversation = null, systemPrompt, prepareTurn, canUseTool, normalize, modelSlug, errorText, mcpServers = [] }) {
 	const ch = channel();
 	let child = null;
 	let buf = '';
@@ -179,13 +188,14 @@ export function openAcp({ spawnSpec, cwd, tag, log, settings, conversation = nul
 			const tool = toolOf(u, normalize);
 			t = { done: false, title: u.title, tool };
 			turn.tools.set(id, t);
-			ch.push({ type: 'tool_use', id, name: tool.name, input: tool.input });
+			ch.push({ type: 'tool_use', id, name: tool.name, input: tool.input, ...diffOf(u.content) });
 		}
 		const status = u.status;
 		if (!t.done && (status === 'completed' || status === 'failed')) {
 			t.done = true;
 			const out = contentText(u.content) || (u.rawOutput == null ? '' : typeof u.rawOutput === 'string' ? u.rawOutput : JSON.stringify(u.rawOutput));
-			ch.push({ type: 'tool_result', id, ok: status === 'completed', text: out || (status === 'failed' ? '这一步失败了' : '') });
+			const images = imagesOf(u.content);
+			ch.push({ type: 'tool_result', id, ok: status === 'completed', text: out || (status === 'failed' ? '这一步失败了' : ''), ...(images.length ? { images } : {}), ...diffOf(u.content) });
 		}
 	}
 
@@ -267,15 +277,15 @@ export function openAcp({ spawnSpec, cwd, tag, log, settings, conversation = nul
 			const sys = sysCap && systemPrompt ? { systemPrompt: systemPrompt() } : {};
 			let opened = null;
 			if (sessionId && caps.sessionCapabilities?.resume) {
-				opened = await Promise.race([request('session/resume', { sessionId, cwd, mcpServers: [], ...sys }), gone]).catch((e) => { log('[agy]', `[${tag}]`, 'resume failed:', e.message); return null; });
+				opened = await Promise.race([request('session/resume', { sessionId, cwd, mcpServers, ...sys }), gone]).catch((e) => { log('[agy]', `[${tag}]`, 'resume failed:', e.message); return null; });
 			} else if (sessionId && caps.loadSession) {
 				// Load replays the whole history as updates; with no turn under way they are not shown.
-				opened = await Promise.race([request('session/load', { sessionId, cwd, mcpServers: [], ...sys }), gone]).catch((e) => { log('[agy]', `[${tag}]`, 'load failed:', e.message); return null; });
+				opened = await Promise.race([request('session/load', { sessionId, cwd, mcpServers, ...sys }), gone]).catch((e) => { log('[agy]', `[${tag}]`, 'load failed:', e.message); return null; });
 			}
 			let fresh = false;
 			if (!opened) {
 				if (sessionId) ch.push({ type: 'notice', text: 'Antigravity 没能接上之前的这段对话，接下来它会从头开始。上面的记录都还在。' });
-				opened = await Promise.race([request('session/new', { cwd, mcpServers: [], ...sys }), gone]);
+				opened = await Promise.race([request('session/new', { cwd, mcpServers, ...sys }), gone]);
 				sessionId = opened?.sessionId;
 				fresh = true;
 				leadSent = false; // a new session knows nothing yet
