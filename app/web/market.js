@@ -509,11 +509,17 @@ async function loadPlugins(more = false) {
 	btn.disabled = false;
 	if (!paging) box.innerHTML = '';
 	if (!r.ok) {
-		const err = emptyMsg(`${r.error || '读取失败'}。请检查网络或代理。`);
+		const err = emptyMsg(`${String(r.error || '读取失败').replace(/[。.]$/, '')}。`);
 		const again = el('button', 'pill-btn market-retry', '重试');
 		again.addEventListener('click', () => loadPlugins());
 		err.appendChild(again);
+		box.appendChild(groupLabel('Claude 插件'));
 		box.appendChild(err);
+		// Claude Code's plugins being out of reach says nothing about Antigravity's.
+		if (curView() === 'installed' && typeof accounts !== 'undefined' && accounts.agy) {
+			loadAgyPlugins(box, seq);
+			box.appendChild(sharedNote());
+		}
 		return;
 	}
 	mk.pluginsLoaded = true;
@@ -521,8 +527,11 @@ async function loadPlugins(more = false) {
 	// What the server is doing now: a job that ended while the page was away must not linger.
 	mk.jobs = new Map((r.jobs || []).map((j) => [j.id, j]));
 	if (curView() === 'installed') {
+		box.appendChild(groupLabel('Claude 插件'));
 		if (r.installed.length) box.appendChild(listOf(r.installed.map(installedPluginRow)));
 		else box.appendChild(emptyMsg(mk.q ? '没有符合的插件' : '还没有安装插件'));
+		if (typeof accounts !== 'undefined' && accounts.agy) loadAgyPlugins(box, seq);
+		box.appendChild(sharedNote());
 		return;
 	}
 	if (!r.items.length && !mk.offset) box.appendChild(emptyMsg('没有符合的插件'));
@@ -533,6 +542,44 @@ async function loadPlugins(more = false) {
 	btn.classList.toggle('hidden', mk.offset + r.items.length >= r.total);
 	if (!paging) loadMarketplaces();
 	tickJobs();
+}
+
+// What carries over between the two agents, said once under the lists.
+const sharedNote = () => el('p', 'hint market-shared', '两边共用：插件里的技能和连接器（MCP）在 Claude 和 Antigravity 的对话里都能用。Claude 插件的命令、子代理和自动脚本只在 Claude 里生效，Antigravity 插件的规则只在 Antigravity 里生效。');
+
+// Antigravity's own plugins (agy plugin), in the same tab as Claude's.
+async function loadAgyPlugins(box, seq) {
+	const holder = el('div', 'agy-plugins');
+	holder.appendChild(groupLabel('Antigravity 插件'));
+	const list = spinner();
+	holder.appendChild(list);
+	box.insertBefore(holder, box.querySelector('.market-shared'));
+	const r = await getJSON('/api/agy/plugins');
+	if (seq !== mk.seq) return;
+	const rows = r.ok ? r.plugins.filter((p) => !mk.q || `${p.name} ${p.description}`.toLowerCase().includes(mk.q.toLowerCase())) : [];
+	list.replaceWith(!r.ok ? emptyMsg(r.error || '读取失败')
+		: rows.length ? listOf(rows.map((p) => marketRow({ title: p.name, sub: p.description, meta: p.version, badges: [['', 'Antigravity']] })))
+		: emptyMsg(mk.q ? '没有符合的插件' : '还没有安装 Antigravity 插件'));
+	holder.appendChild(agyPluginForm());
+}
+function agyPluginForm() {
+	const form = el('div', 'inline-form', '<input type="text" placeholder="Antigravity 插件名，或 https://github.com/作者/仓库" autocomplete="off" autocapitalize="off" spellcheck="false"><button class="pill-btn">安装</button>');
+	const input = $('input', form);
+	$('button', form).addEventListener('click', () => {
+		const source = input.value.trim();
+		if (!source) { input.focus(); return; }
+		showDialog({
+			title: '安装这个 Antigravity 插件？', msg: `${source}\n\n插件里的脚本和命令会以 root 身份在手机上运行。只安装你信任的来源。它的技能和连接器之后在 Claude 的对话里也能用。`, ok: '安装', danger: true,
+			onOk: async () => {
+				const btn = $('button', form);
+				busyButton(btn, '安装中');
+				const r = await api('/api/agy/plugins/install', { source });
+				toast(r.ok ? '已安装，下一条消息起两边都能用' : `没能安装：${r.error || '未知原因'}`);
+				if (onMarket() && mk.tab === 'plugins') loadPlugins();
+			},
+		});
+	});
+	return form;
 }
 
 const originBadge = (p) => (p.official ? ['', '官方目录'] : ['needs-auth', '第三方市场']);
@@ -695,6 +742,10 @@ function contentsHtml(c) {
 async function loadMarketplaces() {
 	const foot = $('#market-foot');
 	foot.innerHTML = '';
+	if (typeof accounts !== 'undefined' && accounts.agy) {
+		foot.appendChild(groupLabel('安装 Antigravity 插件'));
+		foot.appendChild(agyPluginForm());
+	}
 	foot.appendChild(groupLabel('添加其他插件市场'));
 	const form = el('div', 'inline-form', '<input id="market-source" type="text" placeholder="https 地址，或 GitHub 的 owner/repo" autocomplete="off" autocapitalize="off" spellcheck="false"><button class="pill-btn accent">添加</button>');
 	$('button', form).addEventListener('click', async (e) => {

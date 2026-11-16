@@ -521,20 +521,63 @@ function chooseMode(id) {
 }
 $('#btn-mode').addEventListener('click', (e) => { renderModeMenu(); openMenu('menu-mode', e.currentTarget); });
 
-/* ---------------- unified model & thinking sheet ---------------- */
+/* ---------------- model sheet: pick a model, then that model's own thinking levels ---------------- */
+// The levels each Claude model takes (my reading of what each accepts; anything unlisted gets
+// low/medium/high). Antigravity's come from the variants its CLI lists for that model.
+const CLAUDE_EFFORTS = {
+	opus: ['low', 'medium', 'high', 'xhigh', 'max'], sonnet: ['low', 'medium', 'high', 'xhigh', 'max'], fable: ['low', 'medium', 'high', 'xhigh', 'max'],
+	haiku: ['low', 'medium', 'high'], 'opus-5': ['low', 'medium', 'high', 'max'], 'sonnet-5': ['low', 'medium', 'high', 'max'], 'fable-5': ['low', 'medium', 'high', 'max'],
+	'opus-4.8': ['low', 'medium', 'high', 'max'], 'opus-4.7': ['low', 'medium', 'high', 'max'], 'opus-4.6': ['low', 'medium', 'high', 'max'], 'sonnet-4.6': ['low', 'medium', 'high'],
+	'haiku-4.5': [],
+};
+const claudeEfforts = (id) => CLAUDE_EFFORTS[id] ?? ['low', 'medium', 'high'];
 let modelSheetProvider = 'claude';
 let showMoreClaudeModels = false;
-function modelCard(id, name, desc, { badge = '', sel = false, onSelect } = {}) {
-	const b = el('button', 'model-card' + (sel ? ' sel' : ''));
-	b.innerHTML = `<div class="mc-main"><div class="mc-title"><span>${esc(name)}</span>${badge ? `<span class="badge builtin">${esc(badge)}</span>` : ''}</div>${desc ? `<div class="mc-sub">${esc(desc)}</div>` : ''}</div>${ic('i-check', 'mc-check')}`;
-	b.addEventListener('click', onSelect);
-	return b;
+// One model: its name and what it is for; once chosen, the thinking levels it takes, right under it.
+function modelCard({ name, desc = '', sel = false, efforts = [], effort = '', onSelect, onEffort }) {
+	const card = el('div', 'model-card' + (sel ? ' sel' : ''));
+	card.setAttribute('role', 'button');
+	card.tabIndex = 0;
+	card.innerHTML = `<div class="mc-main"><div class="mc-title"><span>${esc(name)}</span></div>${desc ? `<div class="mc-sub">${esc(desc)}</div>` : ''}</div>${ic('i-check', 'mc-check')}`;
+	card.addEventListener('click', (e) => { if (!e.target.closest('.mc-efforts')) onSelect(); });
+	if (sel && efforts.length > 1) {
+		const row = el('div', 'mc-efforts');
+		row.innerHTML = '<span class="mc-eff-label">思考</span>';
+		const seg = el('div', 'seg mc-seg');
+		for (const id of efforts) {
+			const b = el('button', id === effort ? 'sel' : '', esc(EFFORT_LABEL[id] || id));
+			b.addEventListener('click', () => onEffort(id));
+			seg.appendChild(b);
+		}
+		row.appendChild(seg);
+		card.appendChild(row);
+	} else if (sel && efforts.length === 1) {
+		card.querySelector('.mc-main').insertAdjacentHTML('beforeend', `<div class="mc-sub">思考：${esc(EFFORT_LABEL[efforts[0]] || efforts[0])}（固定）</div>`);
+	}
+	return card;
 }
 function signInModelCard(label, desc, provider) {
 	const b = el('button', 'model-card');
 	b.innerHTML = `<div class="mc-main"><div class="mc-title"><span>${esc(label)}</span></div><div class="mc-sub">${esc(desc)}</div></div>${ic('i-chev', 'chev')}`;
 	b.addEventListener('click', () => { closeLayer('sheet'); showLogin(provider, true); });
 	return b;
+}
+// A level this model takes, as close as possible to the one asked for.
+function nearestEffort(levels, want) {
+	if (!levels.length) return want;
+	if (levels.includes(want)) return want;
+	const order = ['low', 'medium', 'high', 'xhigh', 'max'];
+	const at = Math.max(0, order.indexOf(want));
+	return levels.reduce((best, l) => (Math.abs(order.indexOf(l) - at) < Math.abs(order.indexOf(best) - at) ? l : best), levels[0]);
+}
+function claudeCard(id, name, desc) {
+	const sel = !isAgyModel() && (SETTINGS.model === id || SETTINGS.modelName === name);
+	const efforts = claudeEfforts(id);
+	return modelCard({
+		name, desc, sel, efforts, effort: nearestEffort(efforts, SETTINGS.effort),
+		onSelect: () => { if (!sel) pushSettings({ model: id, modelName: name, effort: nearestEffort(efforts, SETTINGS.effort) }); renderModelSheet(); },
+		onEffort: (e) => { pushSettings({ effort: e }); renderModelSheet(); },
+	});
 }
 function renderModelSheet() {
 	$$('#model-provider-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.provider === modelSheetProvider));
@@ -543,26 +586,13 @@ function renderModelSheet() {
 	const moreToggle = $('#more-models-toggle');
 	list.innerHTML = '';
 	more.innerHTML = '';
-
-	let activeAgyFam = null;
-	if (modelSheetProvider === 'claude') {
+	const claudeTab = modelSheetProvider === 'claude';
+	$('#claude-fast-card').classList.toggle('hidden', !claudeTab || !accounts.claude);
+	if (claudeTab) {
 		if (accounts.claude) {
-			MODELS.forEach((m) => {
-				const sel = !isAgyModel() && (SETTINGS.model === m.id || SETTINGS.modelName === m.name);
-				list.appendChild(modelCard(m.id, m.name, m.desc, {
-					sel,
-					onSelect: () => { pushSettings({ model: m.id, modelName: m.name }); renderModelSheet(); },
-				}));
-			});
-			MORE_MODELS.forEach(([id, name]) => {
-				const sel = !isAgyModel() && (SETTINGS.model === id || SETTINGS.modelName === name);
-				more.appendChild(modelCard(id, name, '', {
-					sel,
-					onSelect: () => { pushSettings({ model: id, modelName: name }); renderModelSheet(); },
-				}));
-			});
-			const inMore = MORE_MODELS.some(([id]) => id === SETTINGS.model);
-			if (inMore) showMoreClaudeModels = true;
+			MODELS.forEach((m) => list.appendChild(claudeCard(m.id, m.name, m.desc)));
+			MORE_MODELS.forEach(([id, name]) => more.appendChild(claudeCard(id, name, '')));
+			if (!isAgyModel() && MORE_MODELS.some(([id]) => id === SETTINGS.model)) showMoreClaudeModels = true;
 			moreToggle.classList.remove('hidden');
 			more.classList.toggle('hidden', !showMoreClaudeModels);
 			moreToggle.classList.toggle('expanded', showMoreClaudeModels);
@@ -571,72 +601,38 @@ function renderModelSheet() {
 			more.classList.add('hidden');
 			list.appendChild(signInModelCard('登录 Claude 账号', '用 Claude Pro / Max 订阅使用 Opus、Sonnet 与 Haiku', 'claude'));
 		}
-		$('#claude-fast-row').classList.toggle('hidden', !accounts.claude);
-	} else {
-		moreToggle.classList.add('hidden');
-		more.classList.add('hidden');
-		$('#claude-fast-row').classList.add('hidden');
-		if (!accounts.agy) {
-			list.appendChild(signInModelCard('用 Google 账号登录 Antigravity', '登录后即可统一选择 Gemini 等 Google 模型与思考程度', 'agy'));
-		} else if (agyState?.models?.length) {
-			const fams = groupAgyModels(agyState.models);
-			const curSlug = isAgyModel() ? String(SETTINGS.model).replace(/^agy:/, '') : '';
-			fams.forEach((fam) => {
-				const sel = fam.items.some((it) => it.slug === curSlug);
-				if (sel) activeAgyFam = fam;
-				const variantLabels = Object.keys(fam.variants).map((k) => EFFORT_LABEL[k]).filter(Boolean);
-				const sub = fam.hasVariants
-					? `支持思考调节：${variantLabels.join(' / ')}`
-					: (fam.items[0]?.effort ? `预设思考：${EFFORT_LABEL[fam.items[0].effort]}` : '标准预设');
-				list.appendChild(modelCard(fam.defaultId, fam.name, sub, {
-					badge: sel ? '当前' : '',
-					sel,
-					onSelect: () => {
-						const chosen = pickAgyVariant(fam, SETTINGS.effort);
-						pushSettings({ model: chosen.id, modelName: fam.name, effort: chosen.effort || SETTINGS.effort });
-						renderModelSheet();
-					},
-				}));
-			});
-		} else {
-			list.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
-		}
+		return;
 	}
-
-	// Unified effort control works for both Claude and Antigravity
-	const seg = $('#effort-seg');
-	seg.innerHTML = '';
-	let currentEff = SETTINGS.effort || 'high';
-	let effortNote = '已统一同步思考程度';
-	if (modelSheetProvider === 'agy') {
-		if (!isAgyModel()) {
-			effortNote = '点选上方模型即可应用当前档位';
-		} else if (activeAgyFam?.hasVariants) {
-			const curMeta = activeAgyFam.items.find((it) => 'agy:' + it.slug === SETTINGS.model);
-			if (curMeta?.effort) currentEff = curMeta.effort;
-			effortNote = activeAgyFam.variants[SETTINGS.effort]
-				? `当前档位：${EFFORT_LABEL[currentEff] || currentEff}`
-				: `已映射至接近档位：${EFFORT_LABEL[currentEff] || currentEff}`;
-		} else if (activeAgyFam) {
-			effortNote = '此模型使用固定思考模式';
-		}
-	} else {
-		effortNote = `当前档位：${EFFORT_LABEL[currentEff] || currentEff}`;
+	moreToggle.classList.add('hidden');
+	more.classList.add('hidden');
+	if (!accounts.agy) {
+		list.appendChild(signInModelCard('用 Google 账号登录 Antigravity', '登录后可以使用 Gemini 等 Google 提供的模型', 'agy'));
+		return;
 	}
-	$('#effort-note').textContent = effortNote;
-	EFFORTS.forEach(([id, label]) => {
-		const b = el('button', id === currentEff ? 'sel' : '', esc(label));
-		b.addEventListener('click', () => {
-			if (modelSheetProvider === 'agy' && isAgyModel() && activeAgyFam) {
-				const chosen = pickAgyVariant(activeAgyFam, id);
-				pushSettings({ model: chosen.id, modelName: activeAgyFam.name, effort: id });
-			} else {
-				pushSettings({ effort: id });
-			}
-			renderModelSheet();
-		});
-		seg.appendChild(b);
-	});
+	if (!agyState?.models?.length) {
+		list.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
+		return;
+	}
+	const curSlug = isAgyModel() ? String(SETTINGS.model).replace(/^agy:/, '') : '';
+	for (const fam of groupAgyModels(agyState.models)) {
+		const cur = fam.items.find((it) => it.slug === curSlug);
+		const levels = ['low', 'medium', 'high', 'xhigh', 'max'].filter((k) => fam.variants[k]);
+		list.appendChild(modelCard({
+			name: fam.name, sel: !!cur, efforts: levels, effort: cur?.effort || '',
+			desc: levels.length > 1 ? `${levels.length} 档思考` : '',
+			onSelect: () => {
+				if (cur) return;
+				const chosen = pickAgyVariant(fam, SETTINGS.effort);
+				pushSettings({ model: chosen.id, modelName: fam.name, effort: chosen.effort || SETTINGS.effort });
+				renderModelSheet();
+			},
+			onEffort: (e) => {
+				const v = fam.variants[e];
+				if (v) pushSettings({ model: v.id, modelName: fam.name, effort: e });
+				renderModelSheet();
+			},
+		}));
+	}
 }
 function openModelSheet() {
 	modelSheetProvider = isAgyModel() ? 'agy' : 'claude';
@@ -703,7 +699,13 @@ function renderUsageBody(err) {
 	if (!usageData.rate_limits_available || !usageData.rate_limits) { body.innerHTML = '<div class="empty-state">这个账号没有用量窗口（可能用的是 API Key 或组织账号）。</div>'; return; }
 	const rl = usageData.rate_limits;
 	if (usageData.groups) {
-		body.innerHTML = usageData.groups.map((g) => `<div class="usage-group">${esc(g.name)}</div>${usageBar('5 小时', g.five_hour)}${usageBar('本周', g.seven_day)}`).join('') || '<div class="empty-state">暂无数据</div>';
+		// The quota the model in use draws from; the other families' only on request.
+		const mine = usageData.groups.find((g) => g.name === usageData.current) || usageData.groups[0];
+		const others = usageData.groups.filter((g) => g !== mine);
+		const block = (g) => `<div class="usage-group">${esc(g.name)}</div>${usageBar('5 小时', g.five_hour)}${usageBar('本周', g.seven_day)}`;
+		let html = mine ? block(mine) : '';
+		if (others.length) html += `<details class="usage-more"><summary>其他模型的额度</summary>${others.map(block).join('')}</details>`;
+		body.innerHTML = html || '<div class="empty-state">暂无数据</div>';
 		return;
 	}
 	let html = usageBar('5 小时', rl.five_hour) + usageBar('本周', rl.seven_day) + usageBar('本周 Opus', rl.seven_day_opus) + usageBar('本周 Sonnet', rl.seven_day_sonnet);
@@ -1983,17 +1985,35 @@ async function refreshAccount() {
 	$('#drawer-avatar').classList.toggle('out', !who);
 	$('#drawer-email').textContent = who || '未登录';
 	$('#drawer-plan').textContent = email ? plan : accounts.agy ? '已用 Google 账号登录' : '点此登录';
-	if ($('#set-avatar-badge')) $('#set-avatar-badge').innerHTML = who ? esc(initial) : ic('i-key');
-	$('#set-email').textContent = who || '未登录';
-	$('#set-plan').textContent = email ? plan : accounts.agy ? '已用 Google 账号登录' : '登录 Claude 账号';
-	$('#val-agy').textContent = accounts.agy ? '已登录' : '';
+	// Settings: each engine's card says only what is true of that engine.
+	if ($('#set-avatar-badge')) $('#set-avatar-badge').innerHTML = email ? esc(email.trim()[0].toUpperCase()) : ic('i-key');
+	$('#set-email').textContent = email || '未登录';
+	$('#set-plan').textContent = email ? plan : '登录 Claude 账号';
+	renderAgyCard();
 	updateSettingsBadges();
 }
 async function loadAgy(fresh) {
 	const r = await getJSON('/api/agy/status' + (fresh ? '?fresh=1' : ''));
 	if (r.ok) agyState = r;
+	renderAgyCard();
 	return agyState;
 }
+// The Antigravity card in Settings: its account above, its program below, like Claude's.
+function renderAgyCard() {
+	if (!$('#set-agy-who')) return;
+	const st = agyState;
+	$('#set-agy-who').textContent = accounts.agy ? 'Google 账号' : '未登录';
+	$('#set-agy-plan').textContent = accounts.agy ? (st?.models?.length ? `已登录 · ${st.models.length} 个模型可用` : '已登录') : '用 Google 账号登录';
+	$('#set-agy-badge').innerHTML = accounts.agy ? 'G' : ic('i-spark');
+	const dot = $('#agy-engine-dot');
+	const line = $('#agy-engine-line');
+	if (!st) { dot.className = 'engine-dot off'; line.textContent = 'agy · 正在检测'; return; }
+	if (!st.installed) { dot.className = 'engine-dot off'; line.textContent = st.installing ? 'agy · 正在安装' : 'agy · 未安装，登录时自动下载'; return; }
+	dot.className = 'engine-dot ' + (st.version ? 'ok' : 'err');
+	line.textContent = st.version ? `本机引擎 · ${st.version} (agy)` : 'agy · 已安装，但启动不了';
+}
+$('#set-agy-account').addEventListener('click', () => { if (accounts.agy) openPage('page-agy'); else { closeAll(); showLogin('agy', true); } });
+$('#set-agy-engine').addEventListener('click', () => openPage('page-agy'));
 
 /* ---------------- Antigravity: the CLI, its account, its plugins ---------------- */
 let agyInstallLine = '';
@@ -2011,11 +2031,9 @@ function renderAgyPage() {
 	if (st.loggedIn) html += '<button class="pill-btn danger" id="agy-logout">退出登录</button>';
 	html += '</div>';
 	if (st.installed && st.loggedIn) {
-		html += `<h2 class="group-label">插件</h2><div id="agy-plugins" class="list"><div class="empty-state"><span class="spin"></span></div></div>
-			<div class="inline-form"><input id="agy-plugin-src" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="插件名，或 https://github.com/作者/仓库"><button class="pill-btn" id="agy-plugin-add">安装</button></div>
-			<p class="hint">这是 Antigravity 自己的插件（agy plugin），只在它的对话里生效。扩展市场里的技能和连接器两边都能用。</p>`;
+		html += `<div class="list"><button class="row" id="agy-to-market"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-puzzle"/></svg></span><span class="row-text">插件、技能和连接器<small>和 Claude 共用，在「扩展与插件」里管理</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button></div>`;
 	}
-	html += `<h2 class="group-label">它和 Claude 的不同</h2><p class="hint">Antigravity 的对话由 agy 自己完成，和 Claude Code 是两套程序：同一段对话换了模型所属的账号，接手的一方看不到另一方做过的事。执行命令、写文件、技能、连接器和经验笔记两边都有；Claude Code 的插件、/compact 这类命令只在 Claude 的对话里。</p>`;
+	html += `<h2 class="group-label">它和 Claude 的不同</h2><p class="hint">Antigravity 的对话由 agy 自己完成，和 Claude Code 是两套程序：同一段对话换了模型所属的账号，接手的一方看不到另一方做过的事。执行命令、写文件、技能、连接器、插件里的技能和连接器、经验笔记两边都有；/compact 这类 Claude Code 自己的命令只在 Claude 的对话里。</p>`;
 	body.innerHTML = html;
 	$('#agy-login').addEventListener('click', () => showLogin('agy', true));
 	$('#agy-update')?.addEventListener('click', () => { agyInstallLine = { text: '正在检查…' }; renderAgyPage(); api('/api/agy/install', {}); });
@@ -2023,28 +2041,7 @@ function renderAgyPage() {
 		title: '退出 Antigravity？', msg: '退出后它的模型不能再用，直到重新登录。Claude 账号不受影响。', ok: '退出登录', danger: true,
 		onOk: async () => { await api('/api/agy/logout'); await loadAgy(); renderAgyPage(); },
 	}));
-	if ($('#agy-plugins')) {
-		getJSON('/api/agy/plugins').then((r) => {
-			const box = $('#agy-plugins');
-			if (!box) return;
-			if (!r.ok) { box.innerHTML = `<div class="empty-state">${esc(r.error || '读取失败')}</div>`; return; }
-			box.innerHTML = r.plugins.length ? r.plugins.map((p) => `<div class="row"><span class="row-text">${esc(p.name)}${p.description ? `<small>${esc(p.description)}</small>` : ''}</span><span class="row-val">${esc(p.version)}</span></div>`).join('') : '<div class="empty-state">还没有装插件</div>';
-		});
-		$('#agy-plugin-add').addEventListener('click', () => {
-			const source = $('#agy-plugin-src').value.trim();
-			if (!source) { $('#agy-plugin-src').focus(); return; }
-			showDialog({
-				title: '安装这个插件？', msg: `${source}\n\n插件里的脚本和命令会以 root 身份在手机上运行。只安装你信任的来源。`, ok: '安装', danger: true,
-				onOk: async () => {
-					const btn = $('#agy-plugin-add');
-					if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin sm"></span>安装中'; }
-					const r = await api('/api/agy/plugins/install', { source });
-					toast(r.ok ? '插件已安装，下一条消息起生效' : `没能安装：${r.error || '未知原因'}`);
-					renderAgyPage();
-				},
-			});
-		});
-	}
+	$('#agy-to-market')?.addEventListener('click', () => openMarket('plugins', 'installed'));
 }
 PAGE_OPEN['page-agy'] = async () => { renderAgyPage(); await loadAgy(true); renderAgyPage(); };
 $('#set-account').addEventListener('click', () => {
@@ -2089,7 +2086,7 @@ async function refreshExtraSettingsStatus() {
 	if ($('#engine-dot') && $('#engine-line')) {
 		$('#engine-dot').className = 'engine-dot ' + (rt.ok ? 'ok' : 'err');
 		$('#engine-line').textContent = rt.ok
-			? `本机引擎 · 运行中${rt.chat?.version ? ' · ' + rt.chat.version : ''}`
+			? `本机引擎 · ${rt.chat?.version || '运行中'}`
 			: '本机引擎 · 未检测到 Claude Code';
 	}
 	const promptSet = !!(sp.ok && sp.text && sp.text.trim());
@@ -2113,7 +2110,7 @@ function filterSettings(raw) {
 		top.classList.toggle('hidden', !topMatch);
 		if (topMatch) visible++;
 	}
-	$$('#page-settings .set-group').forEach((grp) => {
+	$$('#page-settings .set-group:not(.engines)').forEach((grp) => {
 		let hits = 0;
 		grp.querySelectorAll('.row, .row-col').forEach((row) => {
 			const hay = `${row.dataset.search || ''} ${row.textContent || ''}`.toLowerCase();
@@ -2184,6 +2181,7 @@ PAGE_OPEN['page-settings'] = async () => {
 	refreshAccount();
 	loadUpdate();
 	refreshExtraSettingsStatus();
+	loadAgy();
 };
 PAGE_OPEN['page-persona'] = () => refreshExtraSettingsStatus();
 $('#t-autoupdate').addEventListener('change', (e) => pushSettings({ autoUpdate: e.target.checked }));

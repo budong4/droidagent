@@ -151,9 +151,9 @@ debian retools                               装逆向分析工具链
 | 连接器（MCP） | App 的连接器配置 | 同一批连接器，同步到 `~/.gemini/config/mcp_config.json`（agy 不支持旧的 SSE 连接方式，这类连接器会跳过） |
 | 系统提示词、经验笔记 | 追加到系统提示词 | agy 没有系统提示词参数，放在每段对话第一条消息的前面 |
 | 用量 | claude.ai 的用量接口 | `agy -p /usage` |
-| 插件 | 扩展市场（`claude plugin`） | 设置 → Antigravity（`agy plugin`） |
+| 插件 | 扩展与插件 → 插件，和 Antigravity 共用（`claude plugin`） | 同一页（`agy plugin`）。两边插件里的技能和连接器互相可用：Claude 插件的技能链接到 `~/.gemini/skills`、连接器写进 agy 的 MCP 配置；agy 插件生成一个本地 Claude 插件（`~/.droidagent/agy-plugins/`）交给 Agent SDK。Claude 插件的命令、子代理、hooks 和 agy 插件的规则不互通 |
 | 斜杠命令 | Claude Code 的全部命令 | App 自己的命令、`/plan` 和各个技能。agy 交互界面里才有的命令（`/mcp`、`/config` 等）在无头模式下没有 |
-| 思考过程 | 显示摘要 | agy 无头模式不输出思考内容，只显示回复和步骤 |
+| 思考过程 | 显示摘要 | 无头模式不输出思考内容，App 从 agy 自己的对话记录（`~/.gemini/antigravity-cli/conversations/<id>.db`）里只读地取出来，在每一步之前显示。格式参考 dsh-agy-link 的实测；读不到时只是不显示 |
 
 同一段对话可以换到另一个账号的模型继续，但两边各记各的：接手的一方看不到另一方做过的事，对话里会有一行说明。
 

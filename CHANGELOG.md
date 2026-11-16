@@ -2,6 +2,17 @@
 
 每个版本的说明会显示在 GitHub Releases 和 App 更新后的提示里。发布新版本时，在最上面加一节，并同步修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode`。
 
+## 1.8.2
+
+- 设置页顶部改成「引擎」：Claude 和 Antigravity 并排两张卡片，各自显示账号和本机程序的状态，不再把 Antigravity 放在「能力」里
+- 选模型更清楚：先选模型，选中的那一个下面才出现它自己支持的思考档位；只有一档的模型直接写明「固定」，不再在底下放一排对所有模型都一样的五个档位
+- 用量面板只显示当前模型所用的那份额度，其他模型的收在「其他模型的额度」里
+- Antigravity 的对话现在也会显示思考过程：从 agy 自己的对话记录里读出来，显示在它引出的那一步之前
+- 一个插件市场两边用：「扩展与插件 → 插件」里同时列出 Claude 插件和 Antigravity 插件，Antigravity 插件也在这里安装
+  - Claude 插件里的技能和连接器，在 Antigravity 的对话里也能用；Antigravity 插件里的技能和连接器，在 Claude 的对话里也能用
+  - 不互通的部分：Claude 插件的命令、子代理和自动脚本，以及 Antigravity 插件的规则，只在各自的对话里生效
+- 修复：Claude Code 启动不了时，插件页连 Antigravity 插件也看不到
+
 ## 1.8.1
 
 - 界面整体改版（默认「雾蓝」主题）：

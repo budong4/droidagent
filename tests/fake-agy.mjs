@@ -139,7 +139,47 @@ const finish = async (response, extra = {}) => {
 	await leave(0);
 };
 
-if (last === 'hang') {
+// agy's record of the conversation: a SQLite file with one protobuf blob per step. A step's thought
+// is field 20 -> 3, its reply field 20 -> 1 (see app/server/backends/agy_thoughts.mjs).
+async function record(idx, stepType, { thought, reply } = {}) {
+	const { DatabaseSync } = await import('node:sqlite');
+	const { mkdirSync } = await import('node:fs');
+	const dir = join(process.env.HOME, '.gemini', 'antigravity-cli', 'conversations');
+	mkdirSync(dir, { recursive: true });
+	const db = new DatabaseSync(join(dir, `${conv}.db`));
+	// The app reads this file while the turn runs: wait for its read rather than fail.
+	db.exec('PRAGMA busy_timeout = 5000');
+	db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)');
+	const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n >>>= 7; } out.push(n); return Buffer.from(out); };
+	const field = (num, bytes) => Buffer.concat([varint((num << 3) | 2), varint(bytes.length), bytes]);
+	const inner = Buffer.concat([reply ? field(1, Buffer.from(reply)) : Buffer.alloc(0), thought ? field(3, Buffer.from(thought)) : Buffer.alloc(0)]);
+	const payload = Buffer.concat([field(1, Buffer.from('header-padding')), field(20, inner)]);
+	db.prepare('INSERT OR REPLACE INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)').run(idx, stepType, payload);
+	db.close();
+}
+
+if (last.startsWith('think: ')) {
+	// A thought, a command, a second thought, then the answer — the thoughts only in the record.
+	// Steps are numbered across the whole conversation, so a later turn's follow the earlier ones.
+	const prev = await (async () => {
+		try {
+			const { DatabaseSync } = await import('node:sqlite');
+			const db = new DatabaseSync(join(process.env.HOME, '.gemini', 'antigravity-cli', 'conversations', `${conv}.db`), { readOnly: true });
+			const n = db.prepare('SELECT max(idx) AS m FROM steps').get().m;
+			db.close();
+			return Number(n) || 0;
+		} catch { return 0; }
+	})();
+	await record(prev + 1, 15, { thought: `first thought about ${last.slice(7)}` });
+	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'DONE', step_type: 'agent_response', usage: { thinking_tokens: 40 } } });
+	await record(prev + 2, 21, { thought: 'I should look at the files' });
+	const info = { name: 'list_dir', parameters: { DirectoryPath: '/sdcard' } };
+	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 2, state: 'ACTIVE', step_type: 'tool', tool_name: 'list_dir', tool_info: info } });
+	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 2, state: 'DONE', step_type: 'tool', tool_name: 'list_dir', tool_info: { ...info, output: 'a\nb' } } });
+	await record(prev + 3, 15, { reply: 'two files', thought: 'SYSTEM ROLE: not a thought' });
+	await say(3, ['two', ' files']);
+	await finish('two files');
+} else if (last === 'hang') {
 	await say(1, ['working', ' on it']);
 	process.on('SIGTERM', () => process.exit(143));
 	await new Promise(() => {});

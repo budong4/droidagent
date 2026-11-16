@@ -200,7 +200,8 @@ export function createClaudeBackend({ log, serverDir }) {
 
 	// One live `query()` for one conversation. `settings` is read once, at the start: what can
 	// change later goes through control (setModel, setPermissionMode), and the rest restarts it.
-	async function open({ tag, cwd, settings, resume, canUseTool, systemAppend, mcpServers }) {
+	// `plugins`: local plugins to load besides the installed ones (the Antigravity plugins, see shared_plugins.mjs).
+	async function open({ tag, cwd, settings, resume, canUseTool, systemAppend, mcpServers, plugins }) {
 		const rt = await runtime();
 		if (!rt.chat) throw new Error(noRuntimeMessage(rt));
 		const spec = rt.chat;
@@ -237,6 +238,7 @@ export function createClaudeBackend({ log, serverDir }) {
 			stderr: (d) => log('[claude]', `[${tag}]`, String(d).trim().slice(0, 300)),
 		};
 		if (mcpServers && Object.keys(mcpServers).length) options.mcpServers = mcpServers;
+		if (plugins?.length) options.plugins = plugins;
 		if (resume) options.resume = resume;
 		Object.assign(options, queryRuntimeOptions(spec));
 
