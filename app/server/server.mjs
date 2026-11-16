@@ -9,7 +9,7 @@ import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open, cp } from 'node:fs/promises';
 import { readFileSync, existsSync, createReadStream, createWriteStream } from 'node:fs';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -23,6 +23,8 @@ import { AGY_PREFIX, BACKEND_NAMES, backendOf, agySlug } from './backends/common
 import { createClaudeBackend, thinkingFor } from './backends/claude.mjs';
 import { createAgyBackend, usageGroupFor } from './backends/antigravity.mjs';
 import { startSignIn } from './backends/agy_oauth.mjs';
+import { sourcesOf, mergeSources, queryOf } from './sources.mjs';
+import { createBrowser, chromiumPath, aptInstallChromium } from './browser.mjs';
 import { configOption, levelsOf } from './backends/agy_acp.mjs';
 import { enabledClaudePlugins, claudePluginsForAgy, agyPluginsForClaude } from './backends/shared_plugins.mjs';
 
@@ -140,7 +142,7 @@ function markInterrupted(sess) {
 	for (const m of sess.messages || []) {
 		if (m.role === 'tool' && m.state === 'running' && m.kind !== 'todo') {
 			m.state = 'err'; m.ok = false; m.summary = (m.summary ? m.summary + '\n' : '') + '（服务中途重启，这一步没有完成）'; changed = true;
-		} else if (m.role === 'perm' && !m.verdict) { m.verdict = 'expired'; changed = true; }
+		} else if ((m.role === 'perm' || m.role === 'ask') && !m.verdict) { m.verdict = 'expired'; changed = true; }
 	}
 	if (changed) saveSession(sess);
 }
@@ -388,6 +390,8 @@ function toolCategory(name) {
 	if (/^(WebSearch|WebFetch)$/.test(name)) return '联网';
 	if (name === 'Skill') return '技能';
 	if (name === 'Task' || name === 'Agent') return '子任务';
+	if (String(name).startsWith('mcp__droidagent__browser_')) return '浏览器';
+	if (name === 'mcp__droidagent__ask_user' || name === 'AskUserQuestion') return '提问';
 	if (String(name).startsWith('mcp__')) return 'MCP';
 	return '工具';
 }
@@ -450,8 +454,34 @@ function toolTitle(name, input) {
 		return `使用技能「${skillNames.get(id) || id || '技能'}」`;
 	}
 	if (name === 'Task' || name === 'Agent') return input?.description ? `子任务：${input.description}` : '派出子任务';
+	if (name === 'mcp__droidagent__ask_user') return '向你提问';
+	if (String(name).startsWith('mcp__droidagent__browser_')) return browserTitle(name.slice('mcp__droidagent__'.length), input);
 	if (String(name).startsWith('mcp__')) { const [, srv, tool] = String(name).split('__'); return `调用 ${srv} 的 ${tool || '工具'}`; }
 	return TOOL_CN[name] || name;
+}
+// What a file change changes, for the step's card: { path, old, new }, each kept short.
+const CLIP = (t, n = 6000) => { const s = String(t ?? ''); return s.length > n ? s.slice(0, n) + '\n…' : s; };
+function diffFor(name, input, given) {
+	if (given) return { path: String(given.path || ''), old: CLIP(given.old), new: CLIP(given.new) };
+	if (name === 'Edit' && input?.new_string != null) return { path: readPath(input), old: CLIP(input.old_string), new: CLIP(input.new_string) };
+	if (name === 'MultiEdit' && Array.isArray(input?.edits)) return { path: readPath(input), old: CLIP(input.edits.map((e) => e.old_string).join('\n…\n')), new: CLIP(input.edits.map((e) => e.new_string).join('\n…\n')) };
+	if (name === 'Write' && input?.content != null) return { path: readPath(input), old: '', new: CLIP(input.content) };
+	return null;
+}
+// Pictures from steps, kept as files and served at /api/media/<name>; the conversation keeps links.
+const MEDIA_DIR = join(dirname(MEMORY_FILE), 'media');
+async function saveImages(images) {
+	const out = [];
+	await mkdir(MEDIA_DIR, { recursive: true });
+	for (const im of images.slice(0, 4)) {
+		const ext = /png/.test(im.mime) ? 'png' : /webp/.test(im.mime) ? 'webp' : /gif/.test(im.mime) ? 'gif' : 'jpg';
+		const buf = Buffer.from(String(im.data), 'base64');
+		if (!buf.length || buf.length > 8e6) continue;
+		const name = `${createHash('sha256').update(buf).digest('hex').slice(0, 24)}.${ext}`;
+		if (!existsSync(join(MEDIA_DIR, name))) await writeFile(join(MEDIA_DIR, name), buf);
+		out.push(`/api/media/${name}`);
+	}
+	return out;
 }
 function toolDetail(name, input) {
 	if (name === 'Bash') return input?.command || '';
@@ -461,6 +491,29 @@ function toolDetail(name, input) {
 const base = (p) => (p ? String(p).split('/').pop() : '');
 const firstWords = (s, n) => (s ? String(s).split(/\s+/).slice(0, n).join(' ') : '');
 
+// The built-in browser's steps, in words.
+function browserTitle(tool, input) {
+	const host = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return String(u || '').slice(0, 40); } };
+	switch (tool) {
+		case 'browser_open': return `打开 ${host(input?.url)}`;
+		case 'browser_read': return '读取网页内容';
+		case 'browser_click': return input?.text ? `点击「${String(input.text).slice(0, 20)}」` : '点击网页上的元素';
+		case 'browser_type': return `在网页里输入「${String(input?.text || '').slice(0, 20)}」`;
+		case 'browser_scroll': return input?.direction === 'up' ? '向上滚动网页' : '向下滚动网页';
+		case 'browser_back': return '返回上一页';
+		case 'browser_screenshot': return '截取网页画面';
+		default: return '使用内置浏览器';
+	}
+}
+// A question from the assistant, whichever agent asks: 1–4 questions, each with 2–6 choices.
+function normalizeQuestions(questions) {
+	return (Array.isArray(questions) ? questions : []).slice(0, 4).map((q) => ({
+		question: String(q?.question || '').slice(0, 500),
+		header: String(q?.header || '').slice(0, 24),
+		multiSelect: !!q?.multiSelect,
+		options: (Array.isArray(q?.options) ? q.options : []).slice(0, 6).map((o) => (typeof o === 'string' ? { label: o, description: '' } : { label: String(o?.label || '').slice(0, 80), description: String(o?.description || '').slice(0, 300) })).filter((o) => o.label),
+	})).filter((q) => q.question);
+}
 const allow = (title, detail) => ({ decision: 'allow', title, detail });
 const deny = (reason, title, detail) => ({ decision: 'deny', reason, title, detail });
 const ask = (reason, title, detail) => ({ decision: 'ask', reason, title, detail });
@@ -474,6 +527,8 @@ function policy(toolName, input) {
 	const mode = settings.mode;
 
 	const title = toolTitle(name, input);
+	// The app's own tools (agent_tools.mjs): asking the owner, the built-in browser the owner watches.
+	if (name.startsWith(`mcp__${AGENT_TOOLS}__`)) return allow(title, toolDetail(name, input));
 	const detail = toolDetail(name, input);
 
 	// Full access: nothing is asked, by the owner's explicit choice of that mode.
@@ -611,12 +666,12 @@ function forPage(sess) {
 // Closes a confirmation card, here and in the saved conversation, whoever answered it.
 function closePermission(sessionId, permId, decision) {
 	const sess = sessionId && sessionCache.get(sessionId);
-	const pm = sess?.messages.find((x) => x.role === 'perm' && x.id === permId);
+	const pm = sess?.messages.find((x) => (x.role === 'perm' || x.role === 'ask') && x.id === permId);
 	if (pm) {
-		pm.verdict = decision;
+		pm.verdict = pm.role === 'ask' && decision !== 'answered' ? 'skipped' : decision;
 		saveSession(sess);
 	}
-	broadcast({ type: 'permission_resolved', sessionId, id: permId, decision });
+	broadcast({ type: pm?.role === 'ask' ? 'question_resolved' : 'permission_resolved', sessionId, id: permId, decision, answers: null });
 }
 
 // Claude Code deletes its transcripts after 30 days, while the App keeps the conversation. Asking it
@@ -659,6 +714,8 @@ setInterval(reapIdle, Math.min(30000, IDLE_OTHER_MS / 2)).unref();
 const APP_PROMPT = `## 在 DroidAgent App 里工作
 - 用户在手机 App 里看着你的每一步，大多数人看不懂命令行。调用 Bash 工具时，description 参数一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「统计下载文件夹大小」「打开微信」，不要把命令本身写进去。
 - 用户用什么语言提问，就用什么语言回答。
+- 需要用户做决定、或者有几种做法要用户挑时，用 AskUserQuestion 工具给出选项，不要在回复里列选项让用户打字。
+- 上网：查资料用 WebSearch / WebFetch；要打开网页、点按钮、填表、登录、看页面长什么样时，用内置浏览器（mcp__droidagent__browser_* 工具），用户能在 App 里实时看着。
 - 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。`;
 // The notes, for either agent. `how` names the tool that adds one.
 const notesPrompt = (how) => `## 经验笔记
@@ -676,6 +733,8 @@ const NOTES_PROMPT = notesPrompt('用 Edit 或 Write 工具往笔记里加一条
 const AGY_PROMPT = `# 你在 DroidAgent 里工作
 你通过 Antigravity CLI 运行在一台已 Root 的 Android 手机上的 Debian 环境里，身份是真 root。用户在手机上的聊天 App「DroidAgent」里和你对话，看着你的每一步；大多数人看不懂命令行。
 - 用户用什么语言提问，就用什么语言回答。
+- 需要用户做决定、或者有几种做法要用户挑时，用 MCP 服务 droidagent 的 ask_user 工具给出选项，不要在回复里列选项让用户打字。
+- 要打开网页、点按钮、填表、看页面长什么样时，用 droidagent 的 browser_* 工具（内置浏览器），用户能在 App 里实时看着。
 - 用你自带的工具执行命令、读写文件。需要确认的步骤，App 会按用户选的执行模式自动放行，或者先请用户确认；被拒绝了就不要换个办法重试同一件事，先问用户。
 - 下面的「手机环境说明」原本是写给 Claude Code 的：里面说的 Bash 工具就是你执行命令的工具，Read、Write、Edit 是你读写文件的工具，形如 mcp__名字__工具 的是对应 MCP 服务的工具。
 - 安装技能时，SKILL.md 放在 \`~/.claude/skills/<技能名>/SKILL.md\`，App 会把它同步给你。`;
@@ -854,7 +913,30 @@ async function startRuntime(id) {
 	// One decision per step, for either agent: allowed by the mode, refused by it, or put to the
 	// owner as a card and held until answered.
 	const pending = new Map();
+	// The assistant asking the owner something, with choices (Claude's AskUserQuestion, and the
+	// ask_user tool of agent_tools.mjs for Antigravity). Resolves { question text: answer } or
+	// null when the owner skipped it. Asked in every mode: a question is not a permission.
+	const askOwner = (questions) => {
+		const askId = randomUUID();
+		const qs = normalizeQuestions(questions);
+		if (rt) rt.label = '等你回答';
+		broadcast({ type: 'question', sessionId: id, id: askId, questions: qs });
+		sess.messages.push({ role: 'ask', id: askId, questions: qs, answers: null, verdict: null, time: Date.now() });
+		saveSession(sess);
+		return new Promise((resolve) => {
+			pending.set(askId, {
+				resolve: (r) => { pending.delete(askId); resolve(r.behavior === 'allow' ? r.answers || {} : null); },
+				kind: 'ask',
+			});
+		});
+	};
 	const canUseTool = async (toolName, toolInput) => {
+		if (toolName === 'AskUserQuestion') {
+			const answers = await askOwner(toolInput?.questions);
+			return answers
+				? { behavior: 'allow', updatedInput: { ...toolInput, answers } }
+				: { behavior: 'deny', message: '用户没有回答这个问题（跳过了）。不要再问同样的问题，按你的判断继续，或者在回复里直接说明需要用户决定什么。', interrupt: false };
+		}
 		const p = policy(toolName, toolInput);
 		if (p.decision === 'allow') {
 			broadcast({ type: 'tool_note', sessionId: id, name: toolName, title: p.title, auto: true });
@@ -882,18 +964,18 @@ async function startRuntime(id) {
 	const handle = backend === 'agy'
 		? agy.open({
 			tag, cwd: CWD, settings, conversation: sess.agyConversationId || null,
-			preamble: agyPreamble, prepareTurn: prepareAgy, canUseTool,
+			preamble: agyPreamble, prepareTurn: prepareAgy, canUseTool, mcpServers: [acpStdio(AGENT_TOOLS, agentToolsServer(id, 'ask,browser'))],
 		})
 		: await claude.open({
 			tag, cwd: CWD, settings, resume: sess.claudeSessionId || null, canUseTool,
 			systemAppend: [APP_PROMPT, NOTES_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n'),
-			mcpServers: await loadMcpServers(),
+			mcpServers: { ...await loadMcpServers(), [AGENT_TOOLS]: { type: 'stdio', ...agentToolsServer(id, 'browser') } },
 			plugins: await agyPluginsForClaudeNow(),
 		});
 
 	rt = {
 		pushUser: handle.send, end: handle.close, q: handle.control, pending, running: false, assistantText: '', lastActive: Date.now(),
-		chatSpec: handle.spec, backend,
+		chatSpec: handle.spec, backend, askOwner, canUseTool,
 	};
 	runtimes.set(id, rt);
 	const started = rt;
@@ -981,24 +1063,38 @@ async function consume(id, events, rt) {
 			// TodoWrite gets a live checklist render in the UI instead of a generic tool card.
 			const isTodo = ev.name === 'TodoWrite';
 			const todos = isTodo ? (ev.input?.todos || []) : undefined;
+			const diff = diffFor(ev.name, ev.input, ev.diff);
 			if (sess) {
-				sess.messages.push({ role: 'tool', id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}) });
+				sess.messages.push({ role: 'tool', id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}), ...(diff ? { diff } : {}) });
 				saveSession(sess);
 			}
 			rt.label = title;
-			broadcast({ type: 'tool_use', sessionId: id, id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), ...(isTodo ? { kind: 'todo', todos } : {}) });
+			(rt.toolInputs ||= new Map()).set(ev.id, { name: ev.name, input: ev.input });
+			broadcast({ type: 'tool_use', sessionId: id, id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), ...(isTodo ? { kind: 'todo', todos } : {}), ...(diff ? { diff } : {}) });
 		} else if (ev.type === 'tool_result') {
 			const summary = String(ev.text ?? '').slice(0, 4000);
+			// What a search found, or which page was read: shown on the step, and as the answer's sources.
+			const used = rt.toolInputs?.get(ev.id);
+			rt.toolInputs?.delete(ev.id);
+			const sources = ev.ok && used ? sourcesOf(used.name, used.input, ev.text) : [];
+			const query = used?.name === 'WebSearch' ? (used.input?.query || queryOf(ev.text)) : '';
+			if (sources.length) rt.sources = mergeSources(rt.sources, sources);
+			const images = ev.images?.length ? await saveImages(ev.images) : [];
+			const lateDiff = ev.diff && sess?.messages.find((x) => x.role === 'tool' && x.id === ev.id && !x.diff) ? diffFor('', {}, ev.diff) : null;
 			if (sess) {
 				const tm = sess.messages.find((x) => x.role === 'tool' && x.id === ev.id);
 				if (tm) {
 					tm.state = ev.ok ? 'ok' : 'err';
 					tm.ok = !!ev.ok;
 					tm.summary = summary;
+					if (sources.length) tm.sources = sources;
+					if (query) tm.query = query;
+					if (images.length) tm.images = images;
+					if (lateDiff) tm.diff = lateDiff;
 					saveSession(sess);
 				}
 			}
-			broadcast({ type: 'tool_result', sessionId: id, id: ev.id, ok: !!ev.ok, summary });
+			broadcast({ type: 'tool_result', sessionId: id, id: ev.id, ok: !!ev.ok, summary, ...(sources.length ? { sources } : {}), ...(query ? { query } : {}), ...(images.length ? { images } : {}), ...(lateDiff ? { diff: lateDiff } : {}) });
 			rt.label = '正在思考';
 		} else if (ev.type === 'result') {
 			rt.running = false;
@@ -1013,12 +1109,17 @@ async function consume(id, events, rt) {
 			if (sess) {
 				// How long this turn took, shown under its last reply.
 				for (let i = sess.messages.length - 1; i >= 0 && sess.messages[i].role !== 'user'; i--) {
-					if (sess.messages[i].role === 'assistant') { sess.messages[i].tookMs = tookMs; break; }
+					if (sess.messages[i].role === 'assistant') {
+						sess.messages[i].tookMs = tookMs;
+						if (rt.sources?.length) sess.messages[i].sources = rt.sources; // what this turn's answer drew on
+						break;
+					}
 				}
 				saveSession(sess);
 				maybeTitle(id); // name the conversation once it has its first answer
 			}
-			broadcast({ type: 'result', sessionId: id, ok: !!ev.ok, text: ev.text || '', costUsd: ev.costUsd || 0, durationMs: tookMs, subtype: ev.subtype, errors: ev.errors });
+			broadcast({ type: 'result', sessionId: id, ok: !!ev.ok, text: ev.text || '', costUsd: ev.costUsd || 0, durationMs: tookMs, subtype: ev.subtype, errors: ev.errors, sources: rt.sources || [] });
+			rt.sources = [];
 			if (ev.code === 'auth') broadcastAuth(); // the login it ran on is gone
 			announceSkillDrafts(id).catch((e) => log('[skills] draft scan', e?.message));
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
@@ -1046,6 +1147,40 @@ async function generateTitle(userText, replyText, backend = 'claude') {
 		? await agy.oneShot({ prompt: `${system}\n\n${prompt}`, cwd: TITLE_DIR, model: agySlug(settings.model) })
 		: await claude.oneShot({ prompt, system, cwd: TITLE_DIR, model: 'haiku' });
 	return cleanTitle(out);
+}
+// ---------------------------------------------------------------- thinking, in Chinese
+// Models mostly think in English. When the owner opens a thinking block, the model in use
+// translates it (one-off call, no tools); translations are kept by the text's hash.
+const TRANSLATIONS_FILE = join(homedir(), '.claude', 'agent-translations.json');
+let translations = null;
+const translating = new Map(); // hash -> promise
+const mostlyChinese = (t) => { const s = String(t || '').replace(/\s+/g, ''); const han = (s.match(/[\u4e00-\u9fff]/g) || []).length; return s.length > 0 && han / s.length > 0.25; };
+async function translateThinking(text, backend) {
+	const src = String(text || '').trim();
+	if (!src) return { ok: true, text: '' };
+	if (mostlyChinese(src)) return { ok: true, text: src, same: true };
+	const key = createHash('sha256').update(src).digest('hex').slice(0, 32);
+	translations ||= await readFile(TRANSLATIONS_FILE, 'utf8').then(JSON.parse).catch(() => ({}));
+	if (translations[key]) return { ok: true, text: translations[key] };
+	if (translating.has(key)) return translating.get(key);
+	const job = (async () => {
+		const LIMIT = 9000;
+		const part = src.length > LIMIT ? src.slice(0, LIMIT) : src;
+		const system = '你是翻译。把用户给的一段 AI 思考过程翻译成自然、通顺的简体中文。只输出译文，不加任何解释或前后缀；代码、命令、文件路径、包名、专有名词保持原样。';
+		await mkdir(TITLE_DIR, { recursive: true });
+		const out = (backend === 'agy'
+			? await agy.oneShot({ prompt: `${system}\n\n---\n${part}`, cwd: TITLE_DIR, model: agySlug(settings.model), timeoutMs: 90000 })
+			: await claude.oneShot({ prompt: part, system, cwd: TITLE_DIR, model: 'haiku', timeoutMs: 90000 })).trim();
+		if (!out) return { ok: false, error: '翻译没有返回结果' };
+		const zh = src.length > LIMIT ? `${out}\n\n（后面还有一部分没有翻译，可以点「原文」查看）` : out;
+		translations[key] = zh;
+		const keys = Object.keys(translations);
+		if (keys.length > 600) for (const k of keys.slice(0, keys.length - 500)) delete translations[k];
+		await writeJsonAtomic(TRANSLATIONS_FILE, translations).catch(() => {});
+		return { ok: true, text: zh };
+	})().catch((e) => ({ ok: false, error: String(e?.message || e) })).finally(() => translating.delete(key));
+	translating.set(key, job);
+	return job;
 }
 async function maybeTitle(id) {
 	const sess = sessionCache.get(id);
@@ -2306,6 +2441,44 @@ async function prepareAgy() {
 	});
 }
 const AGY_PLUGIN_WRAPPERS = join(dirname(MEMORY_FILE), 'agy-plugins');
+// ---------------------------------------------------------------- the app's own tools (agent_tools.mjs)
+// One MCP server per conversation, started by its agent: it asks the owner questions (Antigravity)
+// and drives the built-in browser (both). Calls come back here with a token made at every start.
+const AGENT_TOOLS = 'droidagent';
+const TOOLS_TOKEN = randomBytes(24).toString('hex');
+function agentToolsServer(sessionId, which) {
+	return {
+		command: process.execPath, args: [join(HERE, 'agent_tools.mjs')],
+		env: { DROIDAGENT_TOOLS_URL: `http://127.0.0.1:${PORT}`, DROIDAGENT_TOOLS_TOKEN: TOOLS_TOKEN, DROIDAGENT_SESSION: sessionId, DROIDAGENT_TOOLS: which },
+	};
+}
+// The same, as ACP's session/new wants an MCP server.
+const acpStdio = (name, s) => ({ name, command: s.command, args: s.args, env: Object.entries(s.env).map(([k, v]) => ({ name: k, value: v })) });
+const toolsTokenOk = (t) => { const a = Buffer.from(String(t || '')); const b = Buffer.from(TOOLS_TOKEN); return a.length === b.length && timingSafeEqual(a, b); };
+const answerText = (qs, answers) => (answers ? qs.map((q) => `${q.question}\n→ ${answers[q.question] ?? '（没有回答）'}`).join('\n\n') : '用户跳过了这个问题，没有回答。按你的判断继续，或者在回复里说明需要用户决定什么。');
+async function agentToolCall({ token, sessionId, tool, arguments: args }) {
+	if (!toolsTokenOk(token)) return { ok: false, text: '这次调用没有通过验证' };
+	const rt = runtimes.get(String(sessionId || ''));
+	if (!rt) return { ok: false, text: '找不到这次调用属于哪个对话' };
+	const a = args && typeof args === 'object' ? args : {};
+	if (tool === 'ask_user') {
+		const qs = normalizeQuestions(a.questions);
+		if (!qs.length) return { ok: false, text: '没有给出问题' };
+		const answers = await rt.askOwner(qs);
+		return { ok: true, text: answerText(qs, answers) };
+	}
+	if (tool.startsWith('browser_')) return browserTool(tool, a, sessionId);
+	return { ok: false, text: `没有这个工具：${tool}` };
+}
+// The built-in browser (browser.mjs): one for the app, watched and steered from the browser page.
+const browser = createBrowser({
+	log, profileDir: join(dirname(MEMORY_FILE), 'browser-profile'), findChromium: chromiumPath,
+	install: () => { broadcast({ type: 'notice_global', text: '正在安装内置浏览器（Chromium），第一次需要几分钟…' }); return aptInstallChromium(log); },
+	onState: (st) => broadcast({ type: 'browser', ...st }),
+});
+async function browserTool(tool, args) {
+	try { return await browser.tool(tool, args); } catch (e) { log('[browser]', tool, e?.message); return { ok: false, text: `内置浏览器出错：${e?.message || e}` }; }
+}
 const agyPluginsForClaudeNow = () => agyPluginsForClaude(join(homedir(), '.gemini'), AGY_PLUGIN_WRAPPERS).catch((e) => { log('[plugins] agy plugins for Claude:', e?.message); return []; });
 // Who is signed in, for the page: either account is enough to chat.
 async function authState() {
@@ -2632,6 +2805,31 @@ const server = createServer(async (req, res) => {
 				for (const r of runtimes.values()) tell(() => r.q.setPermissionMode?.('default'));
 				broadcast({ type: 'settings', settings });
 			}
+			return json(res, { ok: true });
+		}
+
+		if (req.method === 'POST' && path === '/api/translate') {
+			const { text, sessionId } = await body(req);
+			const sess = sessionId ? await getOrLoadSessionObj(sessionId) : null;
+			const backend = sess?.backend || backendOf(settings.model);
+			return json(res, await translateThinking(String(text || '').slice(0, 40000), backend));
+		}
+		// The owner's answer to the assistant's question. `answers`: { question text: answer }; none = skipped.
+		if (req.method === 'POST' && path === '/api/answer') {
+			const { id: askId, answers, sessionId } = await body(req);
+			const sid = sessionId || activeSessionId;
+			const rt = sid && runtimes.get(sid);
+			const p = rt?.pending.get(askId);
+			if (!p || p.kind !== 'ask') return json(res, { ok: false, error: 'gone' }, 404);
+			const clean = answers && typeof answers === 'object'
+				? Object.fromEntries(Object.entries(answers).map(([k, v]) => [String(k), String(v ?? '').slice(0, 2000)]).filter(([, v]) => v.trim()))
+				: null;
+			const ok = clean && Object.keys(clean).length > 0;
+			p.resolve(ok ? { behavior: 'allow', answers: clean } : { behavior: 'deny' });
+			const sess = sessionCache.get(sid);
+			const am = sess?.messages.find((x) => x.role === 'ask' && x.id === askId);
+			if (am) { am.answers = ok ? clean : null; am.verdict = ok ? 'answered' : 'skipped'; saveSession(sess); }
+			broadcast({ type: 'question_resolved', sessionId: sid, id: askId, answers: ok ? clean : null });
 			return json(res, { ok: true });
 		}
 
@@ -3502,6 +3700,32 @@ const server = createServer(async (req, res) => {
 			return json(res, { ok: true });
 		}
 		if (path === '/api/agy/plugins' && req.method === 'GET') return json(res, await agy.plugins());
+		const mm = path.match(/^\/api\/media\/([0-9a-f]{24}\.(?:png|jpg|webp|gif))$/);
+		if (mm && req.method === 'GET') {
+			try {
+				const data = await readFile(join(MEDIA_DIR, mm[1]));
+				res.writeHead(200, { 'content-type': { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }[mm[1].split('.').pop()], 'cache-control': 'public, max-age=31536000, immutable' });
+				return res.end(data);
+			} catch { res.writeHead(404); return res.end(); }
+		}
+		// ---- The built-in browser, for the owner: its state, its live picture, taps and typing.
+		if (path === '/api/browser' && req.method === 'GET') return json(res, { ok: true, ...browser.state(), installed: !!chromiumPath() });
+		if (path === '/api/browser/stream' && req.method === 'GET') { req.setTimeout(0); res.setTimeout(0); return browser.watch(res); }
+		if (path === '/api/browser/input' && req.method === 'POST') {
+			try { await browser.input(await body(req)); return json(res, { ok: true }); } catch (e) { return json(res, { ok: false, error: String(e?.message || e) }); }
+		}
+		if (path === '/api/browser/start' && req.method === 'POST') {
+			try { await browser.start(); return json(res, { ok: true, ...browser.state() }); } catch (e) { return json(res, { ok: false, error: String(e?.message || e) }); }
+		}
+		if (path === '/api/browser/stop' && req.method === 'POST') { browser.stop(); return json(res, { ok: true }); }
+		// A call from agent_tools.mjs. It may wait long: for the owner's answer, or a page to load.
+		if (path === '/api/agent-tools/call' && req.method === 'POST') {
+			const b = await body(req);
+			req.setTimeout(0); res.setTimeout(0);
+			let r;
+			try { r = await agentToolCall(b); } catch (e) { log('[tools]', e?.stack || e); r = { ok: false, text: `出错了：${e?.message || e}` }; }
+			return json(res, { ok: !!r.ok, text: String(r.text ?? ''), ...(r.image ? { image: r.image, mimeType: r.mimeType } : {}) });
+		}
 		if (path === '/api/agy/plugins/install' && req.method === 'POST') {
 			const r = await agy.installPlugin((await body(req)).source);
 			if (r.ok) restartRuntimesWhenIdle();

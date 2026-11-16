@@ -36,6 +36,31 @@ export function query({ prompt, options }) {
 		for await (const m of prompt) {
 			const text = m.message.content;
 			n++;
+			if (text === 'edit and shoot') {
+				const ed = { file_path: '/sdcard/a.txt', old_string: 'one\\ntwo\\nthree', new_string: 'one\\nTWO\\nthree' };
+				yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'ed_' + n, name: 'Edit', input: ed }] } };
+				await options.canUseTool('Edit', ed);
+				yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'ed_' + n, content: 'ok' }] } };
+				const rd = { file_path: '/tmp/droid/shot.png' };
+				yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'rd_' + n, name: 'Read', input: rd }] } };
+				const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+				yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'rd_' + n, content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }] }] } };
+			}
+			if (text.startsWith('search: ')) {
+				const input = { query: text.slice(8) };
+				yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'ws_' + n, name: 'WebSearch', input }] } };
+				const d = await options.canUseTool('WebSearch', input);
+				const links = [{ title: 'First', url: 'https://one.example/a' }, { title: 'Second', url: 'https://two.example/b' }];
+				yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'ws_' + n, is_error: d.behavior !== 'allow', content: 'Web search results for query: "' + input.query + '"\\n\\nLinks: ' + JSON.stringify(links) + '\\n\\nsummary' }] } };
+			}
+			if (text.startsWith('ask: ')) {
+				const [question, ...labels] = text.slice(5).split('|');
+				const input = { questions: [{ question, header: 'Pick', multiSelect: false, options: labels.map((label) => ({ label, description: 'd' })) }] };
+				yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'ask_' + n, name: 'AskUserQuestion', input }] } };
+				const d = await options.canUseTool('AskUserQuestion', input);
+				note({ asked: d });
+				yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'ask_' + n, is_error: d.behavior !== 'allow', content: d.behavior === 'allow' ? JSON.stringify(d.updatedInput.answers) : d.message }] } };
+			}
 			if (text.startsWith('tool: ')) {
 				const input = { command: text.slice(6), description: '运行测试命令' };
 				const id = 'toolu_' + n;
@@ -257,4 +282,52 @@ test('signing out of Claude while Antigravity is signed in moves to a model that
 	assert.deepEqual(auth, { type: 'auth', loggedIn: true, accounts: { claude: false, agy: true } });
 	const s = (await api('/api/status')).settings;
 	assert.deepEqual({ model: s.model, modelName: s.modelName }, { model: 'agy:gemini-4-carbon-high', modelName: 'Gemini 4 Carbon (High)' });
+});
+
+test("Claude's AskUserQuestion: a sheet, the answer as Claude Code expects it", async () => {
+	// Back to Claude with a working login for this one.
+	writeFileSync(join(home, 'bin', 'claude'), FAKE_CLAUDE);
+	chmodSync(join(home, 'bin', 'claude'), 0o755);
+	await api('/api/settings', { model: 'sonnet', modelName: 'Sonnet 5.5', mode: 'bypassPermissions' });
+	const id = await newSession();
+	const from = events.length;
+	await api('/api/send', { text: 'ask: Which one?|A|B', sessionId: id });
+	const q = await waitFor((e) => e.type === 'question' && e.sessionId === id, { from });
+	assert.equal(q.questions[0].options[1].label, 'B');
+	assert.ok(!events.slice(from).some((e) => e.type === 'tool_use' && e.name === 'AskUserQuestion' && false));
+	await api('/api/answer', { id: q.id, sessionId: id, answers: { 'Which one?': 'B, and something else' } });
+	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
+	const asked = sdk().filter((l) => l.asked).at(-1).asked;
+	assert.deepEqual(asked, { behavior: 'allow', updatedInput: { questions: asked.updatedInput.questions, answers: { 'Which one?': 'B, and something else' } } });
+	await api('/api/settings', { mode: 'acceptEdits' });
+});
+
+test('a web search: its query and results on the step, its sources under the answer, kept', async () => {
+	const id = await newSession();
+	const t = await say(id, 'search: 电池 健康');
+	const res = t.events.find((e) => e.type === 'tool_result');
+	assert.equal(res.query, '电池 健康');
+	assert.deepEqual(res.sources.map((x) => x.url), ['https://one.example/a', 'https://two.example/b']);
+	assert.deepEqual(t.result.sources, res.sources);
+	const sess = await storedWhen(id, (x) => x.messages.some((m) => m.role === 'assistant' && m.sources));
+	assert.deepEqual(sess.messages.find((m) => m.role === 'assistant').sources, res.sources);
+	assert.equal(sess.messages.find((m) => m.role === 'tool').query, '电池 健康');
+	// The next answer starts with no sources of its own.
+	assert.deepEqual((await say(id, 'plain')).result.sources, []);
+});
+
+test("a file change shows what changed; a picture a step returned is kept and shown", async () => {
+	const id = await newSession();
+	const t = await say(id, 'edit and shoot');
+	const edit = t.events.find((e) => e.type === 'tool_use' && e.name === 'Edit');
+	assert.deepEqual(edit.diff, { path: '/sdcard/a.txt', old: 'one\ntwo\nthree', new: 'one\nTWO\nthree' });
+	const shot = t.events.find((e) => e.type === 'tool_result' && e.images);
+	assert.match(shot.images[0], /^\/api\/media\/[0-9a-f]{24}\.png$/);
+	const img = await fetch(base + shot.images[0]);
+	assert.equal(img.headers.get('content-type'), 'image/png');
+	assert.equal(Buffer.from(await img.arrayBuffer()).subarray(1, 4).toString(), 'PNG');
+	assert.equal((await fetch(base + '/api/media/../../etc/passwd')).status, 404);
+	const sess = await storedWhen(id, (x) => x.messages.some((m) => m.images));
+	assert.deepEqual(sess.messages.find((m) => m.images).images, shot.images);
+	assert.ok(sess.messages.find((m) => m.name === 'Edit').diff);
 });

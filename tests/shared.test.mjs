@@ -104,3 +104,17 @@ test('skill links in ~/.gemini/skills: ours follow what is wanted, the owner\'s 
 		assert.equal(readlinkSync(join(target, 'theirs')), join(elsewhere, 'theirs'));
 	} finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+// ---------------------------------------------------------------- sources
+import { sourcesOf, mergeSources, queryOf } from '../app/server/sources.mjs';
+test("a search's links, a fetched page, links in other tools' text", () => {
+	const t = 'Web search results for query: "pixel 9 battery [2026]"\n\nLinks: [{"title":"Pixel [9] review","url":"https://www.gsmarena.com/x"},{"title":"Battery","url":"https://support.google.com/y?a=1"}]\n\nSummary https://ignored.example';
+	assert.equal(queryOf(t), 'pixel 9 battery [2026]');
+	assert.deepEqual(sourcesOf('WebSearch', {}, t), [{ title: 'Pixel [9] review', url: 'https://www.gsmarena.com/x' }, { title: 'Battery', url: 'https://support.google.com/y?a=1' }]);
+	assert.deepEqual(sourcesOf('WebSearch', {}, 'results: https://a.example/1 and https://b.example/2.'), [{ title: 'a.example', url: 'https://a.example/1' }, { title: 'b.example', url: 'https://b.example/2' }]);
+	assert.deepEqual(sourcesOf('WebFetch', { url: 'https://a.b/c' }, 'x'), [{ title: 'a.b', url: 'https://a.b/c' }]);
+	assert.deepEqual(sourcesOf('mcp__droidagent__browser_open', { url: 'https://a.b/c' }, '标题：A page\n...'), [{ title: 'A page', url: 'https://a.b/c' }]);
+	assert.deepEqual(sourcesOf('mcp__x__search', {}, 'see [Doc](https://d.e/f), and https://g.h/i.'), [{ title: 'Doc', url: 'https://d.e/f' }, { title: 'g.h', url: 'https://g.h/i' }]);
+	assert.deepEqual(sourcesOf('Bash', {}, 'https://x.y'), [], 'a command printing a link is not a source');
+	assert.deepEqual(mergeSources([{ url: 'https://a.b/c' }], [{ url: 'https://a.b/c' }, { url: 'ftp://x' }, { url: 'javascript:alert(1)' }]), [{ title: 'a.b', url: 'https://a.b/c' }]);
+});

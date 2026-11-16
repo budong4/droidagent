@@ -417,7 +417,7 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 
 	// One conversation, through `agy acp`. `settings` is the live object (model, effort, mode).
 	// Full access is the one mode where agy is told not to ask at all.
-	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, canUseTool }) {
+	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, canUseTool, mcpServers = [] }) {
 		const bin = find();
 		if (!bin) {
 			// Nothing to start: every message says how to get it.
@@ -436,7 +436,7 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 		const args = ['acp', ...(settings.mode === 'bypassPermissions' ? ['--dangerously-skip-permissions'] : [])];
 		return openAcp({
 			spawnSpec: { bin, args, env: env() }, cwd, tag, log, settings, conversation,
-			systemPrompt: preamble, prepareTurn, canUseTool,
+			systemPrompt: preamble, prepareTurn, canUseTool, mcpServers,
 			normalize: normalizeAgyTool, modelSlug: agySlug, errorText: agyErrorText,
 		});
 	}

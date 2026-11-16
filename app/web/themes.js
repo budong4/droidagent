@@ -5,7 +5,7 @@
    and the illustrations, which are original vector drawings (nothing copied from any show). */
 (function () {
 	const THEMES = [
-		{ id: 'default', name: '雾蓝', group: 'solid', scheme: 'auto', color: '#3B66B8', note: '跟随系统' },
+		{ id: 'default', name: '青瓷', group: 'solid', scheme: 'auto', color: '#1E7A6E', note: '跟随系统' },
 		{ id: 'paper', name: '纸白', group: 'solid', scheme: 'light', color: '#3A5BA0' },
 		{ id: 'circuit', name: '电路板', group: 'solid', scheme: 'auto', color: '#1E6A4F', note: '跟随系统' },
 		{ id: 'matcha', name: '抹茶', group: 'solid', scheme: 'light', color: '#5B7B3A' },
@@ -165,7 +165,7 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 
 	/* ---------------- applying a look ---------------- */
 	// wall: '' = the theme's own art, 'custom' = the owner's picture (version in bg), else a preset id
-	const DEFAULT_LOOK = { theme: 'default', font: 'system', fontSize: 'normal', collapseProcess: true, wall: '', bg: 0, dim: 60 };
+	const DEFAULT_LOOK = { theme: 'default', font: 'system', fontSize: 'normal', collapseProcess: true, translateThinking: true, wall: '', bg: 0, dim: 60 };
 	function load() {
 		let l = {};
 		try { l = JSON.parse(localStorage.getItem('look') || '{}') || {}; } catch (e) { /* private mode */ }
@@ -178,6 +178,7 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		if (!FONTS.some((f) => f.id === look.font)) look.font = 'system';
 		if (!(look.fontSize in FONT_SCALES)) look.fontSize = 'normal';
 		look.collapseProcess = look.collapseProcess !== false;
+		look.translateThinking = look.translateThinking !== false;
 		return look;
 	}
 	function save(look) { try { localStorage.setItem('look', JSON.stringify(look)); } catch (e) { /* */ } }
@@ -212,7 +213,7 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		const meta = document.querySelector('meta[name="theme-color"]');
 		const fallbackBar = look.theme === 'circuit'
 			? (scheme === 'dark' ? '#0D1411' : '#F5F6F2')
-			: (scheme === 'dark' ? '#0E121B' : '#EDF2FB');
+			: (scheme === 'dark' ? '#131517' : '#F6F7F6');
 		if (meta) meta.setAttribute('content', THEME_BAR[look.theme] || fallbackBar);
 	}
 

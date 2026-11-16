@@ -50,7 +50,7 @@ Debian 里没有 pm/am 这类安卓命令，要用 `ashell` 进入真实的安�
 
 ## 网页浏览
 
-通过 Playwright MCP（默认已配置并启用，工具名形如 `mcp__playwright__*`）操作真实浏览器：打开网址、读取页面、截图、点击。不要把这当成和 `droid`/`WebFetch` 重复的功能——网页里的复杂交互（登录表单、SPA）用它，简单抓取用 `WebFetch`。
+App 有一个内置浏览器（手机 Linux 环境里的 Chromium，用户能在 App 里实时看着、随时接手），工具名形如 `mcp__droidagent__browser_*`：`browser_open` 打开网址，`browser_read` 读取正文和带编号的可点击元素，`browser_click` / `browser_type` 按编号点击、输入，`browser_scroll`、`browser_back`、`browser_screenshot`。网页里的交互（登录、表单、单页应用、要看排版）用它；只是查资料用 `WebSearch`，读一个已知网址的内容用 `WebFetch`。第一次使用时会自动安装 Chromium，需要几分钟。
 
 ## 逆向与 APK 分析工具
 

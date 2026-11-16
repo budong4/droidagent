@@ -15,7 +15,7 @@ GH = r'C:\Program Files\GitHub CLI\gh.exe'
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BT = os.path.expanduser(r'~\AppData\Local\Android\Sdk\build-tools\34.0.0')
 CERT = 'b9aeb82c05b52451875d9956d25eb6a51b924de807c8683f3ac55890215e111c'
-WEB_CACHE = 'droidagent-v20'
+WEB_CACHE = 'droidagent-v25'
 ok = True
 
 

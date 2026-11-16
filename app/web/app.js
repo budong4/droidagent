@@ -116,6 +116,7 @@ $$('.sheet-close').forEach((b) => b.addEventListener('click', () => closeLayer('
 /* ---------------- full-screen pages ---------------- */
 const pageStack = [];
 const PAGE_OPEN = {};   // id -> fn run each time the page opens
+const PAGE_CLOSE = {};  // id -> fn run when it closes
 function underOf(depth) { return depth > 0 ? $('#' + pageStack[depth - 1]) : $('#app'); }
 function openPage(id) {
 	if (pageStack.includes(id)) return;
@@ -131,6 +132,7 @@ function openPage(id) {
 		pageStack.splice(i, 1);
 		hide(p);
 		underOf(i).classList.remove('pushed');
+		PAGE_CLOSE[id]?.();
 	});
 	if (PAGE_OPEN[id]) PAGE_OPEN[id]();
 }
@@ -219,10 +221,12 @@ function updateLookValues() {
 	$$('.font-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === look.font));
 	$$('#font-size-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.size === (look.fontSize || 'normal')));
 	if ($('#t-collapse-process')) $('#t-collapse-process').checked = look.collapseProcess !== false;
+	if ($('#t-translate-think')) $('#t-translate-think').checked = look.translateThinking !== false;
 }
 $$('#font-size-seg button').forEach((b) => b.addEventListener('click', () => {
 	if (look.fontSize !== b.dataset.size) setLook({ fontSize: b.dataset.size });
 }));
+$('#t-translate-think')?.addEventListener('change', (e) => setLook({ translateThinking: e.target.checked }));
 $('#t-collapse-process')?.addEventListener('change', (e) => {
 	setLook({ collapseProcess: e.target.checked });
 	if (typeof syncProcessGroups === 'function') syncProcessGroups();
@@ -800,7 +804,19 @@ function addUser(text) {
 	endAssistant();
 	const e = el('div', 'msg user');
 	const b = el('div', 'bubble'); b.textContent = text;
+	e.dataset.text = text;
 	e.appendChild(b);
+	// A tap on a sent message: copy it, or put it back in the box to change and send again.
+	b.addEventListener('click', () => {
+		if (e.querySelector('.user-acts')) { e.querySelector('.user-acts').remove(); return; }
+		const acts = el('div', 'user-acts');
+		const cp = el('button', 'msg-act', `${ic('i-copy')}<span>复制</span>`);
+		cp.addEventListener('click', () => { copyText(text); acts.remove(); });
+		const ed = el('button', 'msg-act', `${ic('i-pen')}<span>编辑后重发</span>`);
+		ed.addEventListener('click', () => { input.value = text; input.dispatchEvent(new Event('input')); input.focus(); acts.remove(); });
+		acts.append(cp, ed);
+		e.appendChild(acts);
+	});
 	thread.appendChild(e);
 	scroll(true);
 	return e;
@@ -830,24 +846,84 @@ function addMsgActions(wrap, raw, tookMs) {
 	const copy = el('button', 'msg-act', `${ic('i-copy')}<span>复制</span>`);
 	copy.addEventListener('click', () => copyText(raw));
 	acts.appendChild(copy);
+	// Ask again: the message this answer replied to goes out once more.
+	const retry = el('button', 'msg-act retry', `${ic('i-refresh')}<span>重试</span>`);
+	retry.addEventListener('click', () => {
+		let n = wrap.previousElementSibling;
+		while (n && !n.classList.contains('user')) n = n.previousElementSibling;
+		const text = n?.dataset.text;
+		if (!text || running) { toast(running ? '等这一轮结束再重试' : '找不到上一条消息'); return; }
+		input.value = text; send();
+	});
+	acts.appendChild(retry);
 	if (tookMs) acts.appendChild(el('span', 'msg-meta', `用时 ${fmtSecs(tookMs)}`));
 	wrap.appendChild(acts);
 }
+// Actions show under the newest answer only; an older one shows its own when tapped.
+function markLatest() {
+	const all = $$('#thread .msg.assistant');
+	all.forEach((m, i) => m.classList.toggle('latest', i === all.length - 1));
+}
+thread.addEventListener('click', (e) => {
+	const m = e.target.closest('.msg.assistant');
+	if (!m || e.target.closest('a, button, .code')) return;
+	if (!m.classList.contains('latest')) m.classList.toggle('show-acts');
+});
 function endAssistant() {
 	if (curAssistant) {
 		curAssistant.wrap.classList.remove('streaming');
 		addMsgActions(curAssistant.wrap, curAssistant.raw);
 		curAssistant = null;
+		markLatest();
 	}
 	endThink();
 }
-function addAssistantStatic(text, tookMs) {
+function addAssistantStatic(text, tookMs, sources) {
 	const wrap = el('div', 'msg assistant');
 	const body = el('div', 'md');
 	body.innerHTML = md(text || '');
 	wrap.appendChild(body);
+	if (sources?.length) wrap.appendChild(sourcesRow(sources));
 	addMsgActions(wrap, text, tookMs);
 	thread.appendChild(wrap);
+	markLatest();
+}
+
+/* ---------------- sources: what a search found, what an answer drew on ---------------- */
+const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } };
+// A small round mark per site, from its name: no request goes out to fetch icons.
+function siteMark(host) {
+	let h = 0;
+	for (const c of host) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+	return `<span class="site-mark" style="--h:${h % 360}">${esc((host.replace(/^(m|en|zh)\./, '')[0] || '?').toUpperCase())}</span>`;
+}
+function sourcesRow(sources) {
+	const row = el('div', 'sources');
+	const list = sources.slice(0, 8);
+	row.innerHTML = `<div class="sources-h">${ic('i-globe')}<span>来源 · ${sources.length}</span></div><div class="sources-chips">${list.map((s, i) => {
+		const host = hostOf(s.url);
+		return `<a class="src-chip" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.title)}">${siteMark(host)}<span class="src-t">${esc(s.title && s.title !== host ? s.title : host)}</span><span class="src-n">${i + 1}</span></a>`;
+	}).join('')}</div>`;
+	return row;
+}
+// Under a search step: what it found, as links rather than raw text.
+function sourcesList(sources) {
+	return `<div class="src-list">${sources.map((s) => {
+		const host = hostOf(s.url);
+		return `<a class="src-item" href="${esc(s.url)}" target="_blank" rel="noopener">${siteMark(host)}<span class="src-item-t"><span>${esc(s.title || host)}</span><small>${esc(host)}</small></span></a>`;
+	}).join('')}</div>`;
+}
+// The turn's sources go under its last reply.
+function markTurnSources(sources) {
+	if (!sources?.length) return;
+	const kids = [...thread.children];
+	for (let i = kids.length - 1; i >= 0 && !kids[i].classList.contains('user'); i--) {
+		if (kids[i].classList.contains('assistant') && !$('.sources', kids[i])) {
+			const acts = $('.msg-acts', kids[i]);
+			kids[i].insertBefore(sourcesRow(sources), acts || null);
+			return;
+		}
+	}
 }
 // The turn's total time goes under its last reply.
 function markTurnTime(ms) {
@@ -875,7 +951,7 @@ function toolCategory(name) {
 	if (String(name).startsWith('mcp__')) return 'MCP';
 	return '工具';
 }
-const CATEGORY_ICON = { 命令: 'i-terminal', 读取: 'i-file', 修改文件: 'i-pen', 查找: 'i-search', 联网: 'i-globe', 技能: 'i-layers', 子任务: 'i-layers', MCP: 'i-plug' };
+const CATEGORY_ICON = { 命令: 'i-terminal', 读取: 'i-file', 修改文件: 'i-pen', 查找: 'i-search', 联网: 'i-globe', 技能: 'i-layers', 子任务: 'i-layers', MCP: 'i-plug', 浏览器: 'i-compass', 提问: 'i-info' };
 function toolIcon(name, detail, category) {
 	const d = detail || '';
 	if (name === 'Bash' && /droid (shot|ui|top)|screencap|uiautomator/.test(d)) return ic('i-shot');
@@ -885,6 +961,7 @@ function toolIcon(name, detail, category) {
 }
 const DETAIL_LABEL = (name) => (name === 'Bash' ? '命令' : /^(Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead)$/.test(name) ? '文件' : '内容');
 function addTool(id, name, title, detail, replay, category) {
+	if (isAskTool(name)) return null;
 	if (!replay) endAssistant();
 	killWelcome();
 	const cat = category || toolCategory(name);
@@ -894,22 +971,65 @@ function addTool(id, name, title, detail, replay, category) {
 	$('.tool-title', card).textContent = title || name;
 	if (detail) $('.tool-detail', card).textContent = detail;
 	$('.tool-head', card).addEventListener('click', () => card.classList.toggle('open'));
+	if (String(name).startsWith('mcp__droidagent__browser_')) {
+		const watch = el('button', 'pill-btn tool-watch', `${ic('i-compass')}看浏览器`);
+		watch.addEventListener('click', (e) => { e.stopPropagation(); openBrowserPage(); });
+		$('.tool-inner', card).prepend(watch);
+	}
 	thread.appendChild(card);
 	if (id) toolEls.set(id, card);
 	scroll();
 	return card;
 }
-function finishTool(id, ok, summary) {
+function finishTool(id, ok, summary, extra = {}) {
 	const card = toolEls.get(id); if (!card) return;
 	const st = $('.tool-state', card);
 	st.innerHTML = ok ? ic('i-check') : '出错';
 	st.className = 'tool-state ' + (ok ? 'ok' : 'err');
 	card.classList.toggle('failed', !ok);
-	if (summary && summary.trim()) {
+	if (extra.images?.length) addImages(card, extra.images);
+	if (extra.diff && !$('.diff', card)) addDiff(card, extra.diff);
+	if (extra.sources?.length) {
+		// A search shows what it found: a count on the step, the links inside.
+		card.classList.add('has-sources');
+		const t = $('.tool-title', card);
+		if (extra.query) t.textContent = `搜索「${extra.query}」`;
+		t.insertAdjacentHTML('beforeend', `<span class="tool-count">${extra.sources.length} 个结果</span>`);
+		const sec = $('.tool-sec.res', card);
+		$('.tool-sec-h', sec).textContent = extra.query ? '搜到的网页' : '读取的网页';
+		$('.tool-result', sec).outerHTML = sourcesList(extra.sources);
+		sec.classList.remove('hidden');
+	} else if (summary && summary.trim()) {
 		$('.tool-result', card).textContent = summary.trim();
 		$('.tool-sec.res', card).classList.remove('hidden');
 	}
 	scroll();
+}
+
+// A file change as lines taken out and put in, the lines both share at the ends left out.
+function diffLines(oldText, newText) {
+	const a = String(oldText || '').split('\n'), b = String(newText || '').split('\n');
+	if (!oldText) return b.map((l) => ['+', l]);
+	let s = 0;
+	while (s < a.length && s < b.length && a[s] === b[s]) s++;
+	let e = 0;
+	while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+	const ctx = (l) => [' ', l];
+	return [...a.slice(Math.max(0, s - 2), s).map(ctx), ...a.slice(s, a.length - e).map((l) => ['-', l]), ...b.slice(s, b.length - e).map((l) => ['+', l]), ...a.slice(a.length - e, a.length - e + 2).map(ctx)];
+}
+function addDiff(card, d) {
+	const lines = diffLines(d.old, d.new).slice(0, 200);
+	const add = lines.filter((l) => l[0] === '+').length, del = lines.filter((l) => l[0] === '-').length;
+	const sec = el('div', 'tool-sec diff');
+	sec.innerHTML = `<div class="tool-sec-h">改动<span class="diff-stat"><b class="plus">+${add}</b> <b class="minus">−${del}</b></span></div><pre class="diff-body">${lines.map(([k, l]) => `<span class="dl ${k === '+' ? 'add' : k === '-' ? 'del' : 'ctx'}">${esc(k === ' ' ? ' ' : k)} ${esc(l)}</span>`).join('')}</pre>`;
+	$('.tool-inner', card).appendChild(sec);
+	$('.tool-title', card).insertAdjacentHTML('beforeend', `<span class="tool-count"><b class="plus">+${add}</b> <b class="minus">−${del}</b></span>`);
+}
+// Pictures a step returned, shown with it (a tap opens the full size).
+function addImages(card, urls) {
+	const box = el('div', 'tool-images');
+	box.innerHTML = urls.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" loading="lazy" alt="步骤返回的图片"></a>`).join('');
+	card.appendChild(box);
 }
 
 /* ---------------- thinking ---------------- */
@@ -919,8 +1039,9 @@ function startThink() {
 	if (curThink) return curThink;
 	killWelcome();
 	const card = el('div', 'think live open');
-	card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span><span class="think-time">0 秒</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div></div></div>`;
-	$('.think-head', card).addEventListener('click', () => card.classList.toggle('open'));
+	card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span><span class="think-time">0 秒</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div></div><div class="think-zh hidden"></div><button class="think-lang hidden"></button></div>`;
+	$('.think-head', card).addEventListener('click', () => { card.classList.toggle('open'); if (card.classList.contains('open')) translateThink(card); });
+	$('.think-lang', card).addEventListener('click', () => { card.classList.toggle('show-orig'); syncThinkLang(card); });
 	thread.appendChild(card);
 	curThink = { card, body: $('.think-body > div', card), start: Date.now() };
 	scroll();
@@ -930,6 +1051,29 @@ function addThinkDelta(text) {
 	const t = startThink();
 	if (t.card.classList.contains('open')) growing(() => { t.body.textContent += text; });
 	else t.body.textContent += text;
+}
+// Opened after the fact: in Chinese when it was written in another language (the setting is on by default).
+function syncThinkLang(card) {
+	const orig = card.classList.contains('show-orig') || !card.dataset.zh;
+	$('.think-body > div', card).classList.toggle('hidden', !orig);
+	$('.think-zh', card).classList.toggle('hidden', orig);
+	const b = $('.think-lang', card);
+	b.classList.toggle('hidden', !card.dataset.zh && !card.classList.contains('translating'));
+	b.textContent = card.classList.contains('translating') ? '正在翻译成中文…' : orig ? '看中文' : '看原文';
+}
+async function translateThink(card) {
+	if (look.translateThinking === false || card.classList.contains('live') || card.dataset.zh || card.classList.contains('translating') || card.dataset.same) return;
+	const text = $('.think-body > div', card).textContent;
+	if (!text.trim()) return;
+	card.classList.add('translating');
+	syncThinkLang(card);
+	const r = await api('/api/translate', { text, sessionId: curSession?.id });
+	card.classList.remove('translating');
+	if (r.ok && r.same) card.dataset.same = '1';
+	else if (r.ok && r.text) { card.dataset.zh = '1'; $('.think-zh', card).textContent = r.text; }
+	else $('.think-lang', card).textContent = '没能翻译：' + (r.error || '请重试');
+	syncThinkLang(card);
+	if (!r.ok) $('.think-lang', card).classList.remove('hidden');
 }
 function closeThinkCard(card, ms, hasText) {
 	card.classList.remove('live', 'open');
@@ -1012,6 +1156,155 @@ function addPermission(p) {
 	scroll(true);
 }
 
+/* ---------------- the built-in browser ---------------- */
+// Its live picture (an MJPEG stream from the server) while this page is open; a tap on it is a tap
+// in the browser, a vertical swipe scrolls it, the bar navigates, the field types into the page.
+let browserState = { running: false };
+const browserOpen = () => pageStack.includes('page-browser');
+function renderBrowserState(st) {
+	browserState = { ...browserState, ...st };
+	const label = browserState.title || browserState.url || '';
+	$('#browser-row').classList.toggle('hidden', !browserState.running || browserOpen());
+	$('#browser-row-title').textContent = label;
+	if ($('#val-browser')) $('#val-browser').textContent = browserState.running ? '运行中' : browserState.installed === false ? '首次使用时安装' : '';
+	if (browserOpen()) {
+		if (document.activeElement !== $('#browser-url')) $('#browser-url').value = browserState.url && browserState.url !== 'about:blank' ? browserState.url : '';
+		$('#browser-stage').classList.toggle('loading', !!browserState.loading);
+		if (browserState.installing) $('#browser-empty-text').textContent = '正在安装浏览器（Chromium），第一次需要几分钟…';
+	}
+}
+async function openBrowserPage() {
+	openPage('page-browser');
+	$('#browser-row').classList.add('hidden');
+	const img = $('#browser-view');
+	$('#browser-empty').classList.remove('hidden');
+	$('#browser-empty-text').textContent = '正在启动浏览器…';
+	const r = await api('/api/browser/start', {});
+	if (!r.ok) { $('#browser-empty-text').textContent = r.error || '浏览器启动不了'; $('.spin', $('#browser-empty'))?.remove(); return; }
+	renderBrowserState(r);
+	img.src = '/api/browser/stream?t=' + Date.now();
+	// An endless MJPEG image never fires "load": the first frame shows as the image getting a size.
+	const shown = () => { if (!browserOpen()) return; if (img.naturalWidth > 0) $('#browser-empty').classList.add('hidden'); else setTimeout(shown, 150); };
+	shown();
+}
+PAGE_CLOSE['page-browser'] = () => { $('#browser-view').removeAttribute('src'); renderBrowserState({}); };
+(() => {
+	const stage = $('#browser-stage');
+	let start = null;
+	stage.addEventListener('pointerdown', (e) => { start = { x: e.clientX, y: e.clientY, t: Date.now() }; });
+	stage.addEventListener('pointerup', (e) => {
+		if (!start) return;
+		const img = $('#browser-view');
+		const r = img.getBoundingClientRect();
+		const dy = e.clientY - start.y;
+		if (Math.abs(dy) > 14) api('/api/browser/input', { type: 'scroll', dy: Math.round(-dy * (412 / r.width) * 1.4) });
+		else if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+			api('/api/browser/input', { type: 'tap', x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height });
+		}
+		start = null;
+	});
+	$('#browser-go').addEventListener('submit', (e) => { e.preventDefault(); const url = $('#browser-url').value.trim(); if (url) { api('/api/browser/input', { type: 'navigate', url }); $('#browser-url').blur(); } });
+	$('#browser-reload').addEventListener('click', () => api('/api/browser/input', { type: 'reload' }));
+	$('#browser-back').addEventListener('click', () => api('/api/browser/input', { type: 'back' }));
+	$('#browser-fwd').addEventListener('click', () => api('/api/browser/input', { type: 'forward' }));
+	$('#browser-type').addEventListener('submit', async (e) => {
+		e.preventDefault();
+		const t = $('#browser-text').value;
+		if (!t) { api('/api/browser/input', { type: 'key', key: 'Enter' }); return; }
+		await api('/api/browser/input', { type: 'text', text: t });
+		$('#browser-text').value = '';
+	});
+	$('#browser-row').addEventListener('click', openBrowserPage);
+	$('#set-browser-row')?.addEventListener('click', openBrowserPage);
+})();
+getJSON('/api/browser').then((r) => { if (r.ok) renderBrowserState(r); });
+
+/* ---------------- the assistant's questions ---------------- */
+// A card in the conversation (the question, then the answer), and a sheet to answer it in.
+const askCards = new Map(); // id -> { card, q }
+let askOpen = null; // the question the sheet is showing
+const isAskTool = (name) => name === 'AskUserQuestion' || name === 'mcp__droidagent__ask_user';
+function addQuestion(q) {
+	endAssistant();
+	killWelcome();
+	const card = el('div', 'ask-card');
+	thread.appendChild(card);
+	askCards.set(q.id, { card, q });
+	renderQuestionCard(q);
+	scroll(true);
+}
+function renderQuestionCard(q) {
+	const entry = askCards.get(q.id);
+	if (!entry) return;
+	entry.q = q;
+	const done = !!q.verdict;
+	const rows = q.questions.map((x) => {
+		const a = q.answers?.[x.question];
+		return `<div class="ask-q"><div class="ask-q-text">${esc(x.question)}</div>${done ? `<div class="ask-a ${a ? '' : 'none'}">${a ? esc(a) : q.verdict === 'expired' ? '已失效' : '没有回答'}</div>` : ''}</div>`;
+	}).join('');
+	entry.card.className = 'ask-card' + (done ? ' done' : '');
+	entry.card.innerHTML = `<div class="ask-top">${ic('i-spark')}<span>${done ? '助手问了你' : '助手在等你回答'}</span></div>${rows}${done ? '' : '<button class="primary ask-open">回答</button>'}`;
+	$('.ask-open', entry.card)?.addEventListener('click', () => openAsk(q));
+}
+function openAsk(q) {
+	askOpen = { q, picked: q.questions.map(() => new Set()), other: q.questions.map(() => '') };
+	const body = $('#ask-body');
+	body.innerHTML = '';
+	q.questions.forEach((x, i) => {
+		const sec = el('div', 'ask-sec');
+		sec.innerHTML = `${x.header ? `<span class="ask-chip">${esc(x.header)}</span>` : ''}<div class="ask-title">${esc(x.question)}</div>${x.multiSelect ? '<div class="ask-hint">可以选多个</div>' : ''}`;
+		const opts = el('div', 'ask-opts');
+		const pick = (label, btn) => {
+			const set = askOpen.picked[i];
+			if (x.multiSelect) { if (set.has(label)) set.delete(label); else set.add(label); } else { set.clear(); set.add(label); askOpen.other[i] = ''; $('.ask-other input', sec).value = ''; }
+			$$('.ask-opt', opts).forEach((b) => b.classList.toggle('sel', set.has(b.dataset.label)));
+			syncAsk();
+		};
+		for (const o of x.options) {
+			const b = el('button', 'ask-opt', `<span class="ask-mark"></span><span class="ask-opt-t"><span>${esc(o.label)}</span>${o.description ? `<small>${esc(o.description)}</small>` : ''}</span>`);
+			b.dataset.label = o.label;
+			b.addEventListener('click', () => pick(o.label, b));
+			opts.appendChild(b);
+		}
+		const other = el('label', 'ask-other', '<input type="text" placeholder="其他，自己写…" autocomplete="off">');
+		$('input', other).addEventListener('input', (e) => {
+			askOpen.other[i] = e.target.value;
+			if (!x.multiSelect && e.target.value.trim()) { askOpen.picked[i].clear(); $$('.ask-opt', opts).forEach((b) => b.classList.remove('sel')); }
+			syncAsk();
+		});
+		sec.appendChild(opts);
+		sec.appendChild(other);
+		body.appendChild(sec);
+	});
+	syncAsk();
+	openSheet('sheet-ask');
+}
+function askAnswers() {
+	if (!askOpen) return null;
+	const out = {};
+	askOpen.q.questions.forEach((x, i) => {
+		const parts = [...askOpen.picked[i]];
+		const typed = askOpen.other[i].trim();
+		if (typed) parts.push(typed);
+		if (parts.length) out[x.question] = parts.join(', ');
+	});
+	return out;
+}
+function syncAsk() {
+	const a = askAnswers();
+	$('#ask-send').disabled = !a || Object.keys(a).length < askOpen.q.questions.length;
+}
+function answerAsk(answers) {
+	if (!askOpen) return;
+	const q = askOpen.q;
+	askOpen = null;
+	closeLayer('sheet');
+	api('/api/answer', { id: q.id, answers, sessionId: q.sessionId || curSession?.id });
+	renderQuestionCard({ ...q, answers, verdict: answers ? 'answered' : 'skipped' });
+}
+$('#ask-send').addEventListener('click', () => answerAsk(askAnswers()));
+$('#ask-skip').addEventListener('click', () => answerAsk(null));
+
 // Copy buttons on code blocks (rendered as markup, so handled here once).
 thread.addEventListener('click', (e) => {
 	const b = e.target.closest('.code-copy');
@@ -1051,20 +1344,23 @@ function renderTranscript(sess) {
 	thread.innerHTML = '';
 	toolEls.clear();
 	permMarks.clear();
+	askCards.clear();
 	curAssistant = null; curThink = null; curTodoEl = null;
 	chatTitle.textContent = sess?.title || '新对话';
 	if (!sess || !sess.messages || !sess.messages.length) buildWelcome();
 	else {
 		for (const m of sess.messages) {
 			if (m.role === 'user') addUser(typedText(m.text));
-			else if (m.role === 'assistant') { endAssistant(); addAssistantStatic(m.text, m.tookMs); }
+			else if (m.role === 'assistant') { endAssistant(); addAssistantStatic(m.text, m.tookMs, m.sources); }
 			else if (m.role === 'tool') {
 				if (m.kind === 'todo') { upsertTodo(m.todos || []); continue; }
-				addTool(m.id, m.name, m.title, m.detail, true, m.category);
-				if (m.state && m.state !== 'running') finishTool(m.id, m.ok !== false, m.summary);
+				const c = addTool(m.id, m.name, m.title, m.detail, true, m.category);
+				if (m.diff && c) addDiff(c, m.diff);
+				if (m.state && m.state !== 'running') finishTool(m.id, m.ok !== false, m.summary, { sources: m.sources, query: m.query, images: m.images });
 			} else if (m.role === 'think') addThinkStatic(m.text, m.ms);
 			else if (m.role === 'cmdout') addCmdOut(m.text);
 			else if (m.role === 'perm') addPermission({ ...m, sessionId: sess.id });
+			else if (m.role === 'ask') addQuestion({ ...m, sessionId: sess.id });
 			else if (m.role === 'sys') sysline(m.text);
 		}
 		groupProcessBlocks({ staticMode: true });
@@ -1092,12 +1388,15 @@ function updateProcessGroupHead(grp) {
 	const cmdOuts = [...inner.querySelectorAll('.cmd-out')];
 	const errCount = tools.filter((t) => t.classList.contains('failed')).length;
 	const total = tools.length + cmdOuts.length + thinks.length;
-	let title = '执行过程';
-	if (tools.length && errCount) title = `执行了 ${tools.length} 步（${errCount} 步出错）`;
-	else if (tools.length) title = `已完成 ${tools.length} 步操作`;
+	// Says what was done, not just how much: the first steps by name, then how many in all.
+	const names = tools.map((t) => $('.tool-title', t)?.firstChild?.textContent || '').filter(Boolean);
+	let title = '思考过程';
+	if (names.length === 1) title = names[0];
+	else if (names.length) title = `${names.slice(0, 2).join('、')}${names.length > 2 ? ` 等 ${names.length} 步` : ''}`;
 	else if (cmdOuts.length) title = `命令输出（${cmdOuts.length}）`;
 	$('.process-title', grp).textContent = title;
-	$('.process-count', grp).textContent = `${tools.length || total} 步`;
+	$('.process-count', grp).textContent = errCount ? `${errCount} 步出错` : '';
+	$('.process-count', grp).classList.toggle('hidden', !errCount);
 	grp.classList.toggle('has-err', errCount > 0);
 }
 function syncProcessGroups() {
@@ -2291,9 +2590,14 @@ function showUpdateNotice(u) {
 	try { seen = localStorage.getItem('seenUpdate') || ''; } catch { /* */ }
 	if (seen === u.to) return;
 	try { localStorage.setItem('seenUpdate', u.to); } catch { /* */ }
-	const notes = String(u.notes || '').split('\n').map((l) => l.trim().replace(/^[-*]\s*/, '')).filter((l) => l && !/^#|^---/.test(l)).slice(0, 6).join('；');
-	sysline(`DroidAgent 已更新到 ${u.to}${notes ? '：' + notes : ''}`);
+	// A sheet of its own, over the conversation, not a line in it.
+	const notes = String(u.notes || '').split('\n').filter((l) => !/^\s*(#|---)/.test(l)).join('\n').trim();
+	$('#whatsnew-ver').textContent = u.from ? `${u.from} → ${u.to}` : u.to;
+	$('#whatsnew-body').innerHTML = notes ? md(notes) : '<p>细节改进和问题修复。</p>';
+	openSheet('sheet-whatsnew');
 }
+$('#whatsnew-ok').addEventListener('click', () => closeLayer('sheet'));
+$('#whatsnew-all').addEventListener('click', () => { closeLayer('sheet'); openPage('page-version'); });
 
 /* ================================================================ login */
 // One sign-in card for the two accounts. `loginProvider` is the one being signed in to.
@@ -2513,9 +2817,9 @@ function connect() {
 			case 'tool_use':
 				if (!mine) break;
 				if (m.kind === 'todo') { endAssistant(); upsertTodo(m.todos); setActivity('正在更新待办清单'); }
-				else { addTool(m.id, m.name, m.title, m.detail, false, m.category); setActivity(doing(m.title || '执行操作')); }
+				else { const c = addTool(m.id, m.name, m.title, m.detail, false, m.category); if (m.diff && c) addDiff(c, m.diff); setActivity(doing(m.title || '执行操作')); }
 				break;
-			case 'tool_result': if (mine) { finishTool(m.id, m.ok, m.summary); setActivity('正在思考'); } break;
+			case 'tool_result': if (mine) { finishTool(m.id, m.ok, m.summary, { sources: m.sources, query: m.query, images: m.images, diff: m.diff }); setActivity('正在思考'); } break;
 			case 'command_output': if (mine) addCmdOut(m.text); break;
 			case 'notice': if (mine) sysline(m.text); break;
 			case 'title':
@@ -2526,6 +2830,21 @@ function connect() {
 				if (m.sessionId) pendingIds.add(m.sessionId);
 				if (mine) { addPermission(m); setActivity('等你确认'); } else renderSidebar();
 				break;
+			case 'browser': renderBrowserState(m); break;
+			case 'notice_global': toast(m.text); break;
+			case 'question':
+				if (m.sessionId) pendingIds.add(m.sessionId);
+				if (mine) { addQuestion(m); setActivity('等你回答'); openAsk(m); } else renderSidebar();
+				break;
+			case 'question_resolved': {
+				if (m.sessionId) pendingIds.delete(m.sessionId);
+				const entry = askCards.get(m.id);
+				// Answered here, elsewhere, or stopped: the card says which; an open sheet for it closes.
+				if (entry && !entry.q.verdict) renderQuestionCard({ ...entry.q, answers: m.answers, verdict: m.answers ? 'answered' : 'skipped' });
+				if (askOpen?.q.id === m.id) { askOpen = null; closeLayer('sheet'); }
+				if (mine) { if (running) setActivity('正在思考'); } else renderSidebar();
+				break;
+			}
 			case 'permission_resolved':
 				if (m.sessionId) pendingIds.delete(m.sessionId);
 				if (permMarks.has(m.id)) { permMarks.get(m.id)(m.decision); permMarks.delete(m.id); } // answered elsewhere, or stopped
@@ -2538,6 +2857,7 @@ function connect() {
 					groupProcessBlocks();
 					setRunning(false);
 					markTurnTime(m.durationMs);
+					markTurnSources(m.sources);
 					if (m.subtype && m.subtype !== 'success') sysline(stoppedIds.has(m.sessionId) ? '已停止' : `这一轮没有做完${m.errors?.[0] ? `：${m.errors[0]}` : '，可以再发一次试试'}`);
 					fetchSessions();
 				} else renderSidebar();
