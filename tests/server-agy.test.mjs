@@ -294,6 +294,39 @@ test('the title of an Antigravity conversation is made by Antigravity', async ()
 	assert.ok(runs().some((r) => r.argv.includes('json') && /起一个标题/.test(r.prompt) && !r.env.session));
 });
 
+test("Antigravity's thoughts are shown, before the steps they led to, and only this turn's", async () => {
+	const id = await newSession();
+	const kinds = (t) => t.events.filter((e) => ['thinking_delta', 'tool_use', 'assistant_delta'].includes(e.type)).map((e) => (e.type === 'thinking_delta' ? `think:${e.text}` : e.type));
+	const first = await say(id, 'think: the battery');
+	assert.deepEqual(kinds(first), ['think:first thought about the battery', 'think:I should look at the files', 'tool_use', 'assistant_delta', 'assistant_delta']);
+	const saved = await storedWhen(id, (x) => x.messages.filter((m) => m.role === 'think').length === 2);
+	assert.deepEqual(saved.messages.filter((m) => m.role === 'think').map((m) => m.text), ['first thought about the battery', 'I should look at the files']);
+	// The next turn shows its own thoughts, not the last one's again.
+	const second = await say(id, 'think: storage');
+	assert.deepEqual(kinds(second).filter((k) => k.startsWith('think:')), ['think:first thought about storage', 'think:I should look at the files'], JSON.stringify(second.events.map((e) => [e.type, e.text]).slice(0, 40)));
+});
+
+test("a Claude plugin's skills and connectors reach Antigravity too", async () => {
+	const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'phone-tools', '1.0.0');
+	mkdirSync(join(root, 'skills', 'battery'), { recursive: true });
+	writeFileSync(join(root, 'skills', 'battery', 'SKILL.md'), '---\nname: battery\ndescription: x\n---\n');
+	writeFileSync(join(root, '.mcp.json'), JSON.stringify({ mcpServers: { local: { command: '${CLAUDE_PLUGIN_ROOT}/srv' } } }));
+	mkdirSync(join(home, '.claude', 'plugins'), { recursive: true });
+	writeFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'phone-tools@mkt': [{ installPath: root }] } }));
+	const settingsFile = join(home, '.claude', 'settings.json');
+	const before = existsSync(settingsFile) ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
+	writeFileSync(settingsFile, JSON.stringify({ ...before, enabledPlugins: { 'phone-tools@mkt': true } }));
+	await say(await newSession(), 'hello');
+	assert.ok(existsSync(join(home, '.gemini', 'skills', 'phone-tools-battery', 'SKILL.md')));
+	const mcp = JSON.parse(readFileSync(join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers;
+	assert.deepEqual(mcp['phone-tools-local'], { command: `${root}/srv`, args: [] });
+	// Switched off: it goes from Antigravity as well.
+	writeFileSync(settingsFile, JSON.stringify({ ...before, enabledPlugins: { 'phone-tools@mkt': false } }));
+	await say(await newSession(), 'hello again');
+	assert.ok(!existsSync(join(home, '.gemini', 'skills', 'phone-tools-battery')));
+	assert.ok(!('phone-tools-local' in JSON.parse(readFileSync(join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers));
+});
+
 test('signing out of Antigravity', async () => {
 	const from = events.length;
 	assert.deepEqual(await api('/api/agy/logout', {}), { ok: true });

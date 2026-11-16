@@ -10,7 +10,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=14">
+	<link rel="stylesheet" href="style.css?v=15">
 	<!-- applies the saved theme and font before the first paint -->
 	<script src="themes.js?v=10"></script>
 </head>
@@ -179,17 +179,33 @@
 				<input id="settings-search" type="search" placeholder="搜索设置" autocomplete="off">
 			</label>
 
-			<div class="engine-card" id="set-top-card">
-				<button id="set-account" class="engine-top">
-					<span id="set-avatar-badge" class="badge-ic lg ic-blue"><svg class="ic"><use href="#i-key"/></svg></span>
-					<span class="account-text"><span id="set-email">未登录</span><small id="set-plan">登录 Claude 账号</small></span>
-					<svg class="ic chev"><use href="#i-chev"/></svg>
-				</button>
-				<button id="set-engine" class="engine-foot">
-					<i id="engine-dot" class="engine-dot ok"></i>
-					<span id="engine-line" class="engine-line">本机引擎 · 运行中</span>
-					<svg class="ic chev"><use href="#i-chev"/></svg>
-				</button>
+			<!-- The two agents a conversation can run on, side by side: each its own account and program. -->
+			<div class="set-group engines" id="set-top-card" data-group="engines">
+				<h2 class="group-label">引擎</h2>
+				<div class="engine-card">
+					<button id="set-account" class="engine-top">
+						<span id="set-avatar-badge" class="badge-ic lg ic-blue"><svg class="ic"><use href="#i-key"/></svg></span>
+						<span class="account-text"><span class="engine-name">Claude</span><span id="set-email">未登录</span><small id="set-plan">登录 Claude 账号</small></span>
+						<svg class="ic chev"><use href="#i-chev"/></svg>
+					</button>
+					<button id="set-engine" class="engine-foot">
+						<i id="engine-dot" class="engine-dot"></i>
+						<span id="engine-line" class="engine-line">Claude Code · 正在检测</span>
+						<svg class="ic chev"><use href="#i-chev"/></svg>
+					</button>
+				</div>
+				<div class="engine-card">
+					<button id="set-agy-account" class="engine-top">
+						<span id="set-agy-badge" class="badge-ic lg ic-orange"><svg class="ic"><use href="#i-spark"/></svg></span>
+						<span class="account-text"><span class="engine-name">Antigravity</span><span id="set-agy-who">未登录</span><small id="set-agy-plan">用 Google 账号登录</small></span>
+						<svg class="ic chev"><use href="#i-chev"/></svg>
+					</button>
+					<button id="set-agy-engine" class="engine-foot">
+						<i id="agy-engine-dot" class="engine-dot"></i>
+						<span id="agy-engine-line" class="engine-line">agy · 正在检测</span>
+						<svg class="ic chev"><use href="#i-chev"/></svg>
+					</button>
+				</div>
 			</div>
 
 			<div class="set-group" data-group="ai">
@@ -207,9 +223,7 @@
 					<button class="row" id="set-phone-row" data-search="手机操控 后台屏幕 截屏"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-tap"/></svg></span><span class="row-text">手机操控</span><span id="val-phone" class="row-val">已开启</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 					<button class="row" id="set-net-row" data-search="联网搜索 网络代理 proxy"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-globe"/></svg></span><span class="row-text">联网搜索</span><span id="val-net" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
 					<button class="row" id="set-github-row" data-search="github 项目 仓库 mcp 令牌 token"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-github"/></svg></span><span class="row-text">GitHub 项目</span><span id="val-github" class="row-val">未连接</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-					<button class="row" data-page="page-market" data-search="插件 扩展市场 技能 连接器 mcp"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-puzzle"/></svg></span><span class="row-text">扩展与插件</span><span class="row-val">技能 · MCP</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-					<button class="row" data-page="page-agy" data-search="antigravity google gemini agy"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-spark"/></svg></span><span class="row-text">Antigravity</span><span id="val-agy" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				</div>
+					<button class="row" data-page="page-market" data-search="插件 扩展市场 技能 连接器 mcp"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-puzzle"/></svg></span><span class="row-text">扩展与插件<small>Claude 和 Antigravity 共用</small></span><span class="row-val">技能 · MCP · 插件</span><svg class="ic chev"><use href="#i-chev"/></svg></button>				</div>
 			</div>
 
 			<div class="set-group" data-group="look">
@@ -361,9 +375,7 @@
 			<div id="model-list" class="model-cards"></div>
 			<button id="more-models-toggle" class="menu-row subtle"><span>更多模型</span><svg class="ic sm"><use href="#i-down"/></svg></button>
 			<div id="more-model-list" class="model-cards hidden"></div>
-			<div class="model-opts-card">
-				<div class="opts-head"><span>思考程度</span><small id="effort-note"></small></div>
-				<div id="effort-seg" class="seg"></div>
+			<div class="model-opts-card" id="claude-fast-card">
 				<label id="claude-fast-row" class="menu-row switch-row"><span class="mr-text"><span>快速模式</span><small>同一个模型，输出更快，用量消耗更多</small></span><span class="sw check-sw"><input type="checkbox" id="t-fast"><i><svg class="sw-ck" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></i></span></label>
 			</div>
 		</div>
@@ -479,7 +491,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=18"></script>
-	<script src="market.js?v=6"></script>
+	<script src="app.js?v=19"></script>
+	<script src="market.js?v=7"></script>
 </body>
 </html>

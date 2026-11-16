@@ -22,6 +22,7 @@ import { isReadOnlyBash } from './policy.mjs';
 import { AGY_PREFIX, BACKEND_NAMES, backendOf, agySlug } from './backends/common.mjs';
 import { createClaudeBackend, thinkingFor } from './backends/claude.mjs';
 import { createAgyBackend, usageGroupFor, BRIDGE_SERVER } from './backends/antigravity.mjs';
+import { enabledClaudePlugins, claudePluginsForAgy, agyPluginsForClaude } from './backends/shared_plugins.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..', 'web');
@@ -890,6 +891,7 @@ async function startRuntime(id) {
 			tag, cwd: CWD, settings, resume: sess.claudeSessionId || null, canUseTool,
 			systemAppend: [APP_PROMPT, NOTES_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n'),
 			mcpServers: await loadMcpServers(),
+			plugins: await agyPluginsForClaudeNow(),
 		});
 
 	rt = {
@@ -2308,9 +2310,18 @@ const tokenMatches = (t) => {
 	return a.length === b.length && timingSafeEqual(a, b);
 };
 // Before every Antigravity turn: its MCP list, approvals and skills follow the app's.
+// One plugin store for both (backends/shared_plugins.mjs): Claude plugins' skills and connectors
+// are offered to Antigravity too, and Antigravity plugins' to Claude.
 async function prepareAgy() {
-	await agy.prepare({ mode: settings.mode, connectors: await loadMcpServers(), skillsDir: SKILLS_DIR, bridge: { url: BRIDGE_URL, token: BRIDGE_TOKEN } });
+	const claudePlugins = await enabledClaudePlugins(join(homedir(), '.claude'), plugins.installed).catch(() => []);
+	const fromPlugins = await claudePluginsForAgy(claudePlugins).catch(() => ({ skills: [], connectors: {} }));
+	await agy.prepare({
+		mode: settings.mode, connectors: { ...fromPlugins.connectors, ...await loadMcpServers() }, skillsDir: SKILLS_DIR,
+		bridge: { url: BRIDGE_URL, token: BRIDGE_TOKEN }, pluginSkills: fromPlugins.skills, pluginRoots: claudePlugins.map((p) => p.root),
+	});
 }
+const AGY_PLUGIN_WRAPPERS = join(dirname(MEMORY_FILE), 'agy-plugins');
+const agyPluginsForClaudeNow = () => agyPluginsForClaude(join(homedir(), '.gemini'), AGY_PLUGIN_WRAPPERS).catch((e) => { log('[plugins] agy plugins for Claude:', e?.message); return []; });
 function killGroup(child) {
 	try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
 	setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 3000).unref();
@@ -3436,7 +3447,7 @@ const server = createServer(async (req, res) => {
 				const win = (g, w) => { const b = g?.buckets.find((x) => x.window === w); return b ? { utilization: b.utilization, resets_at: b.resets_at } : null; };
 				const mine = usageGroupFor(u.groups, agySlug(settings.model));
 				return json(res, {
-					ok: true, provider: 'agy', rate_limits_available: true, cost: null,
+					ok: true, provider: 'agy', rate_limits_available: true, cost: null, current: mine?.name || null,
 					rate_limits: { five_hour: win(mine, '5h'), seven_day: win(mine, 'week') },
 					groups: u.groups.map((g) => ({ name: g.name, five_hour: win(g, '5h'), seven_day: win(g, 'week') })),
 				});

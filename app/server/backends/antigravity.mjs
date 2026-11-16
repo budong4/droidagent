@@ -15,6 +15,8 @@ import { mkdir, readFile, writeFile, rename, rm, chmod, readdir, lstat, readlink
 import { createHash, randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { channel, agySlug } from './common.mjs';
+import { readThoughts, lastStepIndex } from './agy_thoughts.mjs';
+import { skillsIn, syncSkillLinks, agyPluginDirs } from './shared_plugins.mjs';
 
 // Where the official installer (antigravity.google/cli/install.sh) gets its releases.
 const RELEASES = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
@@ -145,12 +147,15 @@ export function createAgyMapper(key = randomUUID().slice(0, 8)) {
 	const state = { sawResult: false, sawText: false, denied: false, activeTools: 0, conversation: null, textOpen: false };
 	const closeText = () => { if (!state.textOpen) return []; state.textOpen = false; return [{ type: 'text_end' }]; };
 
+	const seenSteps = new Set();
 	function step(su) {
 		const out = [];
 		const type = String(su.step_type || '');
 		const stateName = String(su.state ?? su.status ?? '').toUpperCase();
 		const idx = su.step_index ?? su.idx ?? su.step_id ?? 0;
 		const over = stateName === 'DONE' || stateName === 'ERROR';
+		state.lastStep = { type, isNew: !seenSteps.has(idx), over };
+		seenSteps.add(idx);
 		if (su.conversation_id) state.conversation = su.conversation_id;
 
 		if (type === 'agent_response' || type === 'text') {
@@ -192,6 +197,7 @@ export function createAgyMapper(key = randomUUID().slice(0, 8)) {
 		let ev;
 		try { ev = JSON.parse(s); } catch { return []; }
 		if (!ev || typeof ev !== 'object') return [];
+		state.lastStep = null;
 		if (ev.event === 'init') {
 			state.conversation = ev.conversation_id || state.conversation;
 			return [{ type: 'init', ref: state.conversation, model: ev.init?.model ?? ev.model ?? null }];
@@ -504,7 +510,8 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 	// ---- agy's files, kept in step: our tools and the app's connectors in its MCP list, the
 	// approvals this mode grants, and the app's skills where agy looks for skills.
 	async function readManaged() { return (await readJson(MANAGED_FILE)) || {}; }
-	async function prepare({ mode, connectors = {}, skillsDir, bridge }) {
+	// `pluginSkills`: skills from Claude plugins ([{ name, dir }]), linked in next to the app's own.
+	async function prepare({ mode, connectors = {}, skillsDir, bridge, pluginSkills = [], pluginRoots = [] }) {
 		const managed = await readManaged();
 		let changed = false;
 		try {
@@ -535,27 +542,14 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 				if (JSON.stringify(next.managed) !== JSON.stringify(managed.allow || [])) { managed.allow = next.managed; changed = true; }
 			} else log('[agy] settings.json is not valid JSON, leaving it alone');
 		} catch (e) { log('[agy] approvals not synced:', e?.message); }
-		if (skillsDir) await linkSkills(skillsDir).catch((e) => log('[agy] skills not linked:', e?.message));
+		// The app's enabled skills and the skills of enabled Claude plugins, as links in ~/.gemini/skills.
+		// Ours are the links into the app's skills folder or into a Claude plugin; a real folder the
+		// owner put there, or a link of theirs, is never touched.
+		if (skillsDir) {
+			const ours = (target) => dirname(target) === skillsDir || pluginRoots.some((r) => target.startsWith(r + '/')) || /\/\.claude\/plugins\//.test(target);
+			await syncSkillLinks(SKILLS_DIR, [...await skillsIn(skillsDir), ...pluginSkills], ours).catch((e) => log('[agy] skills not linked:', e?.message));
+		}
 		if (changed) await writeJson(MANAGED_FILE, managed).catch((e) => log('[agy] state not saved:', e?.message));
-	}
-	// Each enabled app skill as a link in ~/.gemini/skills; a link of ours whose skill was
-	// switched off or removed goes. A real folder the owner put there is never touched.
-	async function linkSkills(skillsDir) {
-		await mkdir(SKILLS_DIR, { recursive: true });
-		const names = async (dir) => { try { return (await readdir(dir, { withFileTypes: true })).filter((d) => d.isDirectory() || d.isSymbolicLink()).map((d) => d.name); } catch { return []; } };
-		const want = new Set((await names(skillsDir)).filter((n) => existsSync(join(skillsDir, n, 'SKILL.md'))));
-		for (const name of await names(SKILLS_DIR)) {
-			const link = join(SKILLS_DIR, name);
-			const st = await lstat(link).catch(() => null);
-			if (!st?.isSymbolicLink()) continue;
-			const target = await readlink(link).catch(() => '');
-			if (dirname(target) === skillsDir && !want.has(name)) await unlink(link).catch(() => {});
-		}
-		for (const name of want) {
-			const link = join(SKILLS_DIR, name);
-			if (await lstat(link).catch(() => null)) continue;
-			await symlink(join(skillsDir, name), link).catch(() => {});
-		}
 	}
 
 	function killTree(child) {
@@ -570,7 +564,7 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 	// One conversation. Nothing runs between turns: each message starts agy, which picks the
 	// thread up by its id. `settings` is the live object, read afresh at every turn.
 	// `prepareTurn()` is awaited before each start; `preamble()` gives the first message's lead-in.
-	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, turnEnv }) {
+	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, turnEnv, showThoughts }) {
 		const ch = channel();
 		let conv = conversation;
 		let child = null;
@@ -589,6 +583,8 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 						return done();
 					}
 					const prompt = (conv ? text : withPreamble(preamble?.(), text)).split('\u0000').join('');
+					const thoughts = showThoughts?.() !== false;
+					const beforeTurn = conv && thoughts ? await lastStepIndex(home, conv).catch(() => -1) : -1;
 					const viaStdin = Buffer.byteLength(prompt) > 100000;
 					const args = agyArgs({ mode: settings.mode, model: agySlug(settings.model), conversation: conv, prompt, viaStdin });
 					const mapper = createAgyMapper();
@@ -631,7 +627,33 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 							ch.push(ev);
 						}
 					};
-					const onLine = (line) => { if (line.trim()) emit(mapper.feed(line)); };
+					// Thoughts: read from agy's record of the conversation (agy_thoughts.mjs) when a step
+					// starts or ends, never in the middle of a reply being written, and all that remain
+					// before the turn's result. Lines are handled one at a time, in order, for that.
+					let baseline = null; // the last step of the conversation before this turn
+					const shown = new Set();
+					const flushThoughts = async () => {
+						if (!conv || !thoughts) return;
+						if (baseline === null) baseline = beforeTurn ?? -1;
+						const found = await readThoughts(home, conv, baseline + 1).catch(() => new Map());
+						for (const [idx, text] of found) {
+							if (shown.has(idx)) continue;
+							shown.add(idx);
+							ch.push({ type: 'thinking', text });
+						}
+					};
+					let lines = Promise.resolve();
+					const handle = async (line) => {
+						const peek = line.includes('"result"') && /"event"\s*:\s*"result"/.test(line);
+						if (peek && !mapper.state.textOpen) await flushThoughts();
+						const events = mapper.feed(line);
+						const st = mapper.state.lastStep;
+						// A new step: what led to it comes first.
+						if (st?.isNew && !mapper.state.textOpen && !peek) await flushThoughts();
+						emit(events);
+						if (st?.over && !mapper.state.textOpen) await flushThoughts();
+					};
+					const onLine = (line) => { if (line.trim()) lines = lines.then(() => handle(line)).catch((e) => log('[agy]', `[${tag}]`, 'line:', e?.message)); };
 
 					log('[agy]', `[${tag}]`, 'turn', conv ? `(conversation ${String(conv).slice(0, 8)})` : '(new conversation)', `mode=${settings.mode}`, `model=${agySlug(settings.model) || 'default'}`);
 					try {
@@ -654,12 +676,13 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 						stderr = (stderr + s).slice(-4096);
 						for (const l of s.split('\n')) if (l.trim()) log('[agy]', `[${tag}]`, l.trim().slice(0, 300));
 					});
-					const end = (code, signal, spawnError) => {
+					const end = async (code, signal, spawnError) => {
 						if (over) return;
 						over = true;
 						clearTimeout(idle);
 						if (pending.trim()) { onLine(pending); pending = ''; }
 						if (child === me) child = null;
+						await lines;
 						if (!finished) {
 							let ev;
 							if (stopping) ev = { type: 'result', ok: false, text: '', subtype: 'interrupted', errors: [] };

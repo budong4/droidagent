@@ -764,6 +764,10 @@ a { color: var(--accent); }
 	font-size: 13px; color: var(--muted);
 	transition: background-color .18s, transform .16s var(--ease);
 }
+.engines .engine-card { margin-bottom: 10px; }
+.engines .engine-card:last-child { margin-bottom: 16px; }
+.engine-name { font-size: 12px; font-weight: 600; letter-spacing: .02em; color: var(--muted); }
+.engine-dot.off { background: var(--faint); box-shadow: none; }
 .engine-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
 .engine-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
 .engine-dot.err { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent); }
@@ -980,6 +984,13 @@ div.row:active { transform: none; }
 .model-card .mc-sub { font-size: 12.5px; color: var(--muted); line-height: 1.35; }
 .model-card .mc-check { width: 20px; height: 20px; color: var(--accent); opacity: 0; flex: none; }
 .model-card.sel .mc-check { opacity: 1; }
+.model-card { flex-wrap: wrap; cursor: pointer; }
+.model-card .mc-efforts { flex-basis: 100%; display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.model-card .mc-eff-label { font-size: 12.5px; color: var(--muted); flex: none; }
+.model-card .mc-seg { flex: 1; margin: 0; border-radius: 999px; background: var(--pill-fill, var(--surface2)); }
+.model-card .mc-seg button { border-radius: 999px; height: 30px; font-size: 13px; }
+.usage-more { margin-top: 10px; }
+.usage-more summary { font-size: 13px; color: var(--muted); cursor: pointer; padding: 4px 2px; }
 .model-opts-card {
 	background: var(--surface); border: 1px solid var(--line);
 	border-radius: 18px; padding: 12px; box-shadow: var(--shadow);
