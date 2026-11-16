@@ -381,9 +381,13 @@ const MODELS = [
 const MORE_MODELS = [['haiku-4.5', 'Haiku 4.5'], ['sonnet-5', 'Sonnet 5'], ['opus-5', 'Opus 5'], ['fable-5', 'Fable 5'], ['opus-4.8', 'Opus 4.8'], ['opus-4.7', 'Opus 4.7'], ['opus-4.6', 'Opus 4.6'], ['sonnet-4.6', 'Sonnet 4.6']];
 const EFFORTS = [['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '超高'], ['max', '最大']];
 
+// An Antigravity model is stored as "agy:<its name for it>"; anything else is Claude's.
+const isAgyModel = (m = SETTINGS.model) => String(m || '').startsWith('agy:');
 function applySettings(s) {
 	const prevMode = SETTINGS.mode;
+	const prevAgy = isAgyModel();
 	Object.assign(SETTINGS, s || {});
+	if (prevAgy !== isAgyModel()) { usageData = null; renderUsageRing(); loadUsage(true); loadSlashCommands(); } // another account's numbers and commands
 	const m = MODES.find((x) => x.id === SETTINGS.mode) || MODES[1];
 	const chip = $('#btn-mode');
 	chip.dataset.mode = m.id;
@@ -410,6 +414,7 @@ function renderModeMenu() {
 		b.addEventListener('click', () => chooseMode(m.id));
 		list.appendChild(b);
 	}
+	$('#mode-agy-note').classList.toggle('hidden', !isAgyModel());
 }
 function chooseMode(id) {
 	closeMenu();
@@ -430,20 +435,35 @@ $('#btn-mode').addEventListener('click', (e) => { renderModeMenu(); openMenu('me
 
 /* ---------------- model menu ---------------- */
 function modelRow(id, name, desc) {
-	const sel = SETTINGS.model === id || SETTINGS.modelName === name;
+	const sel = SETTINGS.model === id || (SETTINGS.modelName === name && isAgyModel(id) === isAgyModel());
 	const b = el('button', 'menu-row' + (sel ? ' sel' : ''));
 	b.innerHTML = `<span class="mr-text"><span>${esc(name)}</span>${desc ? `<small>${esc(desc)}</small>` : ''}</span>${ic('i-check', 'check')}`;
 	b.addEventListener('click', () => { pushSettings({ model: id, modelName: name }); closeMenu(); });
 	return b;
 }
+// A row that leads to signing in, where an account's models would be.
+function signInRow(label, provider) {
+	const b = el('button', 'menu-row subtle');
+	b.innerHTML = `<span class="mr-text"><span>${esc(label)}</span></span>`;
+	b.addEventListener('click', () => { closeMenu(); showLogin(provider); });
+	return b;
+}
 function renderModelMenu() {
-	const list = $('#model-list'), more = $('#more-model-list');
-	list.innerHTML = ''; more.innerHTML = '';
-	MODELS.forEach((m) => list.appendChild(modelRow(m.id, m.name, m.desc)));
-	MORE_MODELS.forEach(([id, name]) => more.appendChild(modelRow(id, name)));
-	const inMore = MORE_MODELS.some(([id]) => id === SETTINGS.model);
+	const list = $('#model-list'), more = $('#more-model-list'), agyList = $('#agy-model-list');
+	list.innerHTML = ''; more.innerHTML = ''; agyList.innerHTML = '';
+	if (accounts.claude) {
+		MODELS.forEach((m) => list.appendChild(modelRow(m.id, m.name, m.desc)));
+		MORE_MODELS.forEach(([id, name]) => more.appendChild(modelRow(id, name)));
+	} else list.appendChild(signInRow('登录 Claude 账号', 'claude'));
+	const inMore = accounts.claude && MORE_MODELS.some(([id]) => id === SETTINGS.model);
 	more.classList.toggle('hidden', !inMore);
+	$('#more-models-toggle').classList.toggle('hidden', !accounts.claude);
 	$('#more-models-toggle').classList.toggle('expanded', inMore);
+	// Antigravity's models are whatever its CLI lists for this account, read when the menu opens.
+	if (!accounts.agy) agyList.appendChild(signInRow('用 Google 账号登录 Antigravity', 'agy'));
+	else if (agyState?.models?.length) agyState.models.forEach((m) => agyList.appendChild(modelRow(m.id, m.name)));
+	else agyList.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
+	$('#claude-model-opts').classList.toggle('hidden', isAgyModel() || !accounts.claude);
 	const seg = $('#effort-seg');
 	seg.innerHTML = '';
 	EFFORTS.forEach(([id, label]) => {
@@ -458,7 +478,11 @@ $('#more-models-toggle').addEventListener('click', (e) => {
 	e.currentTarget.classList.toggle('expanded', !more.classList.contains('hidden'));
 });
 $('#t-fast').addEventListener('change', (e) => pushSettings({ fastMode: e.target.checked }));
-$('#btn-model').addEventListener('click', (e) => { renderModelMenu(); openMenu('menu-model', e.currentTarget); });
+$('#btn-model').addEventListener('click', (e) => {
+	renderModelMenu();
+	openMenu('menu-model', e.currentTarget);
+	if (accounts.agy) loadAgy().then(() => { if (openMenuId === 'menu-model') renderModelMenu(); });
+});
 
 /* ---------------- usage ring ---------------- */
 let usageData = null;
@@ -502,6 +526,10 @@ function renderUsageBody(err) {
 	if (!usageData) { body.innerHTML = '<div class="empty-state"><span class="spin"></span></div>'; return; }
 	if (!usageData.rate_limits_available || !usageData.rate_limits) { body.innerHTML = '<div class="empty-state">这个账号没有用量窗口（可能用的是 API Key 或组织账号）。</div>'; return; }
 	const rl = usageData.rate_limits;
+	if (usageData.groups) {
+		body.innerHTML = usageData.groups.map((g) => `<div class="usage-group">${esc(g.name)}</div>${usageBar('5 小时', g.five_hour)}${usageBar('本周', g.seven_day)}`).join('') || '<div class="empty-state">暂无数据</div>';
+		return;
+	}
 	let html = usageBar('5 小时', rl.five_hour) + usageBar('本周', rl.seven_day) + usageBar('本周 Opus', rl.seven_day_opus) + usageBar('本周 Sonnet', rl.seven_day_sonnet);
 	if (usageData.cost != null) html += `<div class="usage-cost">当前对话约花费 $${Number(usageData.cost).toFixed(4)}</div>`;
 	body.innerHTML = html || '<div class="empty-state">暂无数据</div>';
@@ -1103,7 +1131,7 @@ const APP_COMMANDS = [
 	{ name: 'config', aliases: ['settings'], desc: '打开设置', run: () => openPage('page-settings') },
 	{ name: 'theme', desc: '更换主题', run: () => openPage('page-theme') },
 	{ name: 'release-notes', aliases: ['version', 'changelog'], desc: '版本与更新记录', run: () => openPage('page-version') },
-	{ name: 'login', desc: '登录或切换 Claude 账号', run: () => showLogin() },
+	{ name: 'login', desc: '登录或切换账号（Claude 或 Antigravity）', run: () => showLogin(isAgyModel() ? 'agy' : 'claude', true) },
 	{ name: 'logout', desc: '退出登录', run: () => confirmLogout() },
 	{ name: 'help', desc: '列出所有命令', run: () => cmdHelp() },
 ];
@@ -1518,21 +1546,84 @@ const AUTH_METHOD_LABEL = { 'claude.ai': 'Claude 账号' };
 const API_PROVIDER_LABEL = { firstParty: 'Anthropic', bedrock: 'AWS Bedrock', vertex: 'Google Vertex', foundry: 'Azure Foundry', gateway: '企业网关' };
 let account = null;
 let loggedIn = false;
+let accounts = { claude: false, agy: false }; // which of the two is signed in; either is enough to chat
+let agyState = null; // /api/agy/status: the CLI, its login, its models
 async function refreshAccount() {
 	const r = await getJSON('/api/account');
 	account = r.ok && r.account ? r.account : null;
 	const email = account?.email || '';
-	const initial = email ? email.trim()[0].toUpperCase() : '·';
+	const initial = email ? email.trim()[0].toUpperCase() : accounts.agy ? 'G' : '·';
 	const plan = account ? (SUBSCRIPTION_LABEL[account.subscriptionType] ? `Claude ${SUBSCRIPTION_LABEL[account.subscriptionType]}` : (account.orgName || '已登录')) : '';
+	// With only Antigravity signed in, the drawer says so rather than "not signed in".
+	const who = email || (accounts.agy ? 'Antigravity' : '');
 	for (const [av, em, pl, out] of [['#drawer-avatar', '#drawer-email', '#drawer-plan', '点此登录'], ['#set-avatar', '#set-email', '#set-plan', '登录 Claude 账号']]) {
 		$(av).textContent = initial;
-		$(av).classList.toggle('out', !email);
-		$(em).textContent = email || '未登录';
-		$(pl).textContent = email ? plan : out;
+		$(av).classList.toggle('out', !who);
+		$(em).textContent = who || '未登录';
+		$(pl).textContent = email ? plan : accounts.agy && pl === '#drawer-plan' ? '已用 Google 账号登录' : out;
+	}
+	$('#val-agy').textContent = accounts.agy ? '已登录' : '';
+}
+async function loadAgy(fresh) {
+	const r = await getJSON('/api/agy/status' + (fresh ? '?fresh=1' : ''));
+	if (r.ok) agyState = r;
+	return agyState;
+}
+
+/* ---------------- Antigravity: the CLI, its account, its plugins ---------------- */
+let agyInstallLine = '';
+function renderAgyPage() {
+	const body = $('#agy-body');
+	const st = agyState;
+	if (!st) { body.innerHTML = '<div class="empty-state"><span class="spin"></span></div>'; return; }
+	const busy = st.installing || (agyInstallLine && !agyInstallLine.done);
+	let html = `<p class="hint">Antigravity 是 Google 的编程助手。这里运行的是它官方的命令行程序（agy）：用 Google 账号登录后，就能在模型菜单里选它的模型（Gemini 等，取决于你的 Google AI 套餐）。</p>
+		<div class="list kv">${kv('命令行程序', st.installed ? `已安装 ${st.version || ''}` : '还没有安装')}${kv('账号', st.loggedIn ? '已登录' : '未登录')}${st.loggedIn ? kv('可用模型', st.modelsError ? st.modelsError : `${st.models.length} 个`) : ''}</div>`;
+	if (agyInstallLine) html += `<p class="login-msg ${agyInstallLine.done ? (agyInstallLine.ok ? 'ok' : 'err') : 'wait'}">${esc(agyInstallLine.text)}</p>`;
+	html += '<div class="agy-acts">';
+	html += `<button class="pill-btn accent" id="agy-login">${st.loggedIn ? '换一个账号登录' : st.installed ? '登录' : '安装并登录'}</button>`;
+	if (st.installed) html += `<button class="pill-btn" id="agy-update" ${busy ? 'disabled' : ''}>检查更新</button>`;
+	if (st.loggedIn) html += '<button class="pill-btn danger" id="agy-logout">退出登录</button>';
+	html += '</div>';
+	if (st.installed && st.loggedIn) {
+		html += `<h2 class="group-label">插件</h2><div id="agy-plugins" class="list"><div class="empty-state"><span class="spin"></span></div></div>
+			<div class="inline-form"><input id="agy-plugin-src" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="插件名，或 https://github.com/作者/仓库"><button class="pill-btn" id="agy-plugin-add">安装</button></div>
+			<p class="hint">这是 Antigravity 自己的插件（agy plugin），只在它的对话里生效。扩展市场里的技能和连接器两边都能用。</p>`;
+	}
+	html += `<h2 class="group-label">它和 Claude 的不同</h2><p class="hint">Antigravity 的对话由 agy 自己完成，和 Claude Code 是两套程序：同一段对话换了模型所属的账号，接手的一方看不到另一方做过的事。执行命令、写文件、技能、连接器和经验笔记两边都有；Claude Code 的插件、/compact 这类命令只在 Claude 的对话里。</p>`;
+	body.innerHTML = html;
+	$('#agy-login').addEventListener('click', () => showLogin('agy', true));
+	$('#agy-update')?.addEventListener('click', () => { agyInstallLine = { text: '正在检查…' }; renderAgyPage(); api('/api/agy/install', {}); });
+	$('#agy-logout')?.addEventListener('click', () => showDialog({
+		title: '退出 Antigravity？', msg: '退出后它的模型不能再用，直到重新登录。Claude 账号不受影响。', ok: '退出登录', danger: true,
+		onOk: async () => { await api('/api/agy/logout'); await loadAgy(); renderAgyPage(); },
+	}));
+	if ($('#agy-plugins')) {
+		getJSON('/api/agy/plugins').then((r) => {
+			const box = $('#agy-plugins');
+			if (!box) return;
+			if (!r.ok) { box.innerHTML = `<div class="empty-state">${esc(r.error || '读取失败')}</div>`; return; }
+			box.innerHTML = r.plugins.length ? r.plugins.map((p) => `<div class="row"><span class="row-text">${esc(p.name)}${p.description ? `<small>${esc(p.description)}</small>` : ''}</span><span class="row-val">${esc(p.version)}</span></div>`).join('') : '<div class="empty-state">还没有装插件</div>';
+		});
+		$('#agy-plugin-add').addEventListener('click', () => {
+			const source = $('#agy-plugin-src').value.trim();
+			if (!source) { $('#agy-plugin-src').focus(); return; }
+			showDialog({
+				title: '安装这个插件？', msg: `${source}\n\n插件里的脚本和命令会以 root 身份在手机上运行。只安装你信任的来源。`, ok: '安装', danger: true,
+				onOk: async () => {
+					const btn = $('#agy-plugin-add');
+					if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin sm"></span>安装中'; }
+					const r = await api('/api/agy/plugins/install', { source });
+					toast(r.ok ? '插件已安装，下一条消息起生效' : `没能安装：${r.error || '未知原因'}`);
+					renderAgyPage();
+				},
+			});
+		});
 	}
 }
+PAGE_OPEN['page-agy'] = async () => { renderAgyPage(); await loadAgy(true); renderAgyPage(); };
 $('#set-account').addEventListener('click', () => {
-	if (!account) { closeAll(); showLogin(); return; }
+	if (!account) { closeAll(); showLogin('claude', true); return; }
 	openPage('page-account');
 });
 const kv = (label, value) => (value == null || value === '' ? '' : `<div class="row"><span class="row-text">${esc(label)}</span><span class="row-val">${esc(String(value))}</span></div>`);
@@ -1669,7 +1760,29 @@ function showUpdateNotice(u) {
 }
 
 /* ================================================================ login */
-function showLogin() { closeAll(); $('#login').classList.remove('hidden'); loadProxy(); }
+// One sign-in card for the two accounts. `loginProvider` is the one being signed in to.
+let loginProvider = 'claude';
+const LOGIN_WHO = {
+	claude: { title: '登录 Claude 账号', lede: '使用你的 Claude 订阅（Pro 或 Max），不需要 API Key。', cli: 'claude', server: 'Claude' },
+	agy: { title: '登录 Antigravity', lede: '用 Google 账号登录 Google 的 Antigravity，使用它提供的模型（Gemini 等）。第一次会先下载它的命令行程序，约 100 MB。', cli: 'agy', server: 'Google' },
+};
+function setLoginProvider(p) {
+	loginProvider = p === 'agy' ? 'agy' : 'claude';
+	$$('#login-provider button').forEach((b) => b.classList.toggle('sel', b.dataset.provider === loginProvider));
+	$('#login-title').textContent = LOGIN_WHO[loginProvider].title;
+	$('#login-lede').textContent = LOGIN_WHO[loginProvider].lede;
+}
+// `closable`: opened by choice while the other account already works, so it can be put away.
+function showLogin(provider, closable) {
+	closeAll();
+	api('/api/login/cancel');
+	backToStart('开始登录');
+	setLoginMsg('', '');
+	setLoginProvider(provider || (accounts.claude && !accounts.agy ? 'agy' : 'claude'));
+	$('#login-close').classList.toggle('hidden', !(closable || loggedIn));
+	$('#login').classList.remove('hidden');
+	loadProxy();
+}
 function hideLogin() { $('#login').classList.add('hidden'); }
 function setLoginMsg(kind, text) { const m = $('#login-msg'); m.className = 'login-msg' + (kind ? ' ' + kind : ''); m.textContent = text || ''; }
 function showNetBox() { $('#login-net').classList.remove('hidden'); }
@@ -1677,9 +1790,10 @@ function loginWaiting(on) { $('#login-start').classList.toggle('hidden', on); $(
 let verifyTimer = null, verifyStart = 0, verifyLine = '';
 function verifyText() {
 	const secs = Math.round((Date.now() - verifyStart) / 1000);
+	const who = LOGIN_WHO[loginProvider];
 	let t = `正在验证授权码（${secs} 秒）`;
-	if (verifyLine) t += `\nclaude：${verifyLine}`;
-	if (secs >= 20) t += '\n超过 20 秒还没结果，多半是连不上 Claude。可以点「取消，重新开始」，填好代理端口后再登录。';
+	if (verifyLine) t += `\n${who.cli}：${verifyLine}`;
+	if (secs >= 20) t += `\n超过 20 秒还没结果，多半是连不上 ${who.server}。可以点「取消，重新开始」，填好代理端口后再登录。`;
 	return t;
 }
 function startVerify() {
@@ -1701,32 +1815,59 @@ function backToStart(label) {
 	$('#login-start').textContent = label || '重新开始登录';
 }
 $('#login-cancel').addEventListener('click', () => { api('/api/login/cancel'); backToStart(); setLoginMsg('', ''); showNetBox(); });
+$('#login-close').addEventListener('click', () => { api('/api/login/cancel'); hideLogin(); });
+$$('#login-provider button').forEach((b) => b.addEventListener('click', () => {
+	if (b.dataset.provider === loginProvider) return;
+	api('/api/login/cancel');
+	backToStart('开始登录');
+	setLoginMsg('', '');
+	setLoginProvider(b.dataset.provider);
+}));
 function loginStatus(m) {
+	if (m.provider && m.provider !== loginProvider) return; // left over from the other account's attempt
 	if (m.proxy) $('#login-proxy').value = m.proxy;
-	if (m.kind === 'cli') { verifyLine = m.text; setLoginMsg('wait', verifyTimer ? verifyText() : `claude：${m.text}`); return; }
+	if (m.kind === 'cli') { verifyLine = m.text; setLoginMsg('wait', verifyTimer ? verifyText() : `${LOGIN_WHO[loginProvider].cli}：${m.text}`); return; }
 	if (m.kind === 'warn') showNetBox();
 	setLoginMsg(m.kind === 'warn' ? 'err' : m.kind === 'ok' ? 'ok' : 'wait', m.text);
 }
-$('#login-start').addEventListener('click', () => { setLoginMsg('', ''); loginWaiting(true); api('/api/login/start'); });
-// 'auto': after "Authorize" the browser goes straight back to claude on this phone
-// (http://localhost:…/callback) and the login finishes by itself; pasting is only a fallback.
+$('#login-start').addEventListener('click', () => { setLoginMsg('', ''); loginWaiting(true); api('/api/login/start', { provider: loginProvider }); });
+// 'auto': after "Authorize" the browser goes straight back to the CLI on this phone
+// (http://localhost:…) and the login finishes by itself; pasting is only a fallback.
 const LOGIN_TEXT = {
-	auto: {
-		step1: '用你的 Claude 账号登录，然后点「Authorize」。授权后浏览器会跳回本机，登录自动完成，回到这里就行。',
-		title: '没有自动完成？',
-		step2: '如果浏览器最后停在一个打不开的 localhost 页面，复制它地址栏里的完整网址，粘贴到这里。',
-		placeholder: '粘贴 http://localhost:… 网址', submit: '提交',
-		waiting: '等你在浏览器里点「Authorize」，授权后这里会自动完成。',
+	claude: {
+		auto: {
+			step1: '用你的 Claude 账号登录，然后点「Authorize」。授权后浏览器会跳回本机，登录自动完成，回到这里就行。',
+			title: '没有自动完成？',
+			step2: '如果浏览器最后停在一个打不开的 localhost 页面，复制它地址栏里的完整网址，粘贴到这里。',
+			placeholder: '粘贴 http://localhost:… 网址', submit: '提交',
+			waiting: '等你在浏览器里点「Authorize」，授权后这里会自动完成。',
+		},
+		manual: {
+			step1: '用你的 Claude 账号登录，然后点「Authorize」。',
+			title: '粘贴授权码',
+			step2: '授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。',
+			placeholder: '粘贴授权码', submit: '完成登录', waiting: '',
+		},
 	},
-	manual: {
-		step1: '用你的 Claude 账号登录，然后点「Authorize」。',
-		title: '粘贴授权码',
-		step2: '授权后页面会显示一串授权码，点「Copy code」再粘贴到这里。整条回调网址也可以直接粘贴。',
-		placeholder: '粘贴授权码', submit: '完成登录', waiting: '',
+	agy: {
+		auto: {
+			step1: '用你的 Google 账号登录并同意授权。授权后浏览器会跳回本机，登录自动完成，回到这里就行。',
+			title: '没有自动完成？',
+			step2: '如果浏览器最后停在一个打不开的 localhost 页面，复制它地址栏里的完整网址，粘贴到这里。',
+			placeholder: '粘贴 http://localhost:… 网址', submit: '提交',
+			waiting: '等你在浏览器里完成 Google 授权，授权后这里会自动完成。',
+		},
+		manual: {
+			step1: '用你的 Google 账号登录并同意授权。',
+			title: '粘贴授权码',
+			step2: '授权后页面会显示一串授权码，复制后粘贴到这里。',
+			placeholder: '粘贴授权码', submit: '完成登录', waiting: '',
+		},
 	},
 };
-function loginUrl(url, mode) {
-	const t = LOGIN_TEXT[mode] || LOGIN_TEXT.manual;
+function loginUrl(url, mode, provider) {
+	if (provider && provider !== loginProvider) return;
+	const t = LOGIN_TEXT[loginProvider][mode] || LOGIN_TEXT[loginProvider].manual;
 	loginWaiting(false);
 	$('#login-step1').classList.add('hidden');
 	$('#login-step2').classList.remove('hidden');
@@ -1749,11 +1890,18 @@ $('#login-submit').addEventListener('click', async () => {
 	const r = await api('/api/login/code', { code });
 	if (!r.ok) { backToStart(); setLoginMsg('err', r.error || '登录会话已超时，请重新开始登录'); }
 });
-function loginDone(ok, message) {
+function loginDone(ok, message, provider) {
+	if (provider && provider !== loginProvider) return;
 	stopVerify();
 	loginWaiting(false);
 	$('#login-submit').disabled = false;
-	if (ok) { setLoginMsg('ok', '登录成功'); setTimeout(hideLogin, 700); refreshAccount(); loadUsage(true); return; }
+	if (ok) {
+		setLoginMsg('ok', '登录成功');
+		setTimeout(hideLogin, 700);
+		refreshAccount(); loadUsage(true);
+		loadAgy(true).then(() => { if (!$('#page-agy').classList.contains('hidden')) renderAgyPage(); });
+		return;
+	}
 	backToStart();
 	setLoginMsg('err', '登录失败：' + (message || '请重试'));
 	if (/连接|连不上|网络|代理|回应|ETIMEDOUT|ECONN|ENOTFOUND|fetch failed/i.test(message || '')) showNetBox();
@@ -1763,12 +1911,13 @@ async function loadProxy() {
 	if (r.ok) $('#login-proxy').value = r.proxy || '';
 }
 $('#login-proxy-save').addEventListener('click', async () => {
-	setLoginMsg('wait', '正在保存并测试能否连上 Claude');
-	const r = await api('/api/proxy', { proxy: $('#login-proxy').value.trim() });
+	const who = LOGIN_WHO[loginProvider].server;
+	setLoginMsg('wait', `正在保存并测试能否连上 ${who}`);
+	const r = await api('/api/proxy', { proxy: $('#login-proxy').value.trim(), provider: loginProvider });
 	if (!r.ok) return setLoginMsg('err', r.error || '保存失败');
 	const where = r.proxy ? `代理 ${r.proxy}` : '直连';
-	if (r.reachable) setLoginMsg('ok', `已保存，${where}能连上 Claude，现在可以登录了。`);
-	else setLoginMsg('err', `已保存，但${where}连不上 Claude（${r.summary}）。请检查端口是否正确、代理软件是否在运行。`);
+	if (r.reachable) setLoginMsg('ok', `已保存，${where}能连上 ${who}，现在可以登录了。`);
+	else setLoginMsg('err', `已保存，但${where}连不上 ${who}（${r.summary}）。请检查端口是否正确、代理软件是否在运行。`);
 });
 
 /* ================================================================ live events */
@@ -1800,8 +1949,11 @@ function connect() {
 				break;
 			case 'auth':
 				loggedIn = !!m.loggedIn;
-				if (!m.loggedIn) showLogin(); else { hideLogin(); loadUsage(); }
+				accounts = { claude: !!m.accounts?.claude, agy: !!m.accounts?.agy };
+				// Signed in to neither: the card comes up. Signed in to one: it is only up if the owner opened it.
+				if (!m.loggedIn) { if ($('#login').classList.contains('hidden')) showLogin(); } else { if ($('#login-step2').classList.contains('hidden') && $('#login-wait').classList.contains('hidden')) hideLogin(); loadUsage(); }
 				refreshAccount();
+				if (accounts.agy) loadAgy();
 				break;
 			case 'session_switched':
 				curSession = m.session;
@@ -1871,9 +2023,16 @@ function connect() {
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) { endAssistant(); setRunning(false); sysline('出错了：' + m.message); } else renderSidebar();
 				break;
-			case 'login_url': loginUrl(m.url, m.mode); break;
+			case 'login_url': loginUrl(m.url, m.mode, m.provider); break;
 			case 'login_status': loginStatus(m); break;
-			case 'login_done': loginDone(m.ok, m.message); break;
+			case 'login_done': loginDone(m.ok, m.message, m.provider); break;
+			case 'agy_install':
+				agyInstallLine = m;
+				if (!$('#page-agy').classList.contains('hidden')) renderAgyPage();
+				break;
+			case 'agy_updated':
+				loadAgy(true).then(() => { if (!$('#page-agy').classList.contains('hidden')) renderAgyPage(); });
+				break;
 			case 'update_status': renderUpdate(m.update); break;
 		}
 	};

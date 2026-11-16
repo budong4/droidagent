@@ -1,5 +1,7 @@
-// K70U agent app backend: serves the chat UI and drives official Claude Code via the Agent SDK.
-// Supports multi-session history, apps/files/folders scope selection, screenshot capture, and rich model & effort controls.
+// DroidAgent's backend: serves the chat UI and runs each conversation on one of two agents —
+// official Claude Code (via the Agent SDK) or Google's Antigravity CLI (`agy`). What differs
+// between them lives in backends/; everything here (sessions, queues, confirmation cards, the
+// permission policy, settings, the extension market) is the same for both.
 import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
@@ -7,8 +9,8 @@ import { request as httpsRequest } from 'node:https';
 import { spawn, exec, execFile } from 'node:child_process';
 import { readFile, writeFile, stat, lstat, mkdir, readdir, unlink, realpath, rm, rename, open, cp } from 'node:fs/promises';
 import { readFileSync, existsSync, createReadStream, createWriteStream } from 'node:fs';
-import { randomUUID, createHash } from 'node:crypto';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import {
@@ -17,6 +19,9 @@ import {
 	inspectSkillDir, mergeSlashCommands, OFFICIAL_NAMES, COMPAT_MARKETPLACE, COMPAT_OF, compatibleMarketplace,
 } from './market.mjs';
 import { isReadOnlyBash } from './policy.mjs';
+import { AGY_PREFIX, BACKEND_NAMES, backendOf, agySlug } from './backends/common.mjs';
+import { createClaudeBackend, thinkingFor } from './backends/claude.mjs';
+import { createAgyBackend, usageGroupFor, BRIDGE_SERVER } from './backends/antigravity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..', 'web');
@@ -48,7 +53,7 @@ process.on('uncaughtException', (e) => log('[bug] uncaught exception:', e?.stack
 // ---------------------------------------------------------------- settings & persistence
 const SETTINGS_FILE = join(homedir(), '.claude', 'agent-settings.json');
 const settings = {
-	model: 'sonnet',          // opus | sonnet | haiku | fable | etc.
+	model: 'sonnet',          // opus | sonnet | haiku | fable | etc.; "agy:<slug>" is one of Antigravity's
 	modelName: 'Sonnet 5.5',  // Display name
 	effort: 'xhigh',          // low | medium | high | xhigh | max
 	fastMode: false,          // fast mode toggle
@@ -188,6 +193,7 @@ function sessionMeta(sess) {
 		createdAt: sess.createdAt,
 		updatedAt: sess.updatedAt,
 		claudeSessionId: sess.claudeSessionId || null,
+		backend: sess.backend || 'claude',
 		msgCount: sess.messages?.length || 0,
 		preview: lastMsg?.text ? typedText(lastMsg.text).replace(/\n+/g, ' ').slice(0, 60) : '',
 	};
@@ -436,6 +442,7 @@ function toolTitle(name, input) {
 	if (name === 'WebSearch') return `上网搜索「${String(input?.query || '').slice(0, 30)}」`;
 	if (name === 'WebFetch') { try { return `打开网页 ${new URL(input?.url).hostname}`; } catch { return '打开网页'; } }
 	if (name === 'TodoWrite') return '更新待办清单';
+	if (name === `mcp__${BRIDGE_SERVER}__remember`) return '记一条经验笔记';
 	if (name === 'Skill') {
 		const id = String(input?.skill || input?.command || input?.name || '').replace(/^\//, '');
 		return `使用技能「${skillNames.get(id) || id || '技能'}」`;
@@ -511,6 +518,7 @@ function teardownRuntime(id) {
 	if (!rt) return;
 	try { rt.end(); } catch { /* already done */ }
 	tell(() => rt.q?.interrupt?.());
+	killBridgeJobs(rt);
 	for (const [, p] of rt.pending) p.resolve({ behavior: 'deny', message: '会话已重置', interrupt: false });
 	runtimes.delete(id);
 }
@@ -581,6 +589,7 @@ function drainQueue(id) {
 function interruptTurn(id) {
 	const rt = runtimes.get(id);
 	tell(() => rt?.q?.interrupt?.());
+	killBridgeJobs(rt);
 	for (const [permId, p] of rt?.pending || []) {
 		p.resolve({ behavior: 'deny', message: '用户已停止', interrupt: true });
 		closePermission(id, permId, 'stop');
@@ -645,37 +654,45 @@ function reapIdle() {
 }
 setInterval(reapIdle, Math.min(30000, IDLE_OTHER_MS / 2)).unref();
 
-function getSdkModel(m) {
-	if (!m) return 'sonnet';
-	const lower = String(m).toLowerCase();
-	if (lower.startsWith('opus')) return 'opus';
-	if (lower.startsWith('sonnet')) return 'sonnet';
-	if (lower.startsWith('haiku')) return 'haiku';
-	if (lower.startsWith('fable')) return 'fable';
-	return lower;
-}
-
 // ---- Eta-parity config loaders (system prompt / skills / MCP) ----
 // Always appended: the person watching reads the steps, mostly not command lines.
 const APP_PROMPT = `## 在 DroidAgent App 里工作
 - 用户在手机 App 里看着你的每一步，大多数人看不懂命令行。调用 Bash 工具时，description 参数一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「统计下载文件夹大小」「打开微信」，不要把命令本身写进去。
 - 用户用什么语言提问，就用什么语言回答。
-- 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。
-
-## 经验笔记
+- 安装技能时，SKILL.md 必须直接位于 \`~/.claude/skills/<技能名>/SKILL.md\`，放得更深就不会生效。不要把整个仓库克隆进这个目录：只放需要的那个技能目录，装好后删掉仓库。`;
+// The notes, for either agent. `how` names the tool that adds one.
+const notesPrompt = (how) => `## 经验笔记
 你有一份跨对话保留的经验笔记：\`${MEMORY_FILE}\`。它现在的内容附在下面「你的经验笔记」里。
 - 动手前先看笔记。有现成的做法就直接照做，不要再去查用法或重新试错。
-- 遇到这些情况，当场用 Edit 或 Write 工具往笔记里加一条，不用问用户：查过或试过才弄清的工具、命令用法；报错的原因和解决办法；这台手机、系统或某个应用的特殊之处；用户明确说过的偏好。
+- 遇到这些情况，当场${how}，不用问用户：查过或试过才弄清的工具、命令用法；报错的原因和解决办法；这台手机、系统或某个应用的特殊之处；用户明确说过的偏好。
 - 一条一行，以「- 」开头，写清什么情况下怎么做，例如「- 查电池温度：dumpsys battery 的 temperature 要除以 10」。
 - 不记一次性的内容（这次任务的具体数据、临时文件名）。旧条目过时或写错了就改掉或删掉，不要重复记同一件事。
 - 笔记保持在 150 条以内，接近时把相近的条目合并。`;
-// Older models take a fixed budget instead of adaptive thinking.
-function thinkingFor(model) {
-	const m = String(model || '');
-	if (/haiku-4|sonnet-4\.5|opus-4\.[015]\b/.test(m)) return { type: 'enabled', budgetTokens: 8000, display: 'summarized' };
-	return { type: 'adaptive', display: 'summarized' };
-}
+const NOTES_PROMPT = notesPrompt('用 Edit 或 Write 工具往笔记里加一条');
 
+// Antigravity has no flag for a system prompt: this goes ahead of the first message of each of
+// its conversations, with the phone's own instructions (written for Claude Code) and the notes.
+const AGY_PROMPT = `# 你在 DroidAgent 里工作
+你通过 Antigravity CLI 运行在一台已 Root 的 Android 手机上的 Debian 环境里，身份是真 root。用户在手机上的聊天 App「DroidAgent」里和你对话，看着你的每一步；大多数人看不懂命令行。
+- 用户用什么语言提问，就用什么语言回答。
+- 执行命令、操作手机，一律用 MCP 服务 \`${BRIDGE_SERVER}\` 的 \`shell\` 工具；写文件用它的 \`write_file\` 工具。它们会按用户选的执行模式自动放行，或者先在 App 里请用户确认。
+- 你自带的命令和写文件工具在这里没法请用户确认，需要确认时会被直接拒绝。被拒绝后不要重复尝试，改用上面两个工具。
+- 调用 \`shell\` 时，description 一律用简体中文写一句短话（十个字左右），说清这一步在做什么，例如「查看电池温度」「打开微信」，不要把命令本身写进去。
+- 读文件优先用你自带的读取工具；读不了（比如文件不在工作目录里）就用 \`shell\` 执行 cat。
+- 下面的「手机环境说明」原本是写给 Claude Code 的：里面说的 Bash 工具就是这里的 \`shell\`，Read 就是你自带的读取工具，形如 mcp__名字__工具 的是对应 MCP 服务的工具。
+- 安装技能时，SKILL.md 放在 \`~/.claude/skills/<技能名>/SKILL.md\`，App 会把它同步给你。`;
+const PHONE_GUIDE_FILE = join(homedir(), '.claude', 'CLAUDE.md');
+function agyPreamble() {
+	let guide = '';
+	try { guide = readFileSync(PHONE_GUIDE_FILE, 'utf8').trim(); } catch { /* none on this phone */ }
+	return [
+		AGY_PROMPT,
+		guide && `# 手机环境说明\n${guide}`,
+		notesPrompt(`用 \`${BRIDGE_SERVER}\` 的 \`remember\` 工具往笔记里加一条（改写或删除旧条目用 \`write_file\` 重写整份笔记）`),
+		loadMemory(),
+		loadSystemPromptAppend(),
+	].filter(Boolean).join('\n\n');
+}
 mkdir(dirname(MEMORY_FILE), { recursive: true }).catch(() => {});
 function loadMemory() {
 	let t = '';
@@ -802,14 +819,32 @@ function ensureRuntime(id) {
 	return start;
 }
 
+// What each agent calls a conversation, kept so the next process can pick it up again.
+const REF_KEY = { claude: 'claudeSessionId', agy: 'agyConversationId' };
+
+// A conversation goes on with whichever agent the chosen model belongs to. The two keep their
+// own memory of it, so the one taking over is told nothing of what the other did: say so.
+function noteBackendSwitch(sess, backend) {
+	const prev = sess.backend || 'claude';
+	if (prev !== backend && sess.messages.some((m) => m.role === 'assistant')) {
+		const text = `从这里开始由 ${BACKEND_NAMES[backend]} 回答。${sess[REF_KEY[backend]] ? '它只记得自己之前参与的部分' : `它看不到前面由 ${BACKEND_NAMES[prev]} 完成的内容`}，上面的记录都还在，需要的话把要点再告诉它。`;
+		sess.messages.push({ role: 'sys', text, time: Date.now() });
+		broadcast({ type: 'notice', sessionId: sess.id, text });
+	}
+	if (sess.backend !== backend) { sess.backend = backend; saveSession(sess); }
+}
+
 async function startRuntime(id) {
 	let rt = runtimes.get(id);
-	if (rt && rt.restartWhenIdle && !rt.running && rt.pending.size === 0) { teardownRuntime(id); rt = null; }
+	const backend = backendOf(settings.model);
+	// An idle process that cannot take a changed setting in, or that belongs to the other agent, is replaced.
+	if (rt && !rt.running && rt.pending.size === 0 && (rt.restartWhenIdle || rt.backend !== backend)) { teardownRuntime(id); rt = null; }
 	if (rt) return rt;
 	await pluginGate; // a plugin being downloaded is enabled for a moment; don't start a session in that window
 	const sess = await getOrLoadSessionObj(id);
 	if (!sess) throw new Error('session not found: ' + id);
-	if (sess.claudeSessionId && !(await transcriptExists(sess.claudeSessionId))) {
+	noteBackendSwitch(sess, backend);
+	if (backend === 'claude' && sess.claudeSessionId && !(await transcriptExists(sess.claudeSessionId))) {
 		log('[sessions] transcript gone, starting over', id.slice(0, 8));
 		sess.claudeSessionId = null;
 		const text = '这段对话时间太久，Claude 已经不记得之前的内容了。上面的记录还在，接下来它会从头开始。';
@@ -817,26 +852,9 @@ async function startRuntime(id) {
 		saveSession(sess);
 		broadcast({ type: 'notice', sessionId: id, text });
 	}
-	const runtime = await claudeRuntime();
-	if (!runtime.chat) throw new Error(noRuntimeMessage(runtime));
-	const chatSpec = runtime.chat;
-	const { query } = await loadSdkFor(chatSpec);
 
-	const queue = [];
-	let wake = null;
-	let ended = false;
-	async function* input() {
-		while (!ended) {
-			if (queue.length) { yield queue.shift(); continue; }
-			await new Promise((r) => { wake = r; });
-		}
-	}
-	const pushUser = (text) => {
-		queue.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
-		if (wake) { wake(); wake = null; }
-	};
-	const end = () => { ended = true; if (wake) { wake(); wake = null; } };
-
+	// One decision per step, for either agent: allowed by the mode, refused by it, or put to the
+	// owner as a card and held until answered.
 	const pending = new Map();
 	const canUseTool = async (toolName, toolInput) => {
 		const p = policy(toolName, toolInput);
@@ -862,39 +880,28 @@ async function startRuntime(id) {
 		});
 	};
 
-	const append = [APP_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n');
-	const mcpServers = await loadMcpServers();
-	const queryOpts = {
-		cwd: CWD,
-		model: modelFor(chatSpec, settings.model),
-		effort: settings.effort || 'xhigh',
-		// Ask for the thinking text itself (summarized), not just its token count, so the app can
-		// show what Claude is weighing.
-		thinking: thinkingFor(settings.model),
-		fastMode: !!settings.fastMode,
-		permissionMode: settings.mode === 'plan' ? 'plan' : 'default',
-		includePartialMessages: true,
-		settingSources: ['user', 'project', 'local'],
-		systemPrompt: append ? { type: 'preset', preset: 'claude_code', append } : { type: 'preset', preset: 'claude_code' },
-		canUseTool,
-		stderr: (d) => log('[claude]', `[${id.slice(0, 8)}]`, String(d).trim().slice(0, 300)),
+	const tag = id.slice(0, 8);
+	const handle = backend === 'agy'
+		? agy.open({
+			tag, cwd: CWD, settings, conversation: sess.agyConversationId || null,
+			preamble: agyPreamble, prepareTurn: prepareAgy, turnEnv: () => ({ DROIDAGENT_SESSION: id }),
+		})
+		: await claude.open({
+			tag, cwd: CWD, settings, resume: sess.claudeSessionId || null, canUseTool,
+			systemAppend: [APP_PROMPT, NOTES_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n'),
+			mcpServers: await loadMcpServers(),
+		});
+
+	rt = {
+		pushUser: handle.send, end: handle.close, q: handle.control, pending, running: false, assistantText: '', lastActive: Date.now(),
+		chatSpec: handle.spec, backend, canUseTool, jobs: new Set(),
 	};
-	if (Object.keys(mcpServers).length) queryOpts.mcpServers = mcpServers;
-	if (sess.claudeSessionId) queryOpts.resume = sess.claudeSessionId;
-	Object.assign(queryOpts, queryRuntimeOptions(chatSpec));
-
-	const q = query({
-		prompt: input(),
-		options: queryOpts,
-	});
-
-	rt = { pushUser, end, q, pending, running: false, assistantText: '', lastActive: Date.now(), chatSpec };
 	runtimes.set(id, rt);
 	const started = rt;
-	consume(id, q, started).then(() => {
+	consume(id, handle.events, started).then(() => {
 		// Ended by itself, not by us: nothing would answer the next message sent to it.
 		if (runtimes.get(id) !== started) return;
-		if (started.running) broadcast({ type: 'error', sessionId: id, message: 'Claude Code 意外退出了，再发一次就能继续' });
+		if (started.running) broadcast({ type: 'error', sessionId: id, message: `${backend === 'agy' ? 'Antigravity' : 'Claude Code'} 意外退出了，再发一次就能继续` });
 		teardownRuntime(id);
 		drainQueue(id);
 	}, (e) => {
@@ -909,9 +916,9 @@ async function startRuntime(id) {
 	return rt;
 }
 
-async function consume(id, q, rt) {
-	let sawDelta = false;
-	let sawThinkDelta = false;
+// A turn as it happens, whichever agent runs it (see backends/common.mjs for the events): kept
+// in the conversation's file and sent to the page.
+async function consume(id, events, rt) {
 	const endThinking = (sess) => {
 		const t = rt.thinking;
 		rt.thinking = null;
@@ -919,107 +926,85 @@ async function consume(id, q, rt) {
 		if (sess && t.text.trim()) { sess.messages.push({ role: 'think', text: t.text, ms, time: Date.now() }); saveSession(sess); }
 		broadcast({ type: 'thinking_end', sessionId: id, ms });
 	};
-	for await (const m of q) {
+	for await (const ev of events) {
 		rt.lastActive = Date.now();
 		const sess = sessionCache.get(id);
-		if (m.type === 'system' && m.subtype === 'init') {
-			if (sess && m.session_id) {
-				sess.claudeSessionId = m.session_id;
+		if (ev.type === 'init') {
+			if (sess && ev.ref) {
+				sess[REF_KEY[rt.backend]] = ev.ref;
 				saveSession(sess);
 			}
-			broadcast({ type: 'session', sessionId: id, claudeSessionId: m.session_id, model: m.model });
+			broadcast({ type: 'session', sessionId: id, claudeSessionId: rt.backend === 'claude' ? ev.ref : null, backend: rt.backend, model: ev.model });
 			broadcast({ type: 'skills_updated' }); // the "/" menu can now show this conversation's full list
-		} else if (m.type === 'system' && m.subtype === 'commands_changed') {
-			broadcast({ type: 'skills_updated' }); // Claude Code noticed new skills by itself (new runtime only)
-		} else if (m.type === 'system' && m.subtype === 'local_command_output') {
-			// What a slash command such as /context or /cost printed.
-			const text = String(m.content || '').trim();
-			if (text && sess) { sess.messages.push({ role: 'cmdout', text, time: Date.now() }); saveSession(sess); }
-			if (text) broadcast({ type: 'command_output', sessionId: id, text });
-		} else if (m.type === 'system' && m.subtype === 'compact_boundary') {
-			const md = m.compact_metadata || {};
-			const text = `对话已压缩${md.pre_tokens ? `（${Math.round(md.pre_tokens / 1000)}k${md.post_tokens ? ` → ${Math.round(md.post_tokens / 1000)}k` : ''} tokens）` : ''}`;
-			if (sess) { sess.messages.push({ role: 'sys', text, time: Date.now() }); saveSession(sess); }
-			broadcast({ type: 'notice', sessionId: id, text });
-		} else if (m.type === 'stream_event') {
-			const ev = m.event;
-			if (ev?.type === 'content_block_start' && ev.content_block?.type === 'thinking') {
-				rt.thinking = { text: '', start: Date.now() };
-				rt.label = '正在思考';
-				broadcast({ type: 'thinking_start', sessionId: id });
-			} else if (ev?.type === 'content_block_stop' && rt.thinking) {
-				endThinking(sess);
-			} else if (ev?.type === 'content_block_delta') {
-				if (ev.delta?.type === 'text_delta' && ev.delta.text) {
-					sawDelta = true;
-					rt.assistantText += ev.delta.text;
-					rt.label = '正在回复';
-					broadcast({ type: 'assistant_delta', sessionId: id, text: ev.delta.text });
-				} else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
-					sawThinkDelta = true;
-					rt.label = '正在思考';
-					if (rt.thinking) rt.thinking.text += ev.delta.thinking;
-					broadcast({ type: 'thinking_delta', sessionId: id, text: ev.delta.thinking });
-				}
-			} else if (ev?.type === 'message_stop') {
-				if (rt.assistantText && sess) {
-					sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
-					rt.assistantText = '';
+		} else if (ev.type === 'commands_changed') {
+			broadcast({ type: 'skills_updated' });
+		} else if (ev.type === 'command_output') {
+			if (sess) { sess.messages.push({ role: 'cmdout', text: ev.text, time: Date.now() }); saveSession(sess); }
+			broadcast({ type: 'command_output', sessionId: id, text: ev.text });
+		} else if (ev.type === 'notice') {
+			if (sess) { sess.messages.push({ role: 'sys', text: ev.text, time: Date.now() }); saveSession(sess); }
+			broadcast({ type: 'notice', sessionId: id, text: ev.text });
+		} else if (ev.type === 'thinking_start') {
+			rt.thinking = { text: '', start: Date.now() };
+			rt.label = '正在思考';
+			broadcast({ type: 'thinking_start', sessionId: id });
+		} else if (ev.type === 'thinking_end') {
+			if (rt.thinking) endThinking(sess);
+		} else if (ev.type === 'thinking_delta') {
+			rt.label = '正在思考';
+			if (rt.thinking) rt.thinking.text += ev.text;
+			broadcast({ type: 'thinking_delta', sessionId: id, text: ev.text });
+		} else if (ev.type === 'thinking') {
+			if (sess) { sess.messages.push({ role: 'think', text: ev.text, ms: 0, time: Date.now() }); saveSession(sess); }
+			broadcast({ type: 'thinking_start', sessionId: id });
+			broadcast({ type: 'thinking_delta', sessionId: id, text: ev.text });
+			broadcast({ type: 'thinking_end', sessionId: id, ms: 0 });
+		} else if (ev.type === 'text_delta') {
+			rt.assistantText += ev.text;
+			rt.label = '正在回复';
+			broadcast({ type: 'assistant_delta', sessionId: id, text: ev.text });
+		} else if (ev.type === 'text_end') {
+			if (rt.assistantText && sess) {
+				sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
+				rt.assistantText = '';
+				saveSession(sess);
+			}
+			broadcast({ type: 'assistant_end', sessionId: id });
+		} else if (ev.type === 'text') {
+			if (sess) {
+				sess.messages.push({ role: 'assistant', text: ev.text, time: Date.now() });
+				saveSession(sess);
+			}
+			broadcast({ type: 'assistant_text', sessionId: id, text: ev.text });
+		} else if (ev.type === 'tool_use') {
+			const title = toolTitle(ev.name, ev.input);
+			const detail = toolDetail(ev.name, ev.input);
+			// TodoWrite gets a live checklist render in the UI instead of a generic tool card.
+			const isTodo = ev.name === 'TodoWrite';
+			const todos = isTodo ? (ev.input?.todos || []) : undefined;
+			if (sess) {
+				sess.messages.push({ role: 'tool', id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}) });
+				saveSession(sess);
+			}
+			rt.label = title;
+			broadcast({ type: 'tool_use', sessionId: id, id: ev.id, name: ev.name, title, detail, category: toolCategory(ev.name), ...(isTodo ? { kind: 'todo', todos } : {}) });
+		} else if (ev.type === 'tool_result') {
+			const summary = String(ev.text ?? '').slice(0, 4000);
+			if (sess) {
+				const tm = sess.messages.find((x) => x.role === 'tool' && x.id === ev.id);
+				if (tm) {
+					tm.state = ev.ok ? 'ok' : 'err';
+					tm.ok = !!ev.ok;
+					tm.summary = summary;
 					saveSession(sess);
 				}
-				broadcast({ type: 'assistant_end', sessionId: id });
 			}
-		} else if (m.type === 'assistant') {
-			for (const block of m.message?.content || []) {
-				if (block.type === 'tool_use') {
-					const title = toolTitle(block.name, block.input);
-					const detail = toolDetail(block.name, block.input);
-					// TodoWrite gets a live checklist render in the UI instead of a generic tool card.
-					const isTodo = block.name === 'TodoWrite';
-					const todos = isTodo ? (block.input?.todos || []) : undefined;
-					if (sess) {
-						sess.messages.push({ role: 'tool', id: block.id, name: block.name, title, detail, category: toolCategory(block.name), state: 'running', time: Date.now(), ...(isTodo ? { kind: 'todo', todos } : {}) });
-						saveSession(sess);
-					}
-					rt.label = title;
-					broadcast({ type: 'tool_use', sessionId: id, id: block.id, name: block.name, title, detail, category: toolCategory(block.name), ...(isTodo ? { kind: 'todo', todos } : {}) });
-				} else if (block.type === 'text' && !sawDelta && block.text) {
-					if (sess) {
-						sess.messages.push({ role: 'assistant', text: block.text, time: Date.now() });
-						saveSession(sess);
-					}
-					broadcast({ type: 'assistant_text', sessionId: id, text: block.text });
-				} else if (block.type === 'thinking' && block.thinking && !sawThinkDelta) {
-					// Not streamed (Claude Code falling back to a plain request): it arrives whole.
-					if (sess) { sess.messages.push({ role: 'think', text: block.thinking, ms: 0, time: Date.now() }); saveSession(sess); }
-					broadcast({ type: 'thinking_start', sessionId: id });
-					broadcast({ type: 'thinking_delta', sessionId: id, text: block.thinking });
-					broadcast({ type: 'thinking_end', sessionId: id, ms: 0 });
-				}
-			}
-			sawDelta = false;
-			sawThinkDelta = false;
-		} else if (m.type === 'user') {
-			for (const block of m.message?.content || []) {
-				if (block.type === 'tool_result') {
-					const txt = Array.isArray(block.content) ? block.content.map((c) => c.text || '').join('') : String(block.content ?? '');
-					if (sess) {
-						const tm = sess.messages.find((x) => x.role === 'tool' && x.id === block.tool_use_id);
-						if (tm) {
-							tm.state = block.is_error ? 'err' : 'ok';
-							tm.ok = !block.is_error;
-							tm.summary = txt.slice(0, 4000);
-							saveSession(sess);
-						}
-					}
-					broadcast({ type: 'tool_result', sessionId: id, id: block.tool_use_id, ok: !block.is_error, summary: txt.slice(0, 4000) });
-					rt.label = '正在思考';
-				}
-			}
-		} else if (m.type === 'result') {
+			broadcast({ type: 'tool_result', sessionId: id, id: ev.id, ok: !!ev.ok, summary });
+			rt.label = '正在思考';
+		} else if (ev.type === 'result') {
 			rt.running = false;
 			rt.label = '';
-			const tookMs = rt.since ? Date.now() - rt.since : (m.duration_ms || 0);
+			const tookMs = rt.since ? Date.now() - rt.since : (ev.durationMs || 0);
 			rt.since = 0;
 			if (rt.thinking) endThinking(sess); // stopped mid-thought: no block_stop will come
 			if (rt.assistantText && sess) {
@@ -1034,7 +1019,8 @@ async function consume(id, q, rt) {
 				saveSession(sess);
 				maybeTitle(id); // name the conversation once it has its first answer
 			}
-			broadcast({ type: 'result', sessionId: id, ok: !m.is_error, text: m.result || '', costUsd: m.total_cost_usd || 0, durationMs: tookMs, subtype: m.subtype, errors: m.errors });
+			broadcast({ type: 'result', sessionId: id, ok: !!ev.ok, text: ev.text || '', costUsd: ev.costUsd || 0, durationMs: tookMs, subtype: ev.subtype, errors: ev.errors });
+			if (ev.code === 'auth') broadcastAuth(); // the login it ran on is gone
 			announceSkillDrafts(id).catch((e) => log('[skills] draft scan', e?.message));
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
 			drainQueue(id);
@@ -1044,30 +1030,22 @@ async function consume(id, q, rt) {
 
 // ---------------------------------------------------------------- conversation titles
 // The first message gives a stand-in title; once the conversation has its first answer, a quick
-// one-off Haiku call names it. A title the owner typed is never replaced.
+// one-off call names it (Haiku, or a Flash model for an Antigravity conversation). A title the
+// owner typed is never replaced.
 const autoTitleOf = (text) => typedText(text).trim().slice(0, 24).replace(/\n/g, ' ') || '新对话';
 const TITLE_DIR = join(homedir(), '.claude', 'agent-titles');
 const titling = new Set();
 const cleanTitle = (t) => (String(t || '').split('\n').map((l) => l.trim()).find(Boolean) || '')
 	.replace(/^标题[:：]\s*/, '').replace(/[「」"“”'‘’《》#*`]/g, '').replace(/[。.!！?？,，、；;:：\s]+$/, '').slice(0, 20);
-async function generateTitle(userText, replyText) {
-	const runtime = await claudeRuntime();
-	if (!runtime.chat) return '';
-	const { query } = await loadSdkFor(runtime.chat);
+async function generateTitle(userText, replyText, backend = 'claude') {
 	await mkdir(TITLE_DIR, { recursive: true });
 	const clip = (t, n) => typedText(t).trim().slice(0, n);
+	const system = '你只负责给对话起简短的中文标题。';
 	const prompt = `给下面这段对话起一个标题：不超过 12 个汉字，概括用户想做的事；不要标点、引号、表情和解释，只输出标题本身。\n\n用户：${clip(userText, 800)}\n\n助手：${clip(replyText, 800)}`;
-	const q = query({
-		prompt,
-		options: {
-			cwd: TITLE_DIR, model: modelFor(runtime.chat, 'haiku'), maxTurns: 1, tools: [], settingSources: [],
-			systemPrompt: '你只负责给对话起简短的中文标题。', thinking: { type: 'disabled' },
-			...queryRuntimeOptions(runtime.chat),
-		},
-	});
-	const timer = setTimeout(() => tell(() => q.interrupt?.()), 60000);
-	let out = '';
-	try { for await (const m of q) if (m.type === 'result') out = m.result || ''; } finally { clearTimeout(timer); }
+	// By the agent that answered: the owner may be signed in to only one of the two.
+	const out = backend === 'agy'
+		? await agy.oneShot({ prompt: `${system}\n\n${prompt}`, cwd: TITLE_DIR, model: agySlug(settings.model) })
+		: await claude.oneShot({ prompt, system, cwd: TITLE_DIR, model: 'haiku' });
 	return cleanTitle(out);
 }
 async function maybeTitle(id) {
@@ -1079,7 +1057,7 @@ async function maybeTitle(id) {
 	if (sess.title !== autoTitleOf(firstUser.text)) { sess.titleSource = 'user'; return; } // renamed by hand before
 	titling.add(id);
 	try {
-		const title = await generateTitle(firstUser.text, firstReply.text);
+		const title = await generateTitle(firstUser.text, firstReply.text, sess.backend || 'claude');
 		if (!title || sess.titleSource) return; // nothing usable, or renamed meanwhile
 		if (sessionCache.get(id) !== sess) return; // deleted meanwhile: saving would bring it back
 		sess.title = title;
@@ -1170,6 +1148,15 @@ const STATIC_SLASH_COMMANDS = [
 	{ name: 'compact', description: '压缩当前对话，释放上下文空间', argumentHint: '' },
 	{ name: 'model', description: '切换模型', argumentHint: '' },
 	{ name: 'usage', description: '查看用量和额度', argumentHint: '', aliases: ['cost', 'stats'] },
+	{ name: 'help', description: '查看帮助', argumentHint: '' },
+];
+// For an Antigravity conversation: the app's own, and what a headless agy run takes (its skills
+// are slash commands too, and join this list like Claude's).
+const AGY_SLASH_COMMANDS = [
+	{ name: 'clear', description: '开始一个新对话', argumentHint: '' },
+	{ name: 'model', description: '切换模型', argumentHint: '' },
+	{ name: 'usage', description: '查看用量和额度', argumentHint: '' },
+	{ name: 'plan', description: '先调查并给出计划，不动手', argumentHint: '[要做的事]' },
 	{ name: 'help', description: '查看帮助', argumentHint: '' },
 ];
 
@@ -1816,12 +1803,17 @@ function httpsHead(host, proxy, timeout = 7000) {
 		req.end();
 	});
 }
+// What signing in to Antigravity and its turns need. Google's own region limits only show once
+// agy asks for a model, so here an answer of any kind counts.
+const GOOGLE_HOSTS = ['accounts.google.com', 'oauth2.googleapis.com'];
+const NET = { claude: { hosts: ANTHROPIC_HOSTS, name: 'Claude' }, agy: { hosts: GOOGLE_HOSTS, name: 'Google' } };
 // Reachable means an HTTP answer that isn't Anthropic's region block (403).
-async function checkAnthropic(proxy) {
-	const results = await Promise.all(ANTHROPIC_HOSTS.map((h) => httpsHead(h, proxy)));
-	const bad = results.map((r, i) => ({ host: ANTHROPIC_HOSTS[i], ...r })).filter((r) => !r.ok || r.status === 403);
+async function checkHosts(hosts, proxy) {
+	const results = await Promise.all(hosts.map((h) => httpsHead(h, proxy)));
+	const bad = results.map((r, i) => ({ host: hosts[i], ...r })).filter((r) => !r.ok || (r.status === 403 && hosts === ANTHROPIC_HOSTS));
 	return { ok: bad.length === 0, summary: bad.map((b) => `${b.host} ${b.ok ? '地区受限（403）' : b.error}`).join('，') };
 }
+const checkAnthropic = (proxy) => checkHosts(ANTHROPIC_HOSTS, proxy);
 function portOpen(port, timeout = 700) {
 	return new Promise((resolve) => {
 		const sk = netConnect({ host: '127.0.0.1', port });
@@ -1831,27 +1823,27 @@ function portOpen(port, timeout = 700) {
 		sk.on('error', () => done(false));
 	});
 }
-async function findLocalProxy(skip) {
+async function findLocalProxy(skip, hosts = ANTHROPIC_HOSTS) {
 	for (const port of LOCAL_PROXY_PORTS) {
 		const proxy = `http://127.0.0.1:${port}`;
 		if (proxy === skip || !(await portOpen(port))) continue;
-		if ((await checkAnthropic(proxy)).ok) return proxy;
+		if ((await checkHosts(hosts, proxy)).ok) return proxy;
 	}
 	return null;
 }
-// Make sure claude will be able to reach Anthropic; switch to a working local proxy if needed.
-async function ensureNetwork(report) {
+// Make sure the agent will be able to reach its servers; switch to a working local proxy if needed.
+async function ensureNetwork(report, { hosts, name } = NET.claude) {
 	const current = readProxySetting();
-	const c = await checkAnthropic(current || null);
+	const c = await checkHosts(hosts, current || null);
 	if (c.ok) return { ok: true, proxy: current };
-	report(`${current ? `代理 ${current} ` : '直连'}连不上 Claude（${c.summary}），正在查找本机代理端口…`);
-	const found = await findLocalProxy(current);
+	report(`${current ? `代理 ${current} ` : '直连'}连不上 ${name}（${c.summary}），正在查找本机代理端口…`);
+	const found = await findLocalProxy(current, hosts);
 	if (found) {
 		await saveProxySetting(found);
 		log('[net] switched to local proxy', found, 'after', c.summary);
 		return { ok: true, proxy: found, changed: true };
 	}
-	log('[net] Anthropic unreachable:', c.summary);
+	log(`[net] ${name} unreachable:`, c.summary);
 	return { ok: false, proxy: current, summary: c.summary };
 }
 
@@ -1897,7 +1889,7 @@ async function fetchPlanUsage() {
 	const o = readOauth();
 	if (!o?.accessToken) return { ok: false, error: '还没有登录 Claude 账号' };
 	if (o.expiresAt && o.expiresAt < Date.now()) return { ok: false, error: '登录凭据已过期。发一条消息（claude 会自动刷新），再回来看用量' };
-	const version = String(runtimeCache?.chat?.version || '').match(/\d+\.\d+\.\d+/)?.[0] || '2.1.112';
+	const version = String(claude.version() || '').match(/\d+\.\d+\.\d+/)?.[0] || '2.1.112';
 	const r = await httpsGet('api.anthropic.com', '/api/oauth/usage', {
 		Authorization: `Bearer ${o.accessToken}`,
 		'anthropic-beta': 'oauth-2025-04-20',
@@ -2245,155 +2237,206 @@ function scheduleUpdateCheck(ms) {
 	}, ms);
 }
 
-// ---------------------------------------------------------------- Claude Code runtime
-// Current Claude Code releases are Bun-compiled native binaries (the global `claude`, and the one
-// inside the Agent SDK). On some Android kernels Bun's JavaScript engine aborts while starting up
-// (SIGABRT in JSC::VM::tryCreate), before Claude Code itself runs. So nothing is assumed: each
-// option is started once with --version and the first that works is used, for chat and for
-// `claude auth …` alike:
-//   1. the native binaries as they are;
-//   2. the same with JavaScriptCoreUseJIT=0, which makes JavaScriptCore skip reserving JIT memory;
-//   3. Claude Code 2.1.112 on Node.js — the last release shipped as plain JavaScript — from Agent
-//      SDK 0.2.112 in server/legacy-sdk (installed by the update package). Node runs fine on
-//      these phones: this server is Node.
-const NO_JIT = { JavaScriptCoreUseJIT: '0' };
-const LEGACY_SDK = join(HERE, 'legacy-sdk', 'node_modules', '@anthropic-ai', 'claude-agent-sdk');
-const SDK_CLI_PKGS = {
-	arm64: ['claude-agent-sdk-linux-arm64', 'claude-agent-sdk-linux-arm64-musl'],
-	x64: ['claude-agent-sdk-linux-x64', 'claude-agent-sdk-linux-x64-musl'],
-};
-// The legacy CLI's own aliases point at the models it knew in April 2026; ask for current ones by id.
-const LEGACY_MODEL_IDS = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5', fable: 'claude-fable-5-1' };
+// ---------------------------------------------------------------- the two agents
+// How each is found, started and spoken to is in backends/. `claudeRuntime()` says which
+// Claude Code program works on this phone (see backends/claude.mjs for why that is a question).
+const claude = createClaudeBackend({ log, serverDir: HERE });
+const claudeRuntime = () => claude.runtime();
+const runClaude = (spec, args, opts) => claude.run(spec, args, opts);
+const noRuntimeMessage = (rt) => claude.noRuntimeMessage(rt);
+const agy = createAgyBackend({
+	log, home: homedir(), serverDir: HERE, fetchUrl,
+	stateDir: dirname(MEMORY_FILE), cacheDir: join(homedir(), '.cache', 'droidagent'),
+});
 
-function nativeCandidates() {
-	const out = [];
-	const seen = new Set();
-	const add = (label, kind, path) => {
-		if (seen.has(path) || !existsSync(path)) return;
-		seen.add(path);
-		out.push({ label, kind, path });
-	};
-	for (const dir of String(process.env.PATH || '').split(':')) if (dir) add(`全局 claude（${join(dir, 'claude')}）`, 'global', join(dir, 'claude'));
-	add('全局 claude（~/.local/bin）', 'global', join(homedir(), '.local', 'bin', 'claude'));
-	for (const pkg of SDK_CLI_PKGS[process.arch] || []) add('SDK 内置 claude', 'sdk', join(HERE, 'node_modules', '@anthropic-ai', pkg, 'claude'));
-	return out;
+// ---------------------------------------------------------------- our tools, for Antigravity
+// A headless agy run cannot ask before it acts. So commands and file writes are offered to it
+// as MCP tools of ours (agy_bridge.mjs, started by agy): each call comes back here and goes
+// through the conversation's own policy and confirmation cards, exactly as Claude's steps do.
+// The token is new on every start and reaches the bridge through agy's MCP configuration.
+const BRIDGE_TOKEN = randomBytes(24).toString('hex');
+const BRIDGE_URL = `http://127.0.0.1:${PORT}`;
+const tokenMatches = (t) => {
+	const a = Buffer.from(String(t || ''));
+	const b = Buffer.from(BRIDGE_TOKEN);
+	return a.length === b.length && timingSafeEqual(a, b);
+};
+// Before every Antigravity turn: its MCP list, approvals and skills follow the app's.
+async function prepareAgy() {
+	await agy.prepare({ mode: settings.mode, connectors: await loadMcpServers(), skillsDir: SKILLS_DIR, bridge: { url: BRIDGE_URL, token: BRIDGE_TOKEN } });
 }
-function legacySpec() {
-	const cli = join(LEGACY_SDK, 'cli.js');
-	return existsSync(cli) ? { label: 'Node 版 claude', kind: 'legacy', cmd: [process.execPath, cli], env: {} } : null;
+function killGroup(child) {
+	try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+	setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 3000).unref();
 }
-function runClaude(spec, args, opts = {}) {
-	return spawn(spec.cmd[0], [...spec.cmd.slice(1), ...args], { ...opts, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } });
+function killBridgeJobs(rt) {
+	for (const c of rt?.jobs || []) killGroup(c);
 }
-function probe(spec) {
+const BRIDGE_OUTPUT_MAX = 60000;
+function bridgeShell(rt, command, timeoutMs) {
 	return new Promise((resolve) => {
-		execFile(spec.cmd[0], [...spec.cmd.slice(1), '--version'], { timeout: 45000, env: { ...process.env, ANTHROPIC_API_KEY: '', ...spec.env } },
-			(err, stdout, stderr) => {
-				const version = String(stdout || '').trim().split('\n')[0];
-				if (!err && /\d+\.\d+\.\d+/.test(version)) return resolve({ ok: true, version });
-				const why = err?.signal ? `被信号 ${err.signal} 终止` : err?.killed ? '超时' : (String(stderr || '').trim().split('\n').pop() || err?.message || '无输出');
-				resolve({ ok: false, error: /bun\.report|Bun has crashed/.test(String(stderr) + String(stdout)) ? `Bun 崩溃（${why}）` : why.slice(0, 160) });
-			});
+		const limit = Math.min(Math.max(Number(timeoutMs) || 120000, 1000), 30 * 60 * 1000);
+		let out = '';
+		let cut = 0;
+		let timedOut = false;
+		const child = spawn('bash', ['-c', command], { cwd: CWD, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+		rt.jobs.add(child);
+		const add = (d) => {
+			out += d.toString('utf8');
+			// The start and the end both matter; the middle of a flood does not.
+			if (out.length > BRIDGE_OUTPUT_MAX * 2) { cut += out.length - BRIDGE_OUTPUT_MAX * 1.5; out = out.slice(0, BRIDGE_OUTPUT_MAX / 2) + out.slice(-BRIDGE_OUTPUT_MAX); }
+		};
+		child.stdout.on('data', add);
+		child.stderr.on('data', add);
+		const timer = setTimeout(() => { timedOut = true; killGroup(child); }, limit);
+		const done = (code, signal, error) => {
+			clearTimeout(timer);
+			rt.jobs.delete(child);
+			let text = out.length > BRIDGE_OUTPUT_MAX ? `${out.slice(0, BRIDGE_OUTPUT_MAX / 2)}\n…（中间省略了一部分输出）…\n${out.slice(-BRIDGE_OUTPUT_MAX / 2)}` : out;
+			if (cut && out.length <= BRIDGE_OUTPUT_MAX) text += '\n…（输出太长，中间省略了一部分）';
+			text = text.replace(/\s+$/, '');
+			if (error) text += `\n无法执行：${error.message}`;
+			else if (timedOut) text += `\n（超过 ${Math.round(limit / 1000)} 秒，已终止）`;
+			else if (signal) text += `\n（被信号 ${signal} 终止）`;
+			else if (code) text += `\n（退出码 ${code}）`;
+			resolve({ ok: !error && !timedOut && !signal && code === 0, text: text.trim() });
+		};
+		child.on('error', (e) => done(null, null, e));
+		child.on('close', (code, signal) => done(code, signal));
 	});
 }
+async function bridgeCall({ token, sessionId, tool, arguments: args }) {
+	if (!tokenMatches(token)) return { ok: false, text: '这次调用没有通过验证' };
+	let id = String(sessionId || '');
+	let rt = runtimes.get(id);
+	if (!rt || rt.backend !== 'agy') {
+		// The conversation's id did not come through: the one Antigravity turn in progress, if it is the only one.
+		const live = [...runtimes.entries()].filter(([, r]) => r.backend === 'agy' && r.running);
+		if (live.length !== 1) return { ok: false, text: '找不到这次调用属于哪个对话' };
+		[id, rt] = live[0];
+	}
+	if (!rt.running) return { ok: false, text: '这个对话现在没有在进行的任务' };
+	const a = args && typeof args === 'object' ? args : {};
+	const decide = async (name, input) => {
+		const d = await rt.canUseTool(name, input);
+		if (d.behavior === 'allow') return null;
+		if (d.interrupt) interruptTurn(id); // "stop" on the card ends the turn, as it does for Claude
+		return { ok: false, text: d.message || '用户拒绝了这个操作' };
+	};
+	if (tool === 'shell') {
+		const command = String(a.command || '');
+		if (!command.trim()) return { ok: false, text: '没有给出要执行的命令' };
+		const refused = await decide('Bash', { command, description: a.description ? String(a.description) : undefined });
+		if (refused) return refused;
+		if (runtimes.get(id) !== rt || !rt.running) return { ok: false, text: '任务已经停止' };
+		return bridgeShell(rt, command, a.timeout_ms);
+	}
+	if (tool === 'write_file') {
+		const file = String(a.path || '');
+		if (!file.startsWith('/')) return { ok: false, text: '请给出文件的绝对路径' };
+		const content = String(a.content ?? '');
+		const refused = await decide('Write', { file_path: file, content });
+		if (refused) return refused;
+		await mkdir(dirname(file), { recursive: true });
+		await writeFile(file, content, 'utf8');
+		return { ok: true, text: `已写入 ${file}（${Buffer.byteLength(content)} 字节）` };
+	}
+	if (tool === 'remember') {
+		// The assistant's own notes: written in every mode, as for Claude.
+		const note = String(a.note || '').replace(/\s*\n\s*/g, ' ').trim().replace(/^-\s*/, '');
+		if (!note) return { ok: false, text: '没有给出要记的内容' };
+		let text = '';
+		try { text = await readFile(MEMORY_FILE, 'utf8'); } catch { /* the first one */ }
+		await mkdir(dirname(MEMORY_FILE), { recursive: true });
+		await writeFile(MEMORY_FILE, `${text.replace(/\n*$/, text ? '\n' : '')}- ${note}\n`, 'utf8');
+		broadcast({ type: 'tool_note', sessionId: id, name: 'remember', title: '记一条经验笔记', auto: true });
+		return { ok: true, text: '已记下' };
+	}
+	return { ok: false, text: `没有这个工具：${tool}` };
+}
 
-let runtimeCache = null;
-let runtimeProbe = null;
-async function claudeRuntime() {
-	if (runtimeCache) return runtimeCache;
-	if (runtimeProbe) return runtimeProbe;
-	runtimeProbe = (async () => {
-		const tried = [];
-		const working = [];
-		for (const c of nativeCandidates()) {
-			for (const env of [{}, NO_JIT]) {
-				const spec = { label: c.label + (env === NO_JIT ? ' + 关闭 JIT' : ''), kind: c.kind, cmd: [c.path], env };
-				const r = await probe(spec);
-				tried.push({ label: spec.label, ok: r.ok, detail: r.ok ? r.version : r.error });
-				if (r.ok) { working.push({ ...spec, version: r.version }); break; }
-			}
-		}
-		const legacy = legacySpec();
-		if (legacy) {
-			const r = await probe(legacy);
-			tried.push({ label: legacy.label, ok: r.ok, detail: r.ok ? r.version : r.error });
-			if (r.ok) working.push({ ...legacy, version: r.version });
-		}
-		const chatSpec = working.find((w) => w.kind === 'sdk') || working.find((w) => w.kind === 'legacy') || working.find((w) => w.kind === 'global') || null;
-		const result = {
-			chat: chatSpec,
-			// Log in with the same program chat uses; the credentials land in the same ~/.claude.
-			auth: chatSpec,
-			working,
-			tried,
-			allSpecs: [...nativeCandidates().map((c) => ({ label: c.label, kind: c.kind, cmd: [c.path], env: {} })), ...(legacy ? [legacy] : [])],
-		};
-		log('[runtime]', tried.map((t) => `${t.label}: ${t.ok ? t.detail : '✗ ' + t.detail}`).join(' | ') || 'no candidates');
-		log('[runtime] chat via', chatSpec ? `${chatSpec.label}（${chatSpec.version}）` : 'NOTHING');
-		if (chatSpec) runtimeCache = result; // with nothing working, look again next time
-		return result;
-	})();
-	try { return await runtimeProbe; } finally { runtimeProbe = null; }
+// Who is signed in, for the page: either account is enough to chat.
+async function authState() {
+	const [c, a] = [await isLoggedIn(), agy.loggedIn()];
+	return { type: 'auth', loggedIn: c || a, accounts: { claude: c, agy: a } };
 }
-function noRuntimeMessage(rt) {
-	const lines = (rt?.tried || []).map((t) => `${t.label}：${t.detail}`).join('；');
-	return `这台手机上启动不了 Claude Code${lines ? '（' + lines + '）' : ''}。请刷入最新的 DroidAgent 更新包，它带有 Node 版运行时。`;
+function broadcastAuth() {
+	authState().then(broadcast, (e) => log('[auth]', e?.message));
 }
-const sdkModules = {};
-async function loadSdkFor(spec) {
-	if (spec.kind === 'legacy') return (sdkModules.legacy ||= await import(pathToFileURL(join(LEGACY_SDK, 'sdk.mjs')).href));
-	return (sdkModules.current ||= await import('@anthropic-ai/claude-agent-sdk'));
-}
-function modelFor(spec, m) {
-	const alias = getSdkModel(m);
-	return spec?.kind === 'legacy' ? (LEGACY_MODEL_IDS[alias] || alias) : alias;
-}
-// How the SDK should start Claude Code for this runtime.
-function queryRuntimeOptions(spec) {
-	const o = {};
-	if (Object.keys(spec.env).length) o.env = { ...process.env, ...spec.env };
-	if (spec.kind === 'legacy') { o.pathToClaudeCodeExecutable = spec.cmd[1]; o.executable = 'node'; }
-	else o.pathToClaudeCodeExecutable = spec.cmd[0];
-	return o;
+// The model in use belongs to an account that is not signed in, and the other one is: move to
+// a model that can answer, so the next message does not simply fail.
+async function settleModel() {
+	const { accounts } = await authState();
+	const mine = backendOf(settings.model);
+	if (accounts[mine] || !accounts[mine === 'agy' ? 'claude' : 'agy']) return;
+	if (mine === 'claude') {
+		const first = (await agy.models()).models[0];
+		Object.assign(settings, first ? { model: AGY_PREFIX + first.slug, modelName: first.label } : { model: AGY_PREFIX, modelName: 'Antigravity 默认模型' });
+	} else Object.assign(settings, { model: 'sonnet', modelName: 'Sonnet 5.5' });
+	await persistSettings();
+	broadcast({ type: 'settings', settings });
 }
 
 // ---------------------------------------------------------------- login (pty)
 let login = null;
 let loginRequest = 0;
-async function startLogin() {
+// `provider`: 'claude' (`claude auth login`, login_pty.py) or 'agy' (agy's own sign-in, agy_login_pty.py).
+// Both scripts speak the same lines, so the page shows one flow for the two.
+async function startLogin(provider = 'claude') {
 	cancelLogin();
 	const request = ++loginRequest;
-	const status = (text, extra = {}) => { if (request === loginRequest) broadcast({ type: 'login_status', text, ...extra }); };
+	const net = NET[provider] || NET.claude;
+	const status = (text, extra = {}) => { if (request === loginRequest) broadcast({ type: 'login_status', text, provider, ...extra }); };
+	const fail = (message) => { if (request === loginRequest) broadcast({ type: 'login_done', ok: false, message, provider }); };
+	if (provider === 'agy' && !agy.find()) {
+		// Not on the phone yet: the same download and checksum as Google's install script.
+		try { await agy.install({ onStatus: (t) => status(t) }); } catch (e) { log('[agy] install failed:', e?.message); return fail(`没能装上 Antigravity CLI：${e?.message || e}`); }
+		if (request !== loginRequest) return;
+	}
 	// The CLI inherits the proxy when it starts, so the route has to be right before it does.
-	status('正在检查能否连上 Claude…');
-	const route = await ensureNetwork((text) => status(text));
+	status(`正在检查能否连上 ${net.name}…`);
+	const route = await ensureNetwork((text) => status(text), net);
 	if (request !== loginRequest) return;
 	if (route.changed) status(`已自动改用本机代理 ${route.proxy}`, { proxy: route.proxy, kind: 'ok' });
-	else if (!route.ok) status(`连不上 Claude 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方填写代理软件的 HTTP 端口。`, { kind: 'warn' });
-	const rt = await claudeRuntime();
-	if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
-	// The program chat uses first, then anything else that starts. With nothing that passed
-	// --version, still let the script try every candidate: its output says why none can start.
-	const specs = rt.working.length ? [rt.auth, ...rt.working.filter((w) => w !== rt.auth)] : rt.allSpecs;
-	const child = spawn('python3', [join(HERE, 'login_pty.py')], {
-		stdio: ['pipe', 'pipe', 'pipe'],
-		env: { ...process.env, CLAUDE_CLI_SPECS: JSON.stringify(specs.map(({ label, cmd, env }) => ({ label, cmd, env }))) },
-	});
+	else if (!route.ok) status(`连不上 ${net.name} 的服务器（${route.summary}），也没找到可用的本机代理端口。可以继续，但最后一步多半会卡住；建议先在下方填写代理软件的 HTTP 端口。`, { kind: 'warn' });
+	let child;
+	if (provider === 'agy') {
+		const e = agy.env();
+		child = spawn('python3', [join(HERE, 'agy_login_pty.py')], {
+			stdio: ['pipe', 'pipe', 'pipe'],
+			env: {
+				...process.env, AGY_BIN: agy.find() || '', AGY_TOKEN_FILE: agy.paths.TOKEN_FILE,
+				AGY_ENV: JSON.stringify({ DBUS_SESSION_BUS_ADDRESS: e.DBUS_SESSION_BUS_ADDRESS, AGY_CLI_DISABLE_AUTO_UPDATE: e.AGY_CLI_DISABLE_AUTO_UPDATE }),
+			},
+		});
+	} else {
+		const rt = await claudeRuntime();
+		if (request !== loginRequest) return; // a newer tap on "start" took over while we were probing
+		// The program chat uses first, then anything else that starts. With nothing that passed
+		// --version, still let the script try every candidate: its output says why none can start.
+		const specs = rt.working.length ? [rt.auth, ...rt.working.filter((w) => w !== rt.auth)] : rt.allSpecs;
+		child = spawn('python3', [join(HERE, 'login_pty.py')], {
+			stdio: ['pipe', 'pipe', 'pipe'],
+			env: { ...process.env, CLAUDE_CLI_SPECS: JSON.stringify(specs.map(({ label, cmd, env }) => ({ label, cmd, env }))) },
+		});
+	}
+	const signedIn = () => (provider === 'agy' ? Promise.resolve(agy.loggedIn()) : isLoggedIn());
 	login = child;
 	let buf = '';
 	let done = false;
 	let gotDone = false;
-	let loginMode = 'manual'; // 'auto': the link sends the browser straight back to claude on localhost
+	let loginMode = 'manual'; // 'auto': the link sends the browser straight back to the CLI on localhost
 	const finish = (ok, message) => {
 		if (done || child.cancelled) return;
 		done = true;
-		broadcast({ type: 'login_done', ok, message });
+		broadcast({ type: 'login_done', ok, message, provider });
 		if (login === child) login = null;
 		if (ok) {
 			// Possibly another account: conversations keep the login they started with otherwise.
 			restartRuntimesWhenIdle();
 			usageCache = { t: 0, data: null };
-			isLoggedIn().then((li) => broadcast({ type: 'auth', loggedIn: li }));
+			settleModel().catch((e) => log('[login] model:', e?.message)).then(broadcastAuth);
+			if (provider === 'agy') agy.models({ fresh: true }).then(() => broadcast({ type: 'agy_updated' }));
 		}
 	};
 	child.stdout.on('data', (d) => {
@@ -2403,30 +2446,30 @@ async function startLogin() {
 			const line = buf.slice(0, i); buf = buf.slice(i + 1);
 			log('[login-pty]', line.startsWith('URL ') ? line.slice(0, 50) + '...' : line);
 			if (line.startsWith('MODE ')) loginMode = line.slice(5).trim();
-			else if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim(), mode: loginMode });
+			else if (line.startsWith('URL ')) broadcast({ type: 'login_url', url: line.slice(4).trim(), mode: loginMode, provider });
 			else if (line === 'NEED_CODE') broadcast({ type: 'login_need_code' });
 			else if (line.startsWith('TOKEN ')) {
 				// `claude auth login` doesn't normally print this (login_pty.py keeps the pattern
 				// as a harmless fallback) — intentionally not acted on: see the note at LEGACY_TOKEN_FILE.
 				log('[login-pty] unexpected TOKEN line from auth login, ignoring');
 			} else if (line.startsWith('STATUS ')) {
-				broadcast({ type: 'login_status', text: line.slice(7), kind: 'cli' });
+				broadcast({ type: 'login_status', text: line.slice(7), kind: 'cli', provider });
 			} else if (line.startsWith('DONE ')) {
 				gotDone = true;
 				const ok = line.slice(5).startsWith('ok');
 				const message = ok ? '' : line.slice(5).replace(/^fail\s*/, '');
 				// A run that stalled after the tokens were already saved still logged in.
 				if (ok) finish(true, '');
-				else isLoggedIn().then((li) => finish(li, li ? '' : message), () => finish(false, message));
+				else signedIn().then((li) => finish(li, li ? '' : message), () => finish(false, message));
 			}
 		}
 	});
 	child.stderr.on('data', (d) => log('[login-err]', String(d).trim().slice(0, 300)));
 	child.on('error', (e) => { log('[login-spawn]', e?.message); finish(false, `无法运行登录脚本（python3）：${e?.message || e}`); });
 	// 'close', not 'exit': stdout may still hold the DONE line when the process itself has exited.
-	child.on('close', (c, s) => {
-		log('[login-exit]', c, s);
-		if (!gotDone) finish(false, `登录进程意外退出（${s || c}）`);
+	child.on('close', (c, sg) => {
+		log('[login-exit]', c, sg);
+		if (!gotDone) finish(false, `登录进程意外退出（${sg || c}）`);
 	});
 }
 // Replacing or cancelling a login on purpose must not surface as "login failed" in the UI.
@@ -2545,7 +2588,7 @@ const server = createServer(async (req, res) => {
 			res.isMain = url.searchParams.get('main') === '1'; // the chat page (vs. the bubble's panel)
 			clients.add(res);
 			res.write(`data: ${JSON.stringify({ type: 'hello', settings, activeSessionId, activeSession: activeSessionId ? forPage(sessionCache.get(activeSessionId)) : null, lastUpdate: lastUpdateInfo() })}\n\n`);
-			isLoggedIn().then((li) => { try { res.write(`data: ${JSON.stringify({ type: 'auth', loggedIn: li })}\n\n`); } catch { /* */ } });
+			authState().then((a) => { try { res.write(`data: ${JSON.stringify(a)}\n\n`); } catch { /* */ } });
 			const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch { /* */ } }, 20000);
 			req.on('close', () => { clearInterval(ka); clients.delete(res); });
 			return;
@@ -2895,7 +2938,8 @@ const server = createServer(async (req, res) => {
 			if (fixedAtStart() !== before) restartRuntimesWhenIdle();
 			for (const rt of runtimes.values()) {
 				tell(() => rt.q.setPermissionMode?.(settings.mode === 'plan' ? 'plan' : 'default'));
-				tell(() => rt.q.setModel?.(modelFor(rt.chatSpec, settings.model)));
+				// A model of the other agent is not this process's to switch to: the next message replaces it.
+				if (rt.backend === 'claude' && backendOf(settings.model) === 'claude') tell(() => rt.q.setModel?.(claude.modelFor(rt.chatSpec, settings.model)));
 			}
 			broadcast({ type: 'settings', settings });
 			return json(res, { ok: true, settings });
@@ -3239,10 +3283,11 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/commands' && req.method === 'GET') {
 			const sid = url.searchParams.get('sessionId') || activeSessionId;
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
+			if (backendOf(settings.model) === 'agy') return json(res, { ok: true, commands: await slashCommandsWith(AGY_SLASH_COMMANDS) });
 			const rt = (sid && runtimes.get(sid)) || anyRuntime();
 			if (!rt && sid && url.searchParams.get('probe')) {
 				ensureRuntime(sid)
-					.then((started) => withTimeout(started.q.supportedCommands(), 60000, 'timeout'))
+					.then((started) => (started.q.supportedCommands ? withTimeout(started.q.supportedCommands(), 60000, 'timeout') : null))
 					.then(() => broadcast({ type: 'skills_updated' }))
 					.catch((e) => log('[commands] probe', e?.message));
 			}
@@ -3258,6 +3303,18 @@ const server = createServer(async (req, res) => {
 		// just to check a number — if nothing is running yet, say so instead of starting a ghost chat.
 		if (path === '/api/usage' && req.method === 'GET') {
 			const fresh = url.searchParams.get('fresh') === '1';
+			if (backendOf(settings.model) === 'agy') {
+				// agy's own /usage: one group per family of models, the ring shows the one in use.
+				const u = await agy.usage({ fresh });
+				if (!u.ok) return json(res, { ok: false, error: u.error });
+				const win = (g, w) => { const b = g?.buckets.find((x) => x.window === w); return b ? { utilization: b.utilization, resets_at: b.resets_at } : null; };
+				const mine = usageGroupFor(u.groups, agySlug(settings.model));
+				return json(res, {
+					ok: true, provider: 'agy', rate_limits_available: true, cost: null,
+					rate_limits: { five_hour: win(mine, '5h'), seven_day: win(mine, 'week') },
+					groups: u.groups.map((g) => ({ name: g.name, five_hour: win(g, '5h'), seven_day: win(g, 'week') })),
+				});
+			}
 			if (!fresh && usageCache.data && Date.now() - usageCache.t < 60000) return json(res, { ok: true, ...usageCache.data });
 			let plan;
 			try { plan = await fetchPlanUsage(); } catch (e) { plan = { ok: false, error: `读取用量失败：${e?.message || e}` }; }
@@ -3287,11 +3344,16 @@ const server = createServer(async (req, res) => {
 		}
 
 		if (path === '/api/status') {
-			return json(res, { settings, loggedIn: await isLoggedIn(), running: [...runtimes.values()].some((rt) => rt.running) });
+			const auth = await authState();
+			return json(res, { settings, loggedIn: auth.loggedIn, accounts: auth.accounts, running: [...runtimes.values()].some((rt) => rt.running) });
 		}
 
 		// Login flow
-		if (req.method === 'POST' && path === '/api/login/start') { startLogin().catch((e) => log('[login]', e?.message)); return json(res, { ok: true }); }
+		if (req.method === 'POST' && path === '/api/login/start') {
+			const { provider } = await body(req);
+			startLogin(provider === 'agy' ? 'agy' : 'claude').catch((e) => log('[login]', e?.message));
+			return json(res, { ok: true });
+		}
 		if (req.method === 'POST' && path === '/api/login/code') {
 			const { code } = await body(req);
 			const ok = sendLoginCode(code);
@@ -3322,12 +3384,14 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/api/proxy' && req.method === 'GET') return json(res, { ok: true, proxy: readProxySetting() });
 		if (path === '/api/proxy' && req.method === 'POST') {
-			const proxy = String((await body(req)).proxy || '').trim();
+			const b = await body(req);
+			const proxy = String(b.proxy || '').trim();
 			if (!validProxy(proxy)) return json(res, { ok: false, error: '格式应为 http://主机:端口，例如 http://127.0.0.1:7890' }, 400);
 			await saveProxySetting(proxy);
 			log('[proxy]', proxy || '(none)');
-			const check = await checkAnthropic(proxy || null);
-			return json(res, { ok: true, proxy, reachable: check.ok, summary: check.summary });
+			const net = NET[b.provider] || NET.claude; // tested against whichever account is being signed in to
+			const check = await checkHosts(net.hosts, proxy || null);
+			return json(res, { ok: true, proxy, reachable: check.ok, summary: check.summary, name: net.name });
 		}
 
 		// ---- Account (everything `claude auth status` knows) ----
@@ -3350,8 +3414,48 @@ const server = createServer(async (req, res) => {
 			for (const id of [...queues.keys()]) { forgetQueue(id); broadcastQueue(id); }
 			for (const id of [...runtimes.keys()]) teardownRuntime(id);
 			usageCache = { t: 0, data: null };
-			broadcast({ type: 'auth', loggedIn: false });
+			await settleModel().catch(() => {});
+			broadcastAuth();
 			return json(res, { ok: true });
+		}
+
+		// ---- Antigravity: the CLI itself, its account, models, plugins
+		if (path === '/api/agy/status' && req.method === 'GET') {
+			const st = await agy.status();
+			const m = st.installed && st.loggedIn ? await agy.models({ fresh: url.searchParams.get('fresh') === '1' }) : { models: [] };
+			return json(res, { ok: true, ...st, models: m.models.map((x) => ({ id: AGY_PREFIX + x.slug, name: x.label })), modelsError: m.error || null });
+		}
+		if (path === '/api/agy/install' && req.method === 'POST') {
+			const { force } = await body(req);
+			const say = (text, extra = {}) => broadcast({ type: 'agy_install', text, ...extra });
+			agy.install({ onStatus: (t) => say(t), force: !!force }).then(
+				(r) => say(r.updated ? `已安装 Antigravity CLI ${r.version}` : `已经是最新版本（${r.version}）`, { done: true, ok: true }),
+				(e) => { log('[agy] install failed:', e?.message); say(`没能装上：${e?.message || e}`, { done: true, ok: false }); },
+			).then(() => broadcast({ type: 'agy_updated' }));
+			return json(res, { ok: true });
+		}
+		if (path === '/api/agy/logout' && req.method === 'POST') {
+			await agy.logout();
+			// A turn in progress would carry on with the login it started with.
+			for (const [id, rt] of [...runtimes]) if (rt.backend === 'agy') { forgetQueue(id); broadcastQueue(id); teardownRuntime(id); }
+			await settleModel().catch(() => {});
+			broadcastAuth();
+			broadcast({ type: 'agy_updated' });
+			return json(res, { ok: true });
+		}
+		if (path === '/api/agy/plugins' && req.method === 'GET') return json(res, await agy.plugins());
+		if (path === '/api/agy/plugins/install' && req.method === 'POST') {
+			const r = await agy.installPlugin((await body(req)).source);
+			if (r.ok) restartRuntimesWhenIdle();
+			return json(res, r);
+		}
+		// A tool call from agy_bridge.mjs. It may wait a long time: for the owner's answer, then for the command.
+		if (path === '/api/agy-bridge/call' && req.method === 'POST') {
+			const b = await body(req);
+			req.setTimeout(0); res.setTimeout(0);
+			let r;
+			try { r = await bridgeCall(b); } catch (e) { log('[bridge]', e?.stack || e); r = { ok: false, text: `出错了：${e?.message || e}` }; }
+			return json(res, { ok: !!r.ok, text: String(r.text ?? '') });
 		}
 
 		// ---- Fonts (fetched slice by slice on first use, then served from disk) ----

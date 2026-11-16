@@ -2,7 +2,7 @@
 
 把 **Claude Code / Agent SDK** 装进一台**已 Root 的 Android 手机**，让它以**真 root** 身份在手机本地的 Debian chroot 里运行，通过一个 App 样式的聊天界面帮你管理和操作整台手机——文件、应用、进程、系统设置，还能跨 App 操作屏幕、做 APK 逆向分析。
 
-> 名字叫 DroidAgent 而不是绑定某个模型，是为了以后能接入别的模型。当前后端基于 `@anthropic-ai/claude-agent-sdk`。
+> 名字叫 DroidAgent 而不是绑定某个模型。现在有两个后端：Claude Code（通过 `@anthropic-ai/claude-agent-sdk`）和 Google 的 Antigravity CLI（`agy`），各用各的账号登录，见下文「两个后端」。
 
 ## 下载安装
 
@@ -10,7 +10,7 @@
 
 - **[Releases](../../releases/latest)** → 下载 `DroidAgent.apk`（约 1.3 GB）
 
-需要：已 Root 的 arm64 手机（KernelSU / Magisk / APatch）+ 你自己的 Claude 订阅账号。装好打开 App，它会自己申请 root。想自己从源码构建见下文。
+需要：已 Root 的 arm64 手机（KernelSU / Magisk / APatch）+ 你自己的 Claude 订阅账号，或者能用 Antigravity 的 Google 账号（两者有一个即可）。装好打开 App，它会自己申请 root。想自己从源码构建见下文。
 
 ---
 
@@ -124,7 +124,7 @@ debian retools                               装逆向分析工具链
    2. **解压 Linux 系统**（只在第一次）：从安装包本身解压，不联网下载。界面显示百分比、已处理大小和剩余时间，期间屏幕保持常亮。
    3. **启动助手服务**：服务就绪后自动进入聊天界面。
 3. 以后每次打开：服务在运行就直接进入；不在运行（比如重启过手机）就自动重新启动。
-4. 用你的 **Claude 订阅账号**在 App 里登录（走 OAuth，不需要 API key）。
+4. 在 App 里登录：用你的 **Claude 订阅账号**（走 OAuth，不需要 API key），或者切到「Antigravity」用 **Google 账号**登录。两个可以都登录，在模型菜单里按账号选模型。
 
 ### 登录失败怎么办
 
@@ -137,9 +137,35 @@ debian retools                               装逆向分析工具链
 
 > 开机自启：把 `optional/99-debian-agent.sh` 放到 `/data/adb/service.d/` 即可（KernelSU/Magisk 的 service.d）。
 
+## 两个后端
+
+对话由哪个程序完成，取决于选的模型属于哪个账号。代码在 `app/server/backends/`，会话、排队、确认卡片和权限规则是两边共用的。
+
+| | Claude | Antigravity |
+|---|---|---|
+| 运行的程序 | Claude Code（Agent SDK 驱动，常驻进程） | Google 官方的 `agy`，每轮对话运行一次无头模式（`agy -p … --output-format stream-json`），用 `--conversation` 接续上下文 |
+| 登录 | `claude auth login` | agy 自己的登录（`agy acp --login`，粘贴授权码）。App 不保存也不读取凭据，只看 agy 的凭据文件在不在 |
+| 模型 | Opus / Sonnet / Haiku / Fable | `agy models` 列出的全部（Gemini 等，取决于 Google AI 套餐） |
+| 执行命令、写文件 | Claude Code 的工具，经确认卡片 | agy 无头模式没法逐步确认，所以 App 通过 MCP 给它提供 `shell`、`write_file`、`remember` 三个工具（`app/server/agy_bridge.mjs`），调用回到 App 的同一套权限规则和确认卡片。agy 自带的命令工具只有 Full access 下才放行 |
+| 技能 | `~/.claude/skills` | 同一批技能，链接到 `~/.gemini/skills` |
+| 连接器（MCP） | App 的连接器配置 | 同一批连接器，同步到 `~/.gemini/config/mcp_config.json`（agy 不支持旧的 SSE 连接方式，这类连接器会跳过） |
+| 系统提示词、经验笔记 | 追加到系统提示词 | agy 没有系统提示词参数，放在每段对话第一条消息的前面 |
+| 用量 | claude.ai 的用量接口 | `agy -p /usage` |
+| 插件 | 扩展市场（`claude plugin`） | 设置 → Antigravity（`agy plugin`） |
+| 斜杠命令 | Claude Code 的全部命令 | App 自己的命令、`/plan` 和各个技能。agy 交互界面里才有的命令（`/mcp`、`/config` 等）在无头模式下没有 |
+| 思考过程 | 显示摘要 | agy 无头模式不输出思考内容，只显示回复和步骤 |
+
+同一段对话可以换到另一个账号的模型继续，但两边各记各的：接手的一方看不到另一方做过的事，对话里会有一行说明。
+
+App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json` 里的 `droidagent` 和同步过去的连接器、`settings.json` 里的 `mcp(...)` 放行规则、`~/.gemini/skills` 里的链接），你自己写的条目不会被改动；记录在 `~/.droidagent/agy-managed.json`。
+
+第三方工具驱动官方 `agy` 是否符合 Antigravity 的服务条款，Google 没有明确说法，请自行判断。本项目不使用 Antigravity 的 OAuth 客户端自行登录，也不直接调用它的内部接口。无头模式的事件格式和几处细节参考了 [dsh-agy-link](https://github.com/amlyczz/dsh-agy-link)（MIT）的实测记录。
+
+测试（不需要手机、账号和真正的 agy，用 `tests/fake-agy.mjs` 模拟）：`node --test tests/*.test.mjs`。
+
 ## 配置
 
-- **代理**（访问 Anthropic API）：登录前自动检测；检测不到时在登录页手动填写（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录、对话、字体下载和自动更新都会使用）。
+- **代理**（访问 Anthropic 或 Google）：登录前自动检测；检测不到时在登录页手动填写（写入 chroot 里的 `/etc/agent/proxy.env`，立即生效，登录、对话、字体下载和自动更新都会使用）。
 - **执行模式**（输入框左下角）：Ask（只读操作直接做，其余逐步确认）、Accept edits（自动改文件和跑常规命令，有风险的先问，默认）、Plan（只读分析，先出计划，同意后执行）、Auto（只有刷机、重启、格式化等高危操作才问）、Full access（不再询问，切换时确认一次）。
 - **系统提示词 / 技能 / MCP**：在 App 的设置里管理，下一条消息生效。内置 8 个安卓常用技能（手机体检、存储清理、应用管理、屏幕自动化、日志诊断、网络诊断、APK 分析、备份与恢复），首次启动自动启用；关掉或改过的不会被更新覆盖。
 - **外观**：设置 → 外观 里选主题、字体和聊天背景。背景有 14 张预设（原创动漫风场景和渐变、歌川广重浮世绘、梵高名画、NASA 极光照片，均为原创或公有领域，来源见 `tools/background_photos.py`），也可以用自己的图片，都带可调遮罩。输入框是液态玻璃效果。字体第一次使用时按需下载用到的字，之后缓存在 `~/.claude/fonts`。
