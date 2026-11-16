@@ -2,6 +2,17 @@
 
 每个版本的说明会显示在 GitHub Releases 和 App 更新后的提示里。发布新版本时，在最上面加一节，并同步修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode`。
 
+## 1.8.3
+
+- Antigravity 的对话不再用无头模式，改为通过 agy 官方的 ACP 接口（`agy acp`）运行，每段对话一个常驻进程：
+  - 思考过程实时显示，和 Claude 一样边想边出来
+  - 需要确认的每一步由 agy 自己来问，App 用同一套执行模式和确认卡片回答；不再需要 1.8.0 里那套替代工具，agy 自带的命令、读写文件工具都能直接用
+  - agy 的计划会显示成待办清单；它自己的斜杠命令会出现在「/」菜单里
+  - 模型和思考档位在每条消息前设好；没有分档变体的模型，选中后会显示 agy 提供的思考档位
+- Antigravity 登录改成和 dsh-agy-link 一样的方式：App 直接走 Google 登录，授权后浏览器跳回本机就自动完成，不用再等 agy 打出登录链接。设置里的 Antigravity 卡片会显示登录的 Google 账号
+  - 注意：Antigravity 的服务条款禁止第三方软件使用它的登录，已有账号因此被停用，是否使用请自行权衡
+- 旧版本写进 agy 配置里的替代工具和放行规则会被自动清理
+
 ## 1.8.2
 
 - 设置页顶部改成「引擎」：Claude 和 Antigravity 并排两张卡片，各自显示账号和本机程序的状态，不再把 Antigravity 放在「能力」里

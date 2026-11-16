@@ -1,26 +1,21 @@
-// The Antigravity backend: Google's official `agy` CLI, unmodified, run headless — one short
-// process per turn (`agy -p … --output-format stream-json`), with `--conversation` carrying the
-// thread from one turn to the next. See common.mjs for what a backend hands the server.
+// The Antigravity backend: Google's official `agy` CLI, unmodified. A conversation runs through
+// its Agent Client Protocol server (`agy acp`, see agy_acp.mjs): one process per conversation,
+// streaming replies, thoughts and steps, and asking before a step that needs approval, which the
+// app's own policy and confirmation cards answer. See common.mjs for what a backend hands the server.
 //
-// Signing in is agy's own flow (agy_login_pty.py); this file never reads the token it stores,
-// only whether one is there. Everything asked of Google goes through the binary.
-//
-// What headless agy cannot do is ask: a step that needs approval is refused on the spot. So the
-// phone-facing work (shell commands, writing files) is offered to it as tools of our own over
-// MCP (agy_bridge.mjs), which come back to this server and through the same policy and
-// confirmation cards as Claude's.
-import { spawn, execFile } from 'node:child_process';
+// Signing in: agy_oauth.mjs. Short one-off questions (the model list, usage, a title) still use
+// the CLI's own commands.
+import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, statSync, createReadStream } from 'node:fs';
-import { mkdir, readFile, writeFile, rename, rm, chmod, readdir, lstat, readlink, symlink, unlink, copyFile } from 'node:fs/promises';
-import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile, rename, rm, chmod, copyFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
-import { channel, agySlug } from './common.mjs';
-import { readThoughts, lastStepIndex } from './agy_thoughts.mjs';
-import { skillsIn, syncSkillLinks, agyPluginDirs } from './shared_plugins.mjs';
+import { agySlug } from './common.mjs';
+import { openAcp } from './agy_acp.mjs';
+import { skillsIn, syncSkillLinks } from './shared_plugins.mjs';
 
 // Where the official installer (antigravity.google/cli/install.sh) gets its releases.
 const RELEASES = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
-export const BRIDGE_SERVER = 'droidagent'; // our tools' name in agy's MCP list
 
 // ---------------------------------------------------------------- pure pieces (tested without agy)
 
@@ -61,26 +56,6 @@ export function parseAgyModels(stdout) {
 	return out;
 }
 
-// The app's execution modes, as far as a run that cannot ask goes. Only Full access lets agy's
-// own tools do everything; below it, what needs approval goes through our tools instead.
-const MODE_ARGS = {
-	plan: ['--mode', 'plan'],
-	default: ['--mode', 'default'],
-	acceptEdits: ['--mode', 'accept-edits'],
-	auto: ['--mode', 'accept-edits'],
-	bypassPermissions: ['--dangerously-skip-permissions'],
-};
-export function agyArgs({ mode, model, conversation, prompt, viaStdin = false }) {
-	const args = ['--output-format', 'stream-json', ...(MODE_ARGS[mode] || MODE_ARGS.default)];
-	if (model) args.push('--model', model);
-	if (conversation) args.push('--conversation', conversation);
-	// A long message goes in on stdin: one argument holds 128 KB at most.
-	if (viaStdin) args.push('--input-format', 'stream-json');
-	else args.push('-p', prompt);
-	return args;
-}
-export const agyStdinLine = (prompt) => JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n';
-
 // agy names its tools and their arguments its own way (run_command{CommandLine}, view_file{AbsolutePath}, …).
 // Reshaped into Claude Code's, the same cards, titles and policy serve both.
 const pick = (o, ...keys) => {
@@ -112,9 +87,6 @@ export function normalizeAgyTool(name, params) {
 		const server = String(pick(p, 'ServerName', 'Server') ?? '');
 		const tool = String(pick(p, 'ToolName', 'Tool', 'Name') ?? '');
 		const args = asObject(pick(p, 'Arguments', 'Args', 'Input'));
-		// Our own tools show as what they are: a command, a file written.
-		if (server === BRIDGE_SERVER && tool === 'shell') return { name: 'Bash', input: { command: String(args.command ?? ''), description: args.description } };
-		if (server === BRIDGE_SERVER && tool === 'write_file') return { name: 'Write', input: { file_path: String(args.path ?? '') } };
 		return { name: `mcp__${server || 'mcp'}__${tool || 'tool'}`, input: args };
 	}
 	if (n === 'browser_subagent' || /subagent/.test(n)) return { name: 'Task', input: { description: pick(p, 'TaskName', 'Task', 'Description') } };
@@ -123,8 +95,9 @@ export function normalizeAgyTool(name, params) {
 
 // What agy says when things go wrong, in the owner's words.
 const NETWORK = /(TLS handshake|i\/o timeout|connection (refused|reset)|no such host|EOF\b|network (error|is unreachable)|dial tcp|context deadline exceeded|proxyconnect)/i;
-export function agyErrorText(error, stderr = '') {
+export function agyErrorText(error, stderr = '', code) {
 	const e = String(error || '').trim();
+	if (code === -32000) return { code: 'auth', text: 'Antigravity 还没有登录，或者登录已经失效。请在「设置 → Antigravity」里重新登录。' };
 	const all = `${e}\n${stderr}`;
 	if (/location is not supported|not (currently )?available in your location|not eligible/i.test(all) && !NETWORK.test(all)) {
 		return { code: 'region', text: `Google 不在当前网络所在的地区提供 Antigravity。需要让手机里的 Linux 环境走支持地区的代理（设置里的网络代理）。${e ? `原始提示：${e.slice(0, 200)}` : ''}` };
@@ -138,97 +111,6 @@ export function agyErrorText(error, stderr = '') {
 	return { code: 'error', text: (e || stderr.trim().split('\n').filter(Boolean).pop() || 'Antigravity 没有给出原因').slice(0, 400) };
 }
 export const isNetworkTrouble = (text) => NETWORK.test(String(text || ''));
-const DENIED = /permission denied|denied automatically|user denied|requires? approval|not (allowed|permitted)|was (denied|rejected)/i;
-
-// One turn's stdout, a line at a time -> turn events. `key` makes this turn's step ids unique.
-export function createAgyMapper(key = randomUUID().slice(0, 8)) {
-	const tools = new Map(); // step index -> { id, done }
-	const texts = new Map(); // step index -> what has been shown of it (builds that send the whole text each time)
-	const state = { sawResult: false, sawText: false, denied: false, activeTools: 0, conversation: null, textOpen: false };
-	const closeText = () => { if (!state.textOpen) return []; state.textOpen = false; return [{ type: 'text_end' }]; };
-
-	const seenSteps = new Set();
-	function step(su) {
-		const out = [];
-		const type = String(su.step_type || '');
-		const stateName = String(su.state ?? su.status ?? '').toUpperCase();
-		const idx = su.step_index ?? su.idx ?? su.step_id ?? 0;
-		const over = stateName === 'DONE' || stateName === 'ERROR';
-		state.lastStep = { type, isNew: !seenSteps.has(idx), over };
-		seenSteps.add(idx);
-		if (su.conversation_id) state.conversation = su.conversation_id;
-
-		if (type === 'agent_response' || type === 'text') {
-			let delta = typeof su.text_delta === 'string' ? su.text_delta : '';
-			if (!delta && typeof su.text === 'string') {
-				const shown = texts.get(idx) || '';
-				delta = su.text.startsWith(shown) ? su.text.slice(shown.length) : su.text;
-				texts.set(idx, su.text);
-			}
-			if (delta) { state.sawText = true; state.textOpen = true; out.push({ type: 'text_delta', text: delta }); }
-			if (over) out.push(...closeText());
-		} else if (type === 'tool') {
-			const info = su.tool_info && typeof su.tool_info === 'object' ? su.tool_info : {};
-			let t = tools.get(idx);
-			if (!t) {
-				out.push(...closeText()); // what it said before this step is a message of its own
-				const tool = normalizeAgyTool(info.name || su.tool_name, info.parameters);
-				t = { id: `agy-${key}-${idx}`, done: false };
-				tools.set(idx, t);
-				state.activeTools++;
-				out.push({ type: 'tool_use', id: t.id, name: tool.name, input: tool.input });
-			}
-			const failed = stateName === 'ERROR' || !!info.error;
-			if (!t.done && (over || failed || info.output !== undefined)) {
-				t.done = true;
-				state.activeTools--;
-				const message = info.error ? String(info.error.message ?? info.error.type ?? info.error) : '';
-				if (failed && DENIED.test(message)) state.denied = true;
-				const output = typeof info.output === 'string' ? info.output : info.output === undefined ? '' : JSON.stringify(info.output);
-				out.push({ type: 'tool_result', id: t.id, ok: !failed, text: failed ? (message || output || '这一步失败了') : output });
-			}
-		}
-		return out;
-	}
-
-	function feed(line) {
-		const s = String(line || '').trim();
-		if (!s.startsWith('{')) return [];
-		let ev;
-		try { ev = JSON.parse(s); } catch { return []; }
-		if (!ev || typeof ev !== 'object') return [];
-		state.lastStep = null;
-		if (ev.event === 'init') {
-			state.conversation = ev.conversation_id || state.conversation;
-			return [{ type: 'init', ref: state.conversation, model: ev.init?.model ?? ev.model ?? null }];
-		}
-		// What a slash command answered (/usage and the like): shown as it is.
-		if (ev.event === 'command_result') {
-			const c = ev.command && typeof ev.command === 'object' ? ev.command : {};
-			const said = typeof c.output === 'string' ? c.output : typeof c.text === 'string' ? c.text : c.data !== undefined ? JSON.stringify(c.data, null, 2) : '';
-			return said.trim() ? [{ type: 'command_output', text: `/${c.name || ''}\n${said.trim()}` }] : [];
-		}
-		if (ev.event === 'step_update') return step(ev.step_update && typeof ev.step_update === 'object' ? ev.step_update : ev);
-		if (ev.event === 'result') {
-			const r = ev.result && typeof ev.result === 'object' ? ev.result : ev;
-			if (r.conversation_id) state.conversation = r.conversation_id;
-			state.sawResult = true;
-			const out = closeText();
-			const response = String(r.response || '').trim();
-			// A turn whose answer was never streamed still has one.
-			if (response && !state.sawText) out.push({ type: 'text', text: response });
-			const failed = !!r.error || /^(ERROR|INVALID|CANCELED|INTERRUPTED)$/i.test(String(r.status || ''));
-			const err = failed ? agyErrorText(r.error || `Antigravity 结束时的状态是 ${r.status}`) : null;
-			out.push({
-				type: 'result', ok: !failed, text: response, subtype: failed ? 'error' : 'success', errors: err ? [err.text] : [], code: err?.code,
-				costUsd: 0, durationMs: Math.round((Number(r.duration_seconds) || 0) * 1000), usage: r.usage || null,
-			});
-			return out;
-		}
-		return [];
-	}
-	return { feed, state };
-}
 
 // `agy -p /usage --output-format stream-json`: the same numbers agy's own /usage shows. Either a
 // command_result line, or a tab-separated table (group, window, percent left, reset time).
@@ -273,13 +155,6 @@ export function usageGroupFor(groups, slug) {
 	const want = usageKind(String(slug || '').toLowerCase()) || 'gemini';
 	const kindOf = (g) => usageKind(String(g.name).toLowerCase()) || usageKind(String(g.description).toLowerCase());
 	return groups.find((g) => kindOf(g) === want) || groups[0] || null;
-}
-
-// What the first message of a conversation carries ahead of the owner's words: agy has no flag
-// for a system prompt, so the phone's instructions and the notes go in here.
-export function withPreamble(preamble, text) {
-	const p = String(preamble || '').trim();
-	return p ? `${p}\n\n---\n\n【用户的消息】\n${text}` : text;
 }
 
 // ---------------------------------------------------------------- agy's own files, kept in step with the app
@@ -329,13 +204,9 @@ export function mergeAgyAllow(current, mine, managedBefore = []) {
 	}
 	return { settings: { ...(current || {}), permissions: { ...perms, allow } }, managed };
 }
-// Which of agy's own approvals each mode grants up front. Our tools always: they ask for
-// themselves. Other connectors where the app's policy lets Claude use them without asking.
-export function agyAllowRules(mode) {
-	const rules = [`mcp(${BRIDGE_SERVER}/*)`];
-	if (mode === 'acceptEdits' || mode === 'auto') rules.push('mcp(*)');
-	return rules;
-}
+// agy asks before each step and the app answers, so no approvals are granted up front any more.
+// Rules an earlier version added are taken out again by prepare().
+export const agyAllowRules = () => [];
 
 // ---------------------------------------------------------------- the backend
 
@@ -347,7 +218,6 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 	const SKILLS_DIR = join(GEMINI, 'skills');
 	const MANAGED_FILE = join(stateDir, 'agy-managed.json');
 	const INSTALL_PATH = join(home, '.local', 'bin', 'agy');
-	const IDLE_MS = Number(process.env.AGENT_AGY_IDLE_MS) || 10 * 60 * 1000;
 
 	// There is no desktop keyring in the chroot. Pointing D-Bus at nothing makes agy skip its
 	// ten-second wait for one and keep the login in its own file, the same on every run. It does
@@ -511,21 +381,14 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 	// approvals this mode grants, and the app's skills where agy looks for skills.
 	async function readManaged() { return (await readJson(MANAGED_FILE)) || {}; }
 	// `pluginSkills`: skills from Claude plugins ([{ name, dir }]), linked in next to the app's own.
-	async function prepare({ mode, connectors = {}, skillsDir, bridge, pluginSkills = [], pluginRoots = [] }) {
+	async function prepare({ mode, connectors = {}, skillsDir, pluginSkills = [], pluginRoots = [] }) {
 		const managed = await readManaged();
 		let changed = false;
 		try {
 			const mine = {};
-			if (bridge) {
-				mine[BRIDGE_SERVER] = {
-					command: process.execPath, args: [join(serverDir, 'agy_bridge.mjs')],
-					env: { DROIDAGENT_BRIDGE_URL: bridge.url, DROIDAGENT_BRIDGE_TOKEN: bridge.token },
-					timeoutSeconds: 3600, // a command may run long, and may wait for the owner's answer first
-				};
-			}
 			for (const [name, c] of Object.entries(connectors)) {
 				const entry = toAgyMcp(c);
-				if (entry && name !== BRIDGE_SERVER) mine[name] = entry;
+				if (entry) mine[name] = entry;
 			}
 			const current = await readJson(MCP_CONFIG);
 			if (current) {
@@ -537,7 +400,7 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 		try {
 			const current = await readJson(SETTINGS_FILE);
 			if (current) {
-				const next = mergeAgyAllow(current, mode === 'bypassPermissions' ? [] : agyAllowRules(mode), managed.allow || []);
+				const next = mergeAgyAllow(current, agyAllowRules(mode), managed.allow || []);
 				if (JSON.stringify(next.settings) !== JSON.stringify(current)) await writeJson(SETTINGS_FILE, next.settings);
 				if (JSON.stringify(next.managed) !== JSON.stringify(managed.allow || [])) { managed.allow = next.managed; changed = true; }
 			} else log('[agy] settings.json is not valid JSON, leaving it alone');
@@ -552,166 +415,30 @@ export function createAgyBackend({ log, home, serverDir, fetchUrl, stateDir, cac
 		if (changed) await writeJson(MANAGED_FILE, managed).catch((e) => log('[agy] state not saved:', e?.message));
 	}
 
-	function killTree(child) {
-		if (!child?.pid) return;
-		try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
-		// A run stuck retrying a dead network ignores SIGTERM.
-		const hard = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } try { child.kill('SIGKILL'); } catch { /* gone */ } }, 3000);
-		hard.unref?.();
-		child.once('exit', () => clearTimeout(hard));
-	}
-
-	// One conversation. Nothing runs between turns: each message starts agy, which picks the
-	// thread up by its id. `settings` is the live object, read afresh at every turn.
-	// `prepareTurn()` is awaited before each start; `preamble()` gives the first message's lead-in.
-	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, turnEnv, showThoughts }) {
-		const ch = channel();
-		let conv = conversation;
-		let child = null;
-		let stopping = false;
-		let tail = Promise.resolve();
-
-		function turn(text) {
-			return new Promise((done) => {
-				(async () => {
-					stopping = false;
-					const bin = find();
-					if (!bin) { ch.push({ type: 'result', ok: false, text: '', subtype: 'error', errors: ['还没有安装 Antigravity CLI。请在「设置 → Antigravity」里安装并登录。'], code: 'missing', costUsd: 0, durationMs: 0 }); return done(); }
-					await prepareTurn?.().catch((e) => log('[agy]', `[${tag}]`, 'prepare:', e?.message));
-					if (ch.ended || stopping) {
-						if (!ch.ended) ch.push({ type: 'result', ok: false, text: '', subtype: 'interrupted', errors: [], costUsd: 0, durationMs: 0 });
-						return done();
-					}
-					const prompt = (conv ? text : withPreamble(preamble?.(), text)).split('\u0000').join('');
-					const thoughts = showThoughts?.() !== false;
-					const beforeTurn = conv && thoughts ? await lastStepIndex(home, conv).catch(() => -1) : -1;
-					const viaStdin = Buffer.byteLength(prompt) > 100000;
-					const args = agyArgs({ mode: settings.mode, model: agySlug(settings.model), conversation: conv, prompt, viaStdin });
-					const mapper = createAgyMapper();
-					const started = Date.now();
-					let stderr = '';
-					let pending = '';
-					let finished = false;
-					let idle = null;
-					let idleKilled = false;
-					const armIdle = () => {
-						clearTimeout(idle);
-						idle = setTimeout(() => {
-							if (mapper.state.activeTools > 0) return armIdle(); // a long command is not a hang
-							idleKilled = true;
-							killTree(child);
-						}, IDLE_MS);
-						idle.unref?.();
-					};
-					let over = false;
-					const emit = (events) => {
-						for (const ev of events) {
-							if (ev.type === 'init') {
-								if (!ev.ref || ev.ref === conv) continue; // every turn announces itself; once is news
-								conv = ev.ref;
-							}
-							if (ev.type === 'result') {
-								if (finished) continue;
-								finished = true;
-								// "Not logged in" is also what agy says when it could not reach Google to check.
-								if (ev.code === 'auth' && isNetworkTrouble(stderr)) Object.assign(ev, { code: 'network', errors: [agyErrorText('', stderr).text] });
-								if (mapper.state.denied && settings.mode !== 'bypassPermissions') {
-									ch.push({ type: 'notice', text: 'Antigravity 自带的工具不能逐步确认，需要确认的那一步被它自己拒绝了。命令和写文件它可以改用 DroidAgent 的工具（会弹确认卡片）；想让它不受限制，把执行模式切到 Full access。' });
-								}
-								// The time the owner waited, not only what agy counted.
-								ev.durationMs = Date.now() - started;
-								// The answer is in; a process that lingers afterwards must not hold the next turn up.
-								const lingering = child;
-								setTimeout(() => { if (!over) killTree(lingering); }, 5000).unref?.();
-							}
-							ch.push(ev);
-						}
-					};
-					// Thoughts: read from agy's record of the conversation (agy_thoughts.mjs) when a step
-					// starts or ends, never in the middle of a reply being written, and all that remain
-					// before the turn's result. Lines are handled one at a time, in order, for that.
-					let baseline = null; // the last step of the conversation before this turn
-					const shown = new Set();
-					const flushThoughts = async () => {
-						if (!conv || !thoughts) return;
-						if (baseline === null) baseline = beforeTurn ?? -1;
-						const found = await readThoughts(home, conv, baseline + 1).catch(() => new Map());
-						for (const [idx, text] of found) {
-							if (shown.has(idx)) continue;
-							shown.add(idx);
-							ch.push({ type: 'thinking', text });
-						}
-					};
-					let lines = Promise.resolve();
-					const handle = async (line) => {
-						const peek = line.includes('"result"') && /"event"\s*:\s*"result"/.test(line);
-						if (peek && !mapper.state.textOpen) await flushThoughts();
-						const events = mapper.feed(line);
-						const st = mapper.state.lastStep;
-						// A new step: what led to it comes first.
-						if (st?.isNew && !mapper.state.textOpen && !peek) await flushThoughts();
-						emit(events);
-						if (st?.over && !mapper.state.textOpen) await flushThoughts();
-					};
-					const onLine = (line) => { if (line.trim()) lines = lines.then(() => handle(line)).catch((e) => log('[agy]', `[${tag}]`, 'line:', e?.message)); };
-
-					log('[agy]', `[${tag}]`, 'turn', conv ? `(conversation ${String(conv).slice(0, 8)})` : '(new conversation)', `mode=${settings.mode}`, `model=${agySlug(settings.model) || 'default'}`);
-					try {
-						child = spawn(bin, args, { cwd, env: env(turnEnv?.() || {}), detached: true, stdio: [viaStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
-					} catch (e) {
-						ch.push({ type: 'result', ok: false, text: '', subtype: 'error', errors: [`启动不了 Antigravity CLI：${e?.message || e}`], costUsd: 0, durationMs: 0 });
-						return done();
-					}
-					const me = child;
-					if (viaStdin) { me.stdin.on('error', () => {}); me.stdin.end(agyStdinLine(prompt)); }
-					armIdle();
-					me.stdout.on('data', (d) => {
-						armIdle();
-						pending += d.toString('utf8');
-						let i;
-						while ((i = pending.indexOf('\n')) >= 0) { const line = pending.slice(0, i); pending = pending.slice(i + 1); onLine(line); }
-					});
-					me.stderr.on('data', (d) => {
-						const s = d.toString('utf8');
-						stderr = (stderr + s).slice(-4096);
-						for (const l of s.split('\n')) if (l.trim()) log('[agy]', `[${tag}]`, l.trim().slice(0, 300));
-					});
-					const end = async (code, signal, spawnError) => {
-						if (over) return;
-						over = true;
-						clearTimeout(idle);
-						if (pending.trim()) { onLine(pending); pending = ''; }
-						if (child === me) child = null;
-						await lines;
-						if (!finished) {
-							let ev;
-							if (stopping) ev = { type: 'result', ok: false, text: '', subtype: 'interrupted', errors: [] };
-							else if (idleKilled) ev = { type: 'result', ok: false, text: '', subtype: 'error', errors: [`Antigravity ${Math.round(IDLE_MS / 60000)} 分钟没有任何回应，已经停下。多半是网络断了，请检查代理后再发一次。`], code: 'network' };
-							else {
-								const err = spawnError ? { code: 'error', text: `启动不了 Antigravity CLI：${spawnError.message}` } : agyErrorText('', stderr || `agy 退出了（${signal || code}），没有给出结果`);
-								ev = { type: 'result', ok: false, text: '', subtype: 'error', errors: [err.text], code: err.code };
-							}
-							emit([{ costUsd: 0, durationMs: 0, ...ev }]);
-						}
-						done();
-					};
-					me.on('error', (e) => end(null, null, e));
-					me.on('close', (code, signal) => end(code, signal));
-				})().catch((e) => {
-					log('[agy]', `[${tag}]`, 'turn failed:', e?.stack || e);
-					ch.push({ type: 'result', ok: false, text: '', subtype: 'error', errors: [String(e?.message || e)], costUsd: 0, durationMs: 0 });
-					done();
-				});
-			});
+	// One conversation, through `agy acp`. `settings` is the live object (model, effort, mode).
+	// Full access is the one mode where agy is told not to ask at all.
+	function open({ tag, cwd, settings, conversation = null, preamble, prepareTurn, canUseTool }) {
+		const bin = find();
+		if (!bin) {
+			// Nothing to start: every message says how to get it.
+			const missing = { type: 'result', ok: false, text: '', subtype: 'error', errors: ['还没有安装 Antigravity CLI。请在设置里的 Antigravity 卡片上安装并登录。'], code: 'missing', costUsd: 0, durationMs: 0 };
+			const items = [];
+			let wake = null;
+			let ended = false;
+			return {
+				events: { async *[Symbol.asyncIterator]() { for (;;) { if (items.length) { yield items.shift(); continue; } if (ended) return; await new Promise((r) => { wake = r; }); } } },
+				send() { items.push(missing); wake?.(); },
+				close() { ended = true; wake?.(); },
+				control: { interrupt() {}, supportedCommands: async () => [], options: () => [] },
+				spec: { label: 'Antigravity CLI', kind: 'agy', cmd: ['agy'], env: {} },
+			};
 		}
-
-		return {
-			events: ch,
-			send(text) { tail = tail.then(() => (ch.ended ? null : turn(text))); },
-			close() { ch.end(); stopping = true; killTree(child); },
-			control: { interrupt() { stopping = true; killTree(child); } },
-			spec: { label: 'Antigravity CLI', kind: 'agy', cmd: [find() || 'agy'], env: {} },
-		};
+		const args = ['acp', ...(settings.mode === 'bypassPermissions' ? ['--dangerously-skip-permissions'] : [])];
+		return openAcp({
+			spawnSpec: { bin, args, env: env() }, cwd, tag, log, settings, conversation,
+			systemPrompt: preamble, prepareTurn, canUseTool,
+			normalize: normalizeAgyTool, modelSlug: agySlug, errorText: agyErrorText,
+		});
 	}
 
 	// One question, one answer: what names a conversation. A Flash model when there is one.

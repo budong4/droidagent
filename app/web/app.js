@@ -616,10 +616,14 @@ function renderModelSheet() {
 	const curSlug = isAgyModel() ? String(SETTINGS.model).replace(/^agy:/, '') : '';
 	for (const fam of groupAgyModels(agyState.models)) {
 		const cur = fam.items.find((it) => it.slug === curSlug);
-		const levels = ['low', 'medium', 'high', 'xhigh', 'max'].filter((k) => fam.variants[k]);
+		// Named variants (…-high, …-low) are the levels; a model without them takes the thinking
+		// level agy itself offers in the conversation, once one has run.
+		const variantLevels = ['low', 'medium', 'high', 'xhigh', 'max'].filter((k) => fam.variants[k]);
+		const ownLevels = !variantLevels.length && cur && agyState.levels?.length > 1 ? agyState.levels : [];
+		const levels = variantLevels.length ? variantLevels : ownLevels;
 		list.appendChild(modelCard({
-			name: fam.name, sel: !!cur, efforts: levels, effort: cur?.effort || '',
-			desc: levels.length > 1 ? `${levels.length} 档思考` : '',
+			name: fam.name, sel: !!cur, efforts: levels, effort: variantLevels.length ? cur?.effort || '' : nearestEffort(ownLevels, SETTINGS.effort),
+			desc: variantLevels.length > 1 ? `${variantLevels.length} 档思考` : '',
 			onSelect: () => {
 				if (cur) return;
 				const chosen = pickAgyVariant(fam, SETTINGS.effort);
@@ -629,6 +633,7 @@ function renderModelSheet() {
 			onEffort: (e) => {
 				const v = fam.variants[e];
 				if (v) pushSettings({ model: v.id, modelName: fam.name, effort: e });
+				else pushSettings({ effort: e }); // agy's own level: set at the next message
 				renderModelSheet();
 			},
 		}));
@@ -2002,9 +2007,9 @@ async function loadAgy(fresh) {
 function renderAgyCard() {
 	if (!$('#set-agy-who')) return;
 	const st = agyState;
-	$('#set-agy-who').textContent = accounts.agy ? 'Google 账号' : '未登录';
+	$('#set-agy-who').textContent = accounts.agy ? (st?.email || 'Google 账号') : '未登录';
 	$('#set-agy-plan').textContent = accounts.agy ? (st?.models?.length ? `已登录 · ${st.models.length} 个模型可用` : '已登录') : '用 Google 账号登录';
-	$('#set-agy-badge').innerHTML = accounts.agy ? 'G' : ic('i-spark');
+	$('#set-agy-badge').innerHTML = accounts.agy ? esc(((st?.email || 'G').trim()[0] || 'G').toUpperCase()) : ic('i-spark');
 	const dot = $('#agy-engine-dot');
 	const line = $('#agy-engine-line');
 	if (!st) { dot.className = 'engine-dot off'; line.textContent = 'agy · 正在检测'; return; }

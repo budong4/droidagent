@@ -224,7 +224,7 @@ test('moving a conversation to the other agent and back: each resumes its own th
 	assert.ok(!sdk().some((l) => String(l.setModel).startsWith('agy:')), "an Antigravity model is never pushed to Claude's process");
 	const viaAgy = await say(id, 'second, with Antigravity');
 	assert.match(viaAgy.events.find((e) => e.type === 'notice').text, /从这里开始由 Antigravity 回答。它看不到前面由 Claude 完成的内容/);
-	assert.equal(viaAgy.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), 'echo(gemini-3.8-flash): second, with Antigravity');
+	assert.equal(viaAgy.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), 'echo(gemini-3.8-flash/extra): second, with Antigravity');
 	let sess = await storedWhen(id, (x) => x.agyConversationId && x.messages.at(-1)?.role === 'assistant');
 	assert.equal(sess.backend, 'agy');
 	assert.equal(sess.claudeSessionId, 'claude-session-1', "Claude's thread is kept for when it comes back");
@@ -241,7 +241,7 @@ test('moving a conversation to the other agent and back: each resumes its own th
 	assert.equal(sess.backend, 'claude');
 	assert.deepEqual(sess.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => m.text), [
 		'first, with Claude', 'claude says: first, with Claude',
-		'second, with Antigravity', 'echo(gemini-3.8-flash): second, with Antigravity',
+		'second, with Antigravity', 'echo(gemini-3.8-flash/extra): second, with Antigravity',
 		'third, with Claude again', 'claude says: third, with Claude again',
 	]);
 });

@@ -1,212 +1,190 @@
 #!/usr/bin/env node
-// Stands in for the Antigravity CLI in tests. It prints what the real one prints in headless
-// mode (event shapes as recorded from agy 1.1–1.5), and, like the real one, starts the MCP
-// servers in ~/.gemini/config/mcp_config.json when a prompt asks for one of their tools.
+// Stands in for the Antigravity CLI in tests: `--version`, `models`, `plugin list|install`,
+// `-p /usage`, `-p … --output-format json` (one-off questions), and `acp`, an Agent Client
+// Protocol server (JSON-RPC 2.0, one message per line) as the app drives conversations.
 //
-// What a prompt does (its last line decides, so a lead-in ahead of it does not matter):
-//   "shell: <cmd>"        call the droidagent MCP tool `shell` with that command
-//   "write: <path>=<txt>" call the droidagent MCP tool `write_file`
-//   "native: <cmd>"       agy's own run_command — refused unless --dangerously-skip-permissions
-//   "fail: <message>"     end with status ERROR
-//   "hang"                never answer (until killed)
-//   "/usage"              answer as the /usage command does
-//   anything else         echo it back in two pieces
-// FAKE_AGY_LOG: a file that gets one JSON line per run (argv, cwd, env of interest, stdin).
-import { spawn } from 'node:child_process';
-import { appendFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+// In `acp`, what a prompt does is decided by its last line:
+//   "shell: <cmd>"         a command step: asks permission, then runs it here and reports the output
+//   "write: <path>=<text>" a file write: asks permission, then writes it
+//   "think: <topic>"       a thought, a read step, another thought, then the answer
+//   "plan"                 a plan update
+//   "fail: <message>"      the prompt request fails with that message
+//   "hang"                 starts answering, then waits to be cancelled
+//   anything else          echoed back in two chunks: "echo(<model>/<level>): <text>"
+// Signed out (no token file, or FAKE_AGY_LOGGED_OUT): session requests fail with -32000.
+// FAKE_AGY_LOG: one JSON line per prompt (and per one-off run) for the tests to read.
+import { exec } from 'node:child_process';
+import { appendFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const argv = process.argv.slice(2);
-const emit = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const note = (o) => { if (process.env.FAKE_AGY_LOG) appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify(o) + '\n'); };
+const signedIn = () => !process.env.FAKE_AGY_LOGGED_OUT && existsSync(join(process.env.HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'));
 
 if (argv[0] === '--version') { console.log('agy version 1.5.9-fake'); process.exit(0); }
 if (argv[0] === 'models') {
-	if (process.env.FAKE_AGY_LOGGED_OUT) { console.error('Error: Please sign in'); process.exit(1); }
-	process.stdout.write('gemini-4-carbon-high\tGemini 4 Carbon (High)\ngemini-3.8-flash      Gemini 3.8 Flash\nclaude-sonnet-5-5     Claude Sonnet 5.5 (Thinking)\n');
+	if (!signedIn()) { console.error('Error: Please sign in'); process.exit(1); }
+	process.stdout.write('gemini-4-carbon-high\tGemini 4 Carbon (High)\ngemini-4-carbon-low\tGemini 4 Carbon (Low)\ngemini-3.8-flash      Gemini 3.8 Flash\nclaude-sonnet-5-5     Claude Sonnet 5.5 (Thinking)\n');
 	process.exit(0);
 }
 if (argv[0] === 'plugin' && argv[1] === 'list') { console.log(JSON.stringify([{ name: 'demo-plugin', version: '1.0.0', description: 'a plugin' }])); process.exit(0); }
 if (argv[0] === 'plugin' && argv[1] === 'install') { console.log(`installed ${argv[2]}`); process.exit(argv[2] === 'broken' ? 1 : 0); }
-
-// Signing in the way a machine without a browser does: a link, then the code Google showed.
-// FAKE_AGY_LOGIN: "old" (this build has no `acp --login`), "callback" (the link comes back to a
-// listener on this machine instead of showing a code).
-if (argv[0] === 'acp' || (argv.length === 0 && process.env.FAKE_AGY_LOGIN === 'old')) {
-	if (argv[0] === 'acp' && process.env.FAKE_AGY_LOGIN === 'old') { console.error('Error: unknown flag: --login'); process.exit(1); }
-	const { mkdirSync, writeFileSync } = await import('node:fs');
-	const save = () => {
-		const dir = join(process.env.HOME, '.gemini', 'antigravity-cli');
-		mkdirSync(dir, { recursive: true });
-		writeFileSync(join(dir, 'antigravity-oauth-token'), JSON.stringify({ token: { access_token: 'new', refresh_token: 'new-r' }, auth_method: 'consumer' }));
-	};
-	if (process.env.FAKE_AGY_LOGIN === 'callback') {
-		const { createServer } = await import('node:http');
-		const srv = createServer((req, res) => {
-			const u = new URL(req.url, 'http://localhost');
-			if (u.searchParams.get('code') === 'good-code' && u.searchParams.get('state') === 'st1') { save(); res.end('ok'); console.log('Signed in.'); setTimeout(() => process.exit(0), 50); } else { res.statusCode = 400; res.end('bad'); }
-		});
-		await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-		console.log(`Open this link to sign in:\n\n  https://accounts.google.com/o/oauth2/v2/auth?client_id=x&redirect_uri=${encodeURIComponent(`http://localhost:${srv.address().port}/oauth-callback`)}&state=st1\n\nWaiting for the browser...`);
-		await new Promise(() => {});
+if (argv.includes('-p')) {
+	const prompt = flag('-p');
+	note({ oneShot: true, argv, prompt });
+	if (prompt === '/usage') {
+		console.log(JSON.stringify({ event: 'command_result', command: { name: 'usage', data: { groups: [
+			{ name: 'Gemini', description: 'Gemini quota bucket', buckets: [{ id: 'gemini-5h', window: '5h', remaining_fraction: 0.75, reset_time: '2030-01-01T00:00:00Z' }, { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.4 }] },
+			{ name: 'Claude and GPT', buckets: [{ id: '3p-5h', window: '5h', remaining_fraction: 0.1 }] },
+		] } } }));
+		process.exit(0);
 	}
-	console.log('\x1b[1mSign in with Google\x1b[0m\nOpen this link in a browser:\n\n  https://accounts.google.com/o/oauth2/v2/auth?client_id=x&redirect_uri=https%3A%2F%2Fantigravity.google%2Fcode&state=st1&scope=a%20b\n');
-	process.stdout.write('Paste the authorization code: ');
-	const rl = createInterface({ input: process.stdin });
-	const code = await new Promise((r) => rl.once('line', r));
-	if (code.trim() !== '4/good-code') { console.log('\nError: invalid authorization code'); process.exit(1); }
-	console.log('\nExchanging code...');
-	save();
-	console.log('Signed in as owner@example.com');
+	console.log(JSON.stringify({ conversation_id: 'one-shot', status: 'SUCCESS', response: String(prompt).includes('起一个标题') ? '「查看电池状态」\n' : `echo: ${prompt}` }));
 	process.exit(0);
 }
+if (argv[0] !== 'acp') { console.error(`fake agy: no such command ${argv.join(' ')}`); process.exit(2); }
 
-let stdin = '';
-if (argv.includes('--input-format')) {
-	for await (const chunk of process.stdin) stdin += chunk;
-}
-const prompt = argv.includes('-p') ? flag('-p') : (() => { try { return JSON.parse(stdin.split('\n')[0]).message.content; } catch { return ''; } })();
-if (process.env.FAKE_AGY_LOG) {
-	appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify({
-		argv, cwd: process.cwd(), prompt, stdin: stdin.length,
-		env: { session: process.env.DROIDAGENT_SESSION, dbus: process.env.DBUS_SESSION_BUS_ADDRESS, noUpdate: process.env.AGY_CLI_DISABLE_AUTO_UPDATE },
-	}) + '\n');
-}
-
-const last = String(prompt || '').trim().split('\n').pop().trim();
-if (last === '/usage') {
-	emit({ event: 'command_result', command: { name: 'usage', data: { groups: [
-		{ name: 'Gemini', description: 'Gemini quota bucket', buckets: [{ id: 'gemini-5h', window: '5h', remaining_fraction: 0.75, reset_time: '2030-01-01T00:00:00Z' }, { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.4 }] },
-		{ name: 'Claude and GPT', buckets: [{ id: '3p-5h', window: '5h', remaining_fraction: 0.1 }] },
-	] } } });
-	process.exit(0);
-}
-if (process.env.FAKE_AGY_LOGGED_OUT) {
-	process.stderr.write('Print mode: silent auth failed\n');
-	emit({ event: 'result', result: { conversation_id: '', status: 'ERROR', error: 'You are not logged into Antigravity.' } });
-	process.exit(1);
-}
-
-// --output-format json: one envelope, nothing streamed.
-if (flag('--output-format') === 'json') {
-	console.log(JSON.stringify({ conversation_id: 'conv-json', status: 'SUCCESS', response: String(prompt).includes('起一个标题') ? '「查看电池状态」\n' : `echo: ${last}`, duration_seconds: 0.1, num_turns: 1 }));
-	process.exit(0);
-}
-
-const conv = flag('--conversation') || 'conv-' + Math.abs(String(prompt).length * 2654435761 % 100000);
-const model = flag('--model') || 'gemini-default';
+// ---------------------------------------------------------------- acp
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+let nextId = 1000;
+const waiting = new Map(); // our requests to the client: id -> resolve
+const ask = (method, params) => new Promise((resolve) => { const id = nextId++; waiting.set(id, resolve); send({ jsonrpc: '2.0', id, method, params }); });
+const update = (sessionId, u) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
 const skip = argv.includes('--dangerously-skip-permissions');
-emit({ event: 'init', conversation_id: conv, init: { model, cwd: process.cwd(), tools: ['run_command'], permission_mode: skip ? 'always-proceed' : 'request-review' } });
-emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'DONE', step_type: 'user_input' } });
-process.stdout.write('some noise that is not JSON\n');
+const MODELS = ['gemini-4-carbon-high', 'gemini-4-carbon-low', 'gemini-3.8-flash', 'claude-sonnet-5-5'];
+const LEVELS = [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['extra', 'Extra'], ['max', 'Max']];
+const sessions = new Map(); // id -> { model, level, cancelled, running }
+let seq = 0;
+const options = (s) => [
+	{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: s.model, options: [{ group: 'gemini', name: 'Gemini', options: MODELS.slice(0, 3).map((m) => ({ value: m, name: m })) }, { group: 'third', name: 'Other', options: [{ value: MODELS[3], name: 'Claude Sonnet 5.5 (Thinking)' }] }] },
+	{ id: 'thinking', name: 'Thinking level', category: 'thought_level', type: 'select', currentValue: s.level, options: LEVELS.map(([value, name]) => ({ value, name })) },
+];
+const noAuth = { code: -32000, message: 'Authentication required' };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const say = async (sid, parts, messageId = `m${seq++}`) => { for (const t of parts) { update(sid, { sessionUpdate: 'agent_message_chunk', messageId, content: { type: 'text', text: t } }); await sleep(3); } };
 
-// One call to an MCP server from mcp_config.json, the way agy makes it.
-function mcpCall(server, tool, args) {
-	return new Promise((resolve, reject) => {
-		const cfg = JSON.parse(readFileSync(join(process.env.HOME, '.gemini', 'config', 'mcp_config.json'), 'utf8')).mcpServers[server];
-		const child = spawn(cfg.command, cfg.args, { env: { ...process.env, ...cfg.env }, stdio: ['pipe', 'pipe', 'inherit'] });
-		const rl = createInterface({ input: child.stdout });
-		const send = (o) => child.stdin.write(JSON.stringify(o) + '\n');
-		rl.on('line', (line) => {
-			const m = JSON.parse(line);
-			if (m.id === 1) { send({ jsonrpc: '2.0', method: 'notifications/initialized' }); send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: tool, arguments: args } }); }
-			if (m.id === 2) { child.stdin.end(); resolve(m.result || { isError: true, content: [{ text: m.error?.message }] }); }
+async function permission(sid, toolCall) {
+	if (skip) return true;
+	const r = await ask('session/request_permission', { sessionId: sid, toolCall, options: [
+		{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }, { optionId: 'always', name: 'Always allow', kind: 'allow_always' }, { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+	] });
+	return r?.outcome?.outcome === 'selected' && (r.outcome.optionId === 'yes' || r.outcome.optionId === 'always');
+}
+
+async function prompt(id, p) {
+	const s = sessions.get(p.sessionId);
+	if (!s) return send({ jsonrpc: '2.0', id, error: { code: -32602, message: 'no such session' } });
+	if (!signedIn()) return send({ jsonrpc: '2.0', id, error: noAuth });
+	const text = (p.prompt || []).map((b) => b.text || '').join('');
+	const last = text.trim().split('\n').pop().trim();
+	note({ acp: true, sessionId: p.sessionId, prompt: text, model: s.model, level: s.level, argv, cwd: process.cwd() });
+	s.cancelled = false;
+	const done = (stopReason) => send({ jsonrpc: '2.0', id, result: { stopReason: s.cancelled ? 'cancelled' : stopReason } });
+	const sid = p.sessionId;
+	if (last.startsWith('fail: ')) return send({ jsonrpc: '2.0', id, error: { code: -32603, message: last.slice(6) } });
+	if (last === 'hang') {
+		await say(sid, ['working', ' on it']);
+		if (s.cancelled) return done('cancelled'); // cancelled while it was still writing
+		s.onCancel = () => done('cancelled');
+		return;
+	}
+	if (last === 'plan') {
+		update(sid, { sessionUpdate: 'plan', entries: [{ content: 'look', priority: 'high', status: 'completed' }, { content: 'fix', priority: 'medium', status: 'in_progress' }] });
+		await say(sid, ['planned']);
+		return done('end_turn');
+	}
+	if (last.startsWith('think: ')) {
+		update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `first thought about ${last.slice(7)}` } });
+		update(sid, { sessionUpdate: 'tool_call', toolCallId: `t${seq++}`, title: 'List /sdcard', kind: 'read', status: 'completed', locations: [{ path: '/sdcard' }], rawInput: { DirectoryPath: '/sdcard' }, name: 'list_dir', content: [{ type: 'content', content: { type: 'text', text: 'a\nb' } }] });
+		update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'I should' } });
+		update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ' look at the files' } });
+		await say(sid, ['two', ' files']);
+		return done('end_turn');
+	}
+	if (last.startsWith('shell: ')) {
+		const cmd = last.slice(7);
+		const tc = { toolCallId: `t${seq++}`, title: `Run ${cmd}`, kind: 'execute', status: 'pending', rawInput: { CommandLine: cmd }, name: 'run_command' };
+		await say(sid, ['Let me run that.']);
+		update(sid, { sessionUpdate: 'tool_call', ...tc });
+		if (!(await permission(sid, tc)) || s.cancelled) {
+			update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: 'failed', content: [{ type: 'content', content: { type: 'text', text: 'denied by the user' } }] });
+			await say(sid, ['Not allowed.']);
+			return done('end_turn');
+		}
+		update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: 'in_progress' });
+		const out = await new Promise((resolve) => {
+			const c = exec(cmd, { cwd: process.cwd(), shell: '/bin/bash' }, (err, so, se) => resolve({ ok: !err, text: `${so}${se}`.replace(/\s+$/, '') }));
+			s.onCancel = () => { c.kill('SIGKILL'); };
 		});
-		child.on('error', reject);
-		send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fake-agy', version: '0' } } });
-	});
-}
-async function mcpStep(index, tool, args) {
-	const info = { name: 'call_mcp_tool', parameters: { ServerName: 'droidagent', ToolName: tool, Arguments: args } };
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: index, state: 'ACTIVE', step_type: 'tool', tool_name: 'call_mcp_tool', tool_info: info } });
-	const r = await mcpCall('droidagent', tool, args);
-	const text = r.content?.[0]?.text || '';
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: index, state: r.isError ? 'ERROR' : 'DONE', step_type: 'tool', tool_name: 'call_mcp_tool', tool_info: { ...info, ...(r.isError ? { error: { type: 'TOOL_ERROR', message: text } } : { output: text }) } } });
-	return text;
-}
-const say = async (index, parts) => {
-	for (let i = 0; i < parts.length; i++) {
-		emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: index, state: i === parts.length - 1 ? 'DONE' : 'ACTIVE', step_type: 'agent_response', text_delta: parts[i] } });
-		await sleep(5);
+		s.onCancel = null;
+		if (s.cancelled) return done('cancelled');
+		update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: out.ok ? 'completed' : 'failed', content: [{ type: 'content', content: { type: 'text', text: out.text } }] });
+		await say(sid, ['It said: ', out.text]);
+		return done('end_turn');
 	}
-};
-// Leave only once everything written has gone down the pipe.
-const leave = (code) => new Promise(() => process.stdout.write('', () => process.exit(code)));
-const finish = async (response, extra = {}) => {
-	emit({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response, duration_seconds: 0.1, num_turns: 1, usage: { input_tokens: 10, output_tokens: 5 }, ...extra } });
-	await leave(0);
-};
-
-// agy's record of the conversation: a SQLite file with one protobuf blob per step. A step's thought
-// is field 20 -> 3, its reply field 20 -> 1 (see app/server/backends/agy_thoughts.mjs).
-async function record(idx, stepType, { thought, reply } = {}) {
-	const { DatabaseSync } = await import('node:sqlite');
-	const { mkdirSync } = await import('node:fs');
-	const dir = join(process.env.HOME, '.gemini', 'antigravity-cli', 'conversations');
-	mkdirSync(dir, { recursive: true });
-	const db = new DatabaseSync(join(dir, `${conv}.db`));
-	// The app reads this file while the turn runs: wait for its read rather than fail.
-	db.exec('PRAGMA busy_timeout = 5000');
-	db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)');
-	const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n >>>= 7; } out.push(n); return Buffer.from(out); };
-	const field = (num, bytes) => Buffer.concat([varint((num << 3) | 2), varint(bytes.length), bytes]);
-	const inner = Buffer.concat([reply ? field(1, Buffer.from(reply)) : Buffer.alloc(0), thought ? field(3, Buffer.from(thought)) : Buffer.alloc(0)]);
-	const payload = Buffer.concat([field(1, Buffer.from('header-padding')), field(20, inner)]);
-	db.prepare('INSERT OR REPLACE INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)').run(idx, stepType, payload);
-	db.close();
+	if (last.startsWith('write: ')) {
+		const [path, ...rest] = last.slice(7).split('=');
+		const tc = { toolCallId: `t${seq++}`, title: `Write ${path}`, kind: 'edit', status: 'pending', locations: [{ path }], rawInput: { TargetFile: path, CodeContent: rest.join('=') }, name: 'write_to_file' };
+		update(sid, { sessionUpdate: 'tool_call', ...tc });
+		if (!(await permission(sid, tc))) {
+			update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: 'failed' });
+			return done('end_turn');
+		}
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, rest.join('='));
+		update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tc.toolCallId, status: 'completed', content: [{ type: 'diff', path, newText: rest.join('=') }] });
+		await say(sid, ['written']);
+		return done('end_turn');
+	}
+	await say(sid, [`echo(${s.model}/${s.level}): `, last]);
+	done('end_turn');
 }
 
-if (last.startsWith('think: ')) {
-	// A thought, a command, a second thought, then the answer — the thoughts only in the record.
-	// Steps are numbered across the whole conversation, so a later turn's follow the earlier ones.
-	const prev = await (async () => {
-		try {
-			const { DatabaseSync } = await import('node:sqlite');
-			const db = new DatabaseSync(join(process.env.HOME, '.gemini', 'antigravity-cli', 'conversations', `${conv}.db`), { readOnly: true });
-			const n = db.prepare('SELECT max(idx) AS m FROM steps').get().m;
-			db.close();
-			return Number(n) || 0;
-		} catch { return 0; }
-	})();
-	await record(prev + 1, 15, { thought: `first thought about ${last.slice(7)}` });
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'DONE', step_type: 'agent_response', usage: { thinking_tokens: 40 } } });
-	await record(prev + 2, 21, { thought: 'I should look at the files' });
-	const info = { name: 'list_dir', parameters: { DirectoryPath: '/sdcard' } };
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 2, state: 'ACTIVE', step_type: 'tool', tool_name: 'list_dir', tool_info: info } });
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 2, state: 'DONE', step_type: 'tool', tool_name: 'list_dir', tool_info: { ...info, output: 'a\nb' } } });
-	await record(prev + 3, 15, { reply: 'two files', thought: 'SYSTEM ROLE: not a thought' });
-	await say(3, ['two', ' files']);
-	await finish('two files');
-} else if (last === 'hang') {
-	await say(1, ['working', ' on it']);
-	process.on('SIGTERM', () => process.exit(143));
-	await new Promise(() => {});
-} else if (last.startsWith('fail: ')) {
-	emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: last.slice(6), duration_seconds: 0.1 } });
-	await leave(1);
-} else if (last.startsWith('shell: ')) {
-	await say(1, ['Let me run that.']);
-	const out = await mcpStep(2, 'shell', { command: last.slice(7), description: '运行测试命令' });
-	await say(3, ['It said: ', out]);
-	await finish(`It said: ${out}`);
-} else if (last.startsWith('write: ')) {
-	const [path, ...rest] = last.slice(7).split('=');
-	const out = await mcpStep(1, 'write_file', { path, content: rest.join('=') });
-	await say(2, [out]);
-	await finish(out);
-} else if (last.startsWith('native: ')) {
-	const info = { name: 'run_command', parameters: { CommandLine: last.slice(8) } };
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: info } });
-	if (skip) {
-		emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { ...info, output: 'ran natively' } } });
-		await say(2, ['done']);
-		await finish('done');
+const rl = createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+	let m;
+	try { m = JSON.parse(line); } catch { return; }
+	if (m.id != null && waiting.has(m.id) && !m.method) { const r = waiting.get(m.id); waiting.delete(m.id); r(m.result); return; }
+	const p = m.params || {};
+	const ok = (result) => send({ jsonrpc: '2.0', id: m.id, result });
+	switch (m.method) {
+		case 'initialize':
+			return ok({ protocolVersion: 1, agentInfo: { name: 'Antigravity ACP Server (fake)' }, agentCapabilities: { loadSession: true, promptCapabilities: {}, mcpCapabilities: { http: false }, sessionCapabilities: { resume: {} } },
+				authMethods: [{ id: 'oauth-personal', name: 'Log in with Google' }] });
+		case 'session/new': {
+			if (!signedIn()) return send({ jsonrpc: '2.0', id: m.id, error: noAuth });
+			const sessionId = `sess-${process.pid}-${seq++}`;
+			const s = { model: 'gemini-3.8-flash', level: 'high' };
+			sessions.set(sessionId, s);
+			note({ acp: true, newSession: sessionId, cwd: p.cwd, argv });
+			ok({ sessionId, configOptions: options(s) });
+			setTimeout(() => update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compress', description: 'Shorten the conversation' }, { name: 'plan', description: 'Plan first', input: { hint: 'task' } }] }), 5);
+			return;
+		}
+		case 'session/resume': {
+			if (!signedIn()) return send({ jsonrpc: '2.0', id: m.id, error: noAuth });
+			const s = { model: 'gemini-3.8-flash', level: 'high' };
+			sessions.set(p.sessionId, s);
+			note({ acp: true, resumed: p.sessionId, argv });
+			return ok({ configOptions: options(s) });
+		}
+		case 'session/set_config_option': {
+			const s = sessions.get(p.sessionId);
+			if (!s) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: 'no such session' } });
+			if (p.configId === 'model') s.model = p.value;
+			if (p.configId === 'thinking') s.level = p.value;
+			return ok({ configOptions: options(s) });
+		}
+		case 'session/prompt': return void prompt(m.id, p).catch((e) => send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: String(e) } }));
+		case 'session/cancel': {
+			const s = sessions.get(p.sessionId);
+			if (s) { s.cancelled = true; const f = s.onCancel; s.onCancel = null; f?.(); }
+			return;
+		}
+		default:
+			if (m.id != null) send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: `no method ${m.method}` } });
 	}
-	emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'ERROR', step_type: 'tool', tool_name: 'run_command', tool_info: { ...info, error: { type: 'TOOL_ERROR', message: 'Permission denied automatically in headless mode: run_command' } } } });
-	await finish(''); // agy reports SUCCESS with no text when its only step was refused
-} else {
-	await say(1, [`echo(${model}): `, last]);
-	await finish(`echo(${model}): ${last}`);
-}
+});
+rl.on('close', () => process.exit(0));

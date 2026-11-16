@@ -1,56 +1,16 @@
 // Run: node --test tests/shared.test.mjs
-// Antigravity's thoughts read back from its own record, and the plugin store both agents share.
+// The plugin store both agents share.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import { thoughtOf, readThoughts, lastStepIndex, conversationDb } from '../app/server/backends/agy_thoughts.mjs';
 import {
 	claudeServerToConnector, agyServerToClaude, enabledClaudePlugins, claudePluginsForAgy, agyPluginsForClaude, syncSkillLinks, skillsIn,
 } from '../app/server/backends/shared_plugins.mjs';
 
-const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n >>>= 7; } out.push(n); return Buffer.from(out); };
-const field = (num, bytes) => Buffer.concat([varint((num << 3) | 2), varint(bytes.length), Buffer.from(bytes)]);
 const tmp = () => mkdtempSync(join(tmpdir(), 'droidagent-shared-'));
 const skill = (dir, name) => { mkdirSync(join(dir, name), { recursive: true }); writeFileSync(join(dir, name, 'SKILL.md'), `---\nname: ${name}\ndescription: x\n---\n`); };
-
-// ---------------------------------------------------------------- thoughts
-test("a step's thought is field 20 -> 3; the reply (20 -> 1) and things that only look like prose are not", () => {
-	assert.equal(thoughtOf(Buffer.concat([field(2, 'x'), field(20, Buffer.concat([field(1, 'the answer'), field(3, 'let me think')]))])), 'let me think');
-	assert.equal(thoughtOf(field(20, field(1, 'only an answer'))), '');
-	// Nested a level down, as tool steps carry it.
-	assert.equal(thoughtOf(field(5, field(20, field(3, 'deeper')))), 'deeper');
-	for (const notOne of ['SYSTEM ROLE: you are', '{"toolAction":"x"}', '/plan do it', '3f2a1b4c-0000-4000-8000-000000000000', 'call_abc']) {
-		assert.equal(thoughtOf(field(20, field(3, notOne))), '', notOne);
-	}
-	assert.equal(thoughtOf(Buffer.from([0xff, 0xff, 0xff])), '', 'garbage is no thought and no error');
-	assert.equal(thoughtOf(Buffer.alloc(0)), '');
-});
-
-test('thoughts are read from the conversation record, from a given step on', async () => {
-	const home = tmp();
-	try {
-		assert.deepEqual([...await readThoughts(home, 'conv1')], [], 'no record yet');
-		assert.equal(await lastStepIndex(home, 'conv1'), -1);
-		assert.equal(conversationDb(home, '../etc/passwd'), null, 'an id is never a path');
-		const file = conversationDb(home, 'conv1');
-		mkdirSync(join(home, '.gemini', 'antigravity-cli', 'conversations'), { recursive: true });
-		const db = new DatabaseSync(file);
-		db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)');
-		const add = db.prepare('INSERT INTO steps VALUES (?, ?, ?)');
-		add.run(0, 1, field(1, 'the user typed something long enough'));
-		add.run(1, 15, field(20, field(3, 'thinking one')));
-		add.run(2, 21, Buffer.concat([field(2, 'list_dir'), field(20, field(3, 'thinking two'))]));
-		add.run(3, 15, field(20, field(1, 'the answer, which is not a thought')));
-		add.run(4, 99, field(20, field(3, 'a step type that is not read')));
-		db.close();
-		assert.deepEqual([...await readThoughts(home, 'conv1')], [[1, 'thinking one'], [2, 'thinking two']]);
-		assert.deepEqual([...await readThoughts(home, 'conv1', 2)], [[2, 'thinking two']]);
-		assert.equal(await lastStepIndex(home, 'conv1'), 4);
-	} finally { rmSync(home, { recursive: true, force: true }); }
-});
 
 // ---------------------------------------------------------------- plugins, both ways
 test('MCP server entries convert between the two formats', () => {
