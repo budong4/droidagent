@@ -570,6 +570,12 @@ a { color: var(--accent); }
 .menu-head { display: flex; align-items: center; justify-content: space-between; min-height: 34px; padding: 4px 10px 2px; font-size: 13px; color: var(--muted); font-weight: 500; }
 .menu-list { display: flex; flex-direction: column; }
 .menu-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+.menu-note { margin: 2px 10px 8px; font-size: 12.5px; line-height: 1.5; color: var(--muted); max-width: 300px; }
+.usage-group { margin: 10px 2px 2px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.usage-group:first-child { margin-top: 0; }
+.login-provider { margin: 0 0 18px; }
+#login-close { display: block; margin: 14px auto 0; }
+.agy-acts { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 6px; }
 .menu-row {
 	display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
 	min-height: 46px; padding: 6px 10px; border-radius: max(8px, calc(var(--r-card) - 8px)); font-size: 15px;

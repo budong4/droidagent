@@ -10,7 +10,7 @@
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=11">
+	<link rel="stylesheet" href="style.css?v=12">
 	<!-- applies the saved theme and font before the first paint -->
 	<script src="themes.js?v=8"></script>
 </head>
@@ -127,17 +127,24 @@
 	<div id="menu-mode" class="menu hidden" role="menu">
 		<div class="menu-head">执行模式</div>
 		<div id="mode-list" class="menu-list"></div>
+		<p id="mode-agy-note" class="menu-note hidden">Antigravity 的对话：执行命令和写文件走 DroidAgent 的工具，按这里选的模式放行或问你。它自带的其他工具没法逐步确认，只有 Full access 下不受限。</p>
 	</div>
 
 	<div id="menu-model" class="menu hidden" role="menu">
-		<div class="menu-head">模型</div>
+		<div class="menu-head">Claude</div>
 		<div id="model-list" class="menu-list"></div>
 		<button id="more-models-toggle" class="menu-row subtle"><span>更多模型</span><svg class="ic sm"><use href="#i-down"/></svg></button>
 		<div id="more-model-list" class="menu-list hidden"></div>
 		<div class="menu-sep"></div>
-		<div class="menu-head">思考强度</div>
-		<div id="effort-seg" class="seg"></div>
-		<label class="menu-row switch-row"><span class="mr-text"><span>快速模式</span><small>同一个模型，输出更快，用量消耗更多</small></span><span class="sw"><input type="checkbox" id="t-fast"><i></i></span></label>
+		<div class="menu-head">Antigravity</div>
+		<div id="agy-model-list" class="menu-list"></div>
+		<!-- Claude's own knobs: an Antigravity model carries its thinking level in its name. -->
+		<div id="claude-model-opts">
+			<div class="menu-sep"></div>
+			<div class="menu-head">思考强度</div>
+			<div id="effort-seg" class="seg"></div>
+			<label class="menu-row switch-row"><span class="mr-text"><span>快速模式</span><small>同一个模型，输出更快，用量消耗更多</small></span><span class="sw"><input type="checkbox" id="t-fast"><i></i></span></label>
+		</div>
 	</div>
 
 	<div id="menu-usage" class="menu hidden" role="dialog" aria-label="用量">
@@ -182,6 +189,10 @@
 				<svg class="ic chev"><use href="#i-chev"/></svg>
 			</button>
 
+			<div class="list">
+				<button class="row" data-page="page-agy"><svg class="ic row-ic"><use href="#i-spark"/></svg><span class="row-text">Antigravity<small>用 Google 账号登录，使用 Gemini 等模型</small></span><span id="val-agy" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+			</div>
+
 			<h2 class="group-label">外观</h2>
 			<div class="list">
 				<button class="row" data-page="page-theme"><svg class="ic row-ic"><use href="#i-palette"/></svg><span class="row-text">主题</span><span id="val-theme" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
@@ -225,6 +236,11 @@
 	<section id="page-account" class="page hidden" aria-label="账号">
 		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>账号</h1></header>
 		<div id="account-body" class="page-body"></div>
+	</section>
+
+	<section id="page-agy" class="page hidden" aria-label="Antigravity">
+		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>Antigravity</h1></header>
+		<div id="agy-body" class="page-body"></div>
 	</section>
 
 	<section id="page-theme" class="page hidden" aria-label="主题">
@@ -332,8 +348,12 @@
 	<div id="login" class="login hidden">
 		<div class="login-card">
 			<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><use href="#brand-mark"/></svg>
-			<h2>登录 Claude 账号</h2>
-			<p class="lede">使用你的 Claude 订阅（Pro 或 Max），不需要 API Key。</p>
+			<div id="login-provider" class="seg login-provider">
+				<button data-provider="claude" class="sel">Claude</button>
+				<button data-provider="agy">Antigravity</button>
+			</div>
+			<h2 id="login-title">登录 Claude 账号</h2>
+			<p class="lede" id="login-lede">使用你的 Claude 订阅（Pro 或 Max），不需要 API Key。</p>
 			<div id="login-step1">
 				<button class="primary" id="login-start">开始登录</button>
 				<div id="login-wait" class="login-wait hidden"><span class="spin"></span>正在准备登录</div>
@@ -360,7 +380,8 @@
 				</li>
 			</ol>
 			<p id="login-msg" class="login-msg"></p>
-			<!-- Shown only when the automatic network check could not reach Claude. -->
+			<button class="text-btn hidden" id="login-close">先不登录这个账号</button>
+			<!-- Shown only when the automatic network check could not reach the servers. -->
 			<div id="login-net" class="login-net hidden">
 				<p>手机上开着代理软件的话，填它的本地 HTTP 端口：</p>
 				<div class="inline-form"><input id="login-proxy" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="http://127.0.0.1:7890"><button class="pill-btn accent" id="login-proxy-save">保存</button></div>
@@ -368,7 +389,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=15"></script>
+	<script src="app.js?v=16"></script>
 	<script src="market.js?v=5"></script>
 </body>
 </html>
