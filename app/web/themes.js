@@ -5,22 +5,23 @@
    and the illustrations, which are original vector drawings (nothing copied from any show). */
 (function () {
 	const THEMES = [
-		{ id: 'default', name: '电路板', group: 'solid', scheme: 'auto', note: '跟随系统深浅色' },
-		{ id: 'paper', name: '纸白', group: 'solid', scheme: 'light' },
-		{ id: 'mist', name: '雾蓝', group: 'solid', scheme: 'light' },
-		{ id: 'matcha', name: '抹茶', group: 'solid', scheme: 'light' },
-		{ id: 'graphite', name: '石墨', group: 'solid', scheme: 'dark' },
-		{ id: 'dusk', name: '暮紫', group: 'solid', scheme: 'dark' },
-		{ id: 'sakura', name: '樱花', group: 'art', scheme: 'light' },
-		{ id: 'summer', name: '盛夏', group: 'art', scheme: 'light' },
-		{ id: 'wafu', name: '和风', group: 'art', scheme: 'light' },
-		{ id: 'starry', name: '星夜', group: 'art', scheme: 'dark' },
-		{ id: 'neon', name: '霓虹', group: 'art', scheme: 'dark' },
+		{ id: 'default', name: '雾蓝', group: 'solid', scheme: 'auto', color: '#3B66B8', note: '跟随系统' },
+		{ id: 'paper', name: '纸白', group: 'solid', scheme: 'light', color: '#3A5BA0' },
+		{ id: 'circuit', name: '电路板', group: 'solid', scheme: 'auto', color: '#1E6A4F', note: '跟随系统' },
+		{ id: 'matcha', name: '抹茶', group: 'solid', scheme: 'light', color: '#5B7B3A' },
+		{ id: 'graphite', name: '石墨', group: 'solid', scheme: 'dark', color: '#9DB8E8' },
+		{ id: 'dusk', name: '暮紫', group: 'solid', scheme: 'dark', color: '#B9A4E8' },
+		{ id: 'sakura', name: '樱花', group: 'art', scheme: 'light', color: '#B75C75' },
+		{ id: 'summer', name: '盛夏', group: 'art', scheme: 'light', color: '#2A7EA0' },
+		{ id: 'wafu', name: '和风', group: 'art', scheme: 'light', color: '#2E4A6B' },
+		{ id: 'starry', name: '星夜', group: 'art', scheme: 'dark', color: '#F2C46D' },
+		{ id: 'neon', name: '霓虹', group: 'art', scheme: 'dark', color: '#E08FC8' },
 	];
 	const THEME_BAR = { // status-bar colour, matched to each theme's background
-		paper: '#FCFCFD', mist: '#EEF2F5', matcha: '#F2F4EC', graphite: '#161718', dusk: '#16131D',
+		paper: '#FCFCFD', circuit: '#F5F6F2', matcha: '#F2F4EC', graphite: '#161718', dusk: '#16131D',
 		sakura: '#FBF6F7', summer: '#F3F8FB', wafu: '#F4EFE4', starry: '#0E1426', neon: '#110F18',
 	};
+	const FONT_SCALES = { small: 0.9, normal: 1, large: 1.12, xlarge: 1.24 };
 
 	// Chat backgrounds that ship with the app. Original drawings, or public domain / CC0 (see
 	// tools/background_photos.py for where each came from).
@@ -164,16 +165,19 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 
 	/* ---------------- applying a look ---------------- */
 	// wall: '' = the theme's own art, 'custom' = the owner's picture (version in bg), else a preset id
-	const DEFAULT_LOOK = { theme: 'default', font: 'system', wall: '', bg: 0, dim: 60 };
+	const DEFAULT_LOOK = { theme: 'default', font: 'system', fontSize: 'normal', collapseProcess: true, wall: '', bg: 0, dim: 60 };
 	function load() {
 		let l = {};
 		try { l = JSON.parse(localStorage.getItem('look') || '{}') || {}; } catch (e) { /* private mode */ }
 		if (!('wall' in l) && l.bg) l.wall = 'custom'; // saved before presets existed
+		if (l.theme === 'mist') l.theme = 'default';
 		const look = Object.assign({}, DEFAULT_LOOK, l);
 		if (look.wall && look.wall !== 'custom' && !PRESETS.some((p) => p.id === look.wall)) look.wall = '';
 		if (look.wall === 'custom' && !look.bg) look.wall = '';
 		if (!THEMES.some((t) => t.id === look.theme)) look.theme = 'default';
 		if (!FONTS.some((f) => f.id === look.font)) look.font = 'system';
+		if (!(look.fontSize in FONT_SCALES)) look.fontSize = 'normal';
+		look.collapseProcess = look.collapseProcess !== false;
 		return look;
 	}
 	function save(look) { try { localStorage.setItem('look', JSON.stringify(look)); } catch (e) { /* */ } }
@@ -198,13 +202,18 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		const scheme = schemeOf(look.theme);
 		d.setAttribute('data-theme', look.theme);
 		d.setAttribute('data-scheme', scheme);
+		d.setAttribute('data-fontsize', look.fontSize || 'normal');
 		d.classList.toggle('has-bg', !!look.wall);
 		d.style.setProperty('--bg-dim', (look.dim ?? 55) + '%');
+		d.style.setProperty('--chat-scale', String(FONT_SCALES[look.fontSize] || 1));
 		const f = FONTS.find((x) => x.id === look.font) || FONTS[0];
 		fontLink(f);
 		d.style.setProperty('--font-ui', f.family ? `"${f.family}", ${SYSTEM_STACK}` : SYSTEM_STACK);
 		const meta = document.querySelector('meta[name="theme-color"]');
-		if (meta) meta.setAttribute('content', THEME_BAR[look.theme] || (scheme === 'dark' ? '#0D1411' : '#F5F6F2'));
+		const fallbackBar = look.theme === 'circuit'
+			? (scheme === 'dark' ? '#0D1411' : '#F5F6F2')
+			: (scheme === 'dark' ? '#0E121B' : '#EDF2FB');
+		if (meta) meta.setAttribute('content', THEME_BAR[look.theme] || fallbackBar);
 	}
 
 	// The picture behind the conversation for a look, or '' for the theme's own art.
@@ -214,6 +223,6 @@ ${cloud(shade(c1), '#D5E7F2')}${cloud(c1, '#FFFFFF')}${cloud(shade(c2), '#D5E7F2
 		return p ? 'backgrounds/' + p.file : '';
 	}
 
-	window.DA_LOOK = { THEMES, FONTS, PRESETS, SYSTEM_STACK, load, save, apply, renderArt, schemeOf, fontLink, wallUrl, presetThumb };
+	window.DA_LOOK = { THEMES, FONTS, PRESETS, FONT_SCALES, SYSTEM_STACK, load, save, apply, renderArt, schemeOf, fontLink, wallUrl, presetThumb };
 	apply(load());
 })();

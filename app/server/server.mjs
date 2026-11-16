@@ -15,7 +15,7 @@ import { dirname, join, normalize, extname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os';
 import {
 	OFFICIAL_MARKETPLACES, safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
-	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, connectorName, buildMcpEntry, inspectPluginDir,
+	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, connectorName, buildMcpEntry, parseGithubRepo, inspectPluginDir,
 	inspectSkillDir, mergeSlashCommands, OFFICIAL_NAMES, COMPAT_MARKETPLACE, COMPAT_OF, compatibleMarketplace,
 } from './market.mjs';
 import { isReadOnlyBash } from './policy.mjs';
@@ -1664,6 +1664,52 @@ async function searchRegistry(q) {
 	return found;
 }
 
+// ---------------------------------------------------------------- GitHub projects
+// The "+" menu's GitHub tile: one personal access token makes the GitHub MCP connector (the
+// curated `github` entry, so the market shows it as added) and is also handed to the commands the
+// agents run (GH_TOKEN / GITHUB_TOKEN), so `gh` and `git` over https work on the owner's repos too.
+// Repositories linked recently are remembered for the picker.
+const GITHUB_FILE = join(homedir(), '.claude', 'agent-github.json');
+const GITHUB_MCP = 'github';
+async function readGithubFile() { try { return JSON.parse(await readFile(GITHUB_FILE, 'utf8')); } catch { return { recent: [] }; } }
+async function writeGithubFile(g) { await mkdir(dirname(GITHUB_FILE), { recursive: true }); await writeFile(GITHUB_FILE, JSON.stringify(g, null, 2), { encoding: 'utf8', mode: 0o600 }); }
+function githubTokenOf(entry) {
+	if (!entry) return '';
+	if (entry.bearer) return String(entry.bearer);
+	const h = entry.headers?.Authorization || entry.headers?.authorization || '';
+	return String(h).replace(/^(Bearer|token)\s+/i, '').trim();
+}
+async function githubToken() {
+	const { servers = {} } = await readMcpFile();
+	return githubTokenOf(servers[GITHUB_MCP]);
+}
+function applyGithubEnv(token) {
+	for (const k of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+		if (token) process.env[k] = token;
+		else if (process.env[`DROIDAGENT_SET_${k}`]) delete process.env[k];
+		if (token) process.env[`DROIDAGENT_SET_${k}`] = '1'; else delete process.env[`DROIDAGENT_SET_${k}`];
+	}
+}
+githubToken().then((t) => { if (t) applyGithubEnv(t); }).catch(() => {});
+const githubApi = async (path, token) => JSON.parse((await fetchUrl(`https://api.github.com${path}`, {
+	headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+	timeout: 20000,
+})).body);
+const maskToken = (t) => (t ? `${t.slice(0, 4)}…${t.slice(-4)}` : '');
+async function githubStatus() {
+	const { servers = {} } = await readMcpFile();
+	const entry = servers[GITHUB_MCP];
+	const token = githubTokenOf(entry);
+	const g = await readGithubFile();
+	return { ok: true, configured: !!token, enabled: !!entry && !entry.disabled, token: maskToken(token), login: g.login || '', recent: (g.recent || []).slice(0, 12) };
+}
+async function rememberGithubRepo(r) {
+	const g = await readGithubFile();
+	g.recent = [{ repo: r.repo, url: r.url, branch: r.branch || '', private: !!r.private, description: String(r.description || '').slice(0, 200), at: Date.now() },
+		...(g.recent || []).filter((x) => x.repo !== r.repo)].slice(0, 20);
+	await writeGithubFile(g);
+}
+
 // ---------------------------------------------------------------- connector sign-in (pty)
 let mcpLogin = null;
 function cancelMcpLogin() {
@@ -3164,6 +3210,86 @@ const server = createServer(async (req, res) => {
 				pluginsChanged();
 				return json(res, { ok: true });
 			} catch (e) { return json(res, { ok: false, error: e?.message }, 500); }
+		}
+
+		// ---- GitHub projects ----
+		if (path === '/api/github/status' && req.method === 'GET') {
+			return json(res, await githubStatus());
+		}
+		// Saves the token as the GitHub MCP connector (on for both agents), after GitHub accepts it.
+		if (path === '/api/github/connect' && req.method === 'POST') {
+			const { token } = await body(req);
+			const t = String(token || '').trim();
+			if (!/^[\w-]{20,255}$/.test(t)) return json(res, { ok: false, error: '令牌格式不对：应是 ghp_ / github_pat_ 开头的一串字符' }, 400);
+			let user;
+			try { user = await githubApi('/user', t); } catch (e) {
+				return json(res, { ok: false, error: /HTTP 401/.test(e?.message || '') ? 'GitHub 不认这个令牌，请检查是否复制完整、是否过期' : `连不上 GitHub：${e?.message || e}` }, 400);
+			}
+			const known = (await readCatalog('connectors.json')).find((c) => c.id === GITHUB_MCP);
+			const cfg = await readMcpFile();
+			cfg.servers ||= {};
+			cfg.servers[GITHUB_MCP] = { ...buildMcpEntry(known, { Authorization: t }), auth: known.auth, origin: 'curated' };
+			await writeMcpFile(cfg);
+			const g = await readGithubFile();
+			g.login = user?.login || '';
+			await writeGithubFile(g);
+			applyGithubEnv(t);
+			restartRuntimesWhenIdle(); // the commands an agent runs take GH_TOKEN from its process
+			await applyMcpToAllRuntimes();
+			broadcast({ type: 'mcp_updated' });
+			return json(res, { ...(await githubStatus()), login: g.login });
+		}
+		if (path === '/api/github/disconnect' && req.method === 'POST') {
+			const cfg = await readMcpFile();
+			if (cfg.servers?.[GITHUB_MCP]) {
+				delete cfg.servers[GITHUB_MCP];
+				await writeMcpFile(cfg);
+			}
+			const g = await readGithubFile();
+			delete g.login;
+			await writeGithubFile(g);
+			applyGithubEnv('');
+			restartRuntimesWhenIdle();
+			await applyMcpToAllRuntimes();
+			broadcast({ type: 'mcp_updated' });
+			return json(res, await githubStatus());
+		}
+		if (path === '/api/github/repos' && req.method === 'GET') {
+			const token = await githubToken();
+			if (!token) return json(res, { ok: false, error: '还没有连接 GitHub', needToken: true }, 400);
+			const q = String(url.searchParams.get('q') || '').trim().slice(0, 100);
+			try {
+				let list;
+				if (q) {
+					const g = await readGithubFile();
+					const who = g.login ? ` user:${g.login}` : '';
+					list = (await githubApi(`/search/repositories?per_page=30&q=${encodeURIComponent(q + who)}`, token)).items || [];
+				} else {
+					list = await githubApi('/user/repos?sort=updated&per_page=60&affiliation=owner,collaborator,organization_member', token);
+				}
+				const repos = (Array.isArray(list) ? list : []).map((r) => ({
+					repo: r.full_name, url: r.html_url, private: !!r.private, description: r.description || '', branch: r.default_branch || '',
+					language: r.language || '', stars: r.stargazers_count || 0, updated: r.pushed_at || r.updated_at || '', fork: !!r.fork,
+				}));
+				return json(res, { ok: true, repos });
+			} catch (e) {
+				return json(res, { ok: false, error: /HTTP 401/.test(e?.message || '') ? '令牌已失效，请重新连接 GitHub' : `读取仓库失败：${e?.message || e}` }, 502);
+			}
+		}
+		// A repository put on the conversation: checked, normalized and remembered.
+		if (path === '/api/github/link' && req.method === 'POST') {
+			const { repo, description, private: priv } = await body(req);
+			const r = parseGithubRepo(repo);
+			if (!r) return json(res, { ok: false, error: '请输入 owner/repo 或 GitHub 仓库链接' }, 400);
+			await rememberGithubRepo({ ...r, description, private: priv });
+			return json(res, { ok: true, ...r, mcp: (await githubStatus()).enabled });
+		}
+		if (path === '/api/github/forget' && req.method === 'POST') {
+			const { repo } = await body(req);
+			const g = await readGithubFile();
+			g.recent = (g.recent || []).filter((x) => x.repo !== repo);
+			await writeGithubFile(g);
+			return json(res, await githubStatus());
 		}
 
 		// ---- MCP ----

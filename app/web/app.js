@@ -103,10 +103,12 @@ $('#menu-scrim').addEventListener('click', () => closeLayer('menu'));
 function closeMenu() { closeLayer('menu'); }
 
 /* ---------------- bottom sheets ---------------- */
+let openSheetId = null;
 function openSheet(id) {
 	const s = $('#' + id), scrim = $('#sheet-scrim');
 	show(scrim); show(s);
-	openLayer('sheet', () => { hide(s); hide(scrim); });
+	openSheetId = id;
+	openLayer('sheet', () => { hide(s); hide(scrim); if (openSheetId === id) openSheetId = null; });
 }
 $('#sheet-scrim').addEventListener('click', () => closeLayer('sheet'));
 $$('.sheet-close').forEach((b) => b.addEventListener('click', () => closeLayer('sheet')));
@@ -138,13 +140,14 @@ $$('[data-page]').forEach((b) => b.addEventListener('click', () => openPage(b.da
 
 /* ---------------- dialog ---------------- */
 let dialogOk = null;
-function showDialog({ title, msg = '', html = false, input: withInput = false, value = '', ok = '确定', cancel = '取消', danger = false, onOk }) {
+function showDialog({ title, msg = '', html = false, input: withInput = false, value = '', placeholder = '', ok = '确定', cancel = '取消', danger = false, onOk }) {
 	$('#dialog-title').textContent = title;
 	const m = $('#dialog-msg');
 	if (html) m.innerHTML = msg; else m.textContent = msg;
 	const inp = $('#dialog-input');
 	inp.classList.toggle('hidden', !withInput);
 	inp.value = value;
+	inp.placeholder = placeholder || '';
 	$('#dialog-ok').textContent = ok;
 	$('#dialog-ok').classList.toggle('danger', danger);
 	$('#dialog-cancel').textContent = cancel;
@@ -208,12 +211,22 @@ function updateLookValues() {
 	const t = LOOK.THEMES.find((x) => x.id === look.theme);
 	const f = LOOK.FONTS.find((x) => x.id === look.font);
 	$('#val-theme').textContent = t ? t.name : '';
+	if ($('#val-theme-dot')) $('#val-theme-dot').style.background = t?.color || '';
 	$('#val-font').textContent = f ? f.name : '';
 	const preset = LOOK.PRESETS.find((x) => x.id === look.wall);
 	$('#val-bg').textContent = look.wall === 'custom' ? '我的图片' : preset ? preset.name : (t && t.group === 'art' ? '主题插画' : '跟随主题');
 	$$('.theme-card').forEach((c) => c.classList.toggle('sel', c.dataset.id === look.theme));
 	$$('.font-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === look.font));
+	$$('#font-size-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.size === (look.fontSize || 'normal')));
+	if ($('#t-collapse-process')) $('#t-collapse-process').checked = look.collapseProcess !== false;
 }
+$$('#font-size-seg button').forEach((b) => b.addEventListener('click', () => {
+	if (look.fontSize !== b.dataset.size) setLook({ fontSize: b.dataset.size });
+}));
+$('#t-collapse-process')?.addEventListener('change', (e) => {
+	setLook({ collapseProcess: e.target.checked });
+	if (typeof syncProcessGroups === 'function') syncProcessGroups();
+});
 renderMainArt();
 // The default theme follows the system's dark mode.
 const refollow = () => { if (look.theme === 'default') LOOK.apply(look); };
@@ -364,25 +377,98 @@ $('#file-bg').addEventListener('change', async (e) => {
 });
 
 /* ================================================================ settings state */
+let account = null;
+let loggedIn = false;
+let accounts = { claude: false, agy: false }; // which of the two is signed in; either is enough to chat
+let agyState = null; // /api/agy/status: the CLI, its login, its models
 const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true };
 const MODES = [
-	{ id: 'default', label: 'Ask', desc: '只读操作直接做，其他每一步都先问你' },
-	{ id: 'acceptEdits', label: 'Accept edits', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
-	{ id: 'plan', label: 'Plan', desc: '只读分析，先拿出计划，你同意后再动手' },
-	{ id: 'auto', label: 'Auto', desc: '全部自动执行，只有刷机、重启、格式化这类高危操作才问你' },
-	{ id: 'bypassPermissions', label: 'Full access', desc: '完全放开，任何操作都不再询问' },
+	{ id: 'default', label: 'Ask', zh: '每次询问', desc: '只读操作直接做，其他每一步都先问你' },
+	{ id: 'acceptEdits', label: 'Accept edits', zh: '自动编辑', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
+	{ id: 'plan', label: 'Plan', zh: '仅计划', desc: '只读分析，先拿出计划，你同意后再动手' },
+	{ id: 'auto', label: 'Auto', zh: '自动执行', desc: '全部自动执行，只有刷机、重启、格式化这类高危操作才问你' },
+	{ id: 'bypassPermissions', label: 'Full access', zh: '完全权限', desc: '完全放开，任何操作都不再询问' },
 ];
 const MODELS = [
-	{ id: 'opus', name: 'Opus 5.5', desc: '能力最强，适合复杂任务' },
-	{ id: 'sonnet', name: 'Sonnet 5.5', desc: '日常首选，速度和能力兼顾' },
-	{ id: 'fable', name: 'Fable 5.1', desc: '会消耗额外用量' },
-	{ id: 'haiku', name: 'Haiku 5.5', desc: '最快，适合简单任务' },
+	{ id: 'opus', name: 'Opus 5.5', desc: '能力最强，适合复杂架构与复杂推理' },
+	{ id: 'sonnet', name: 'Sonnet 5.5', desc: '日常首选，速度与深度思考兼顾' },
+	{ id: 'fable', name: 'Fable 5.1', desc: '擅长长文本推演，会消耗额外用量' },
+	{ id: 'haiku', name: 'Haiku 5.5', desc: '响应最快，适合轻量与高频任务' },
 ];
 const MORE_MODELS = [['haiku-4.5', 'Haiku 4.5'], ['sonnet-5', 'Sonnet 5'], ['opus-5', 'Opus 5'], ['fable-5', 'Fable 5'], ['opus-4.8', 'Opus 4.8'], ['opus-4.7', 'Opus 4.7'], ['opus-4.6', 'Opus 4.6'], ['sonnet-4.6', 'Sonnet 4.6']];
 const EFFORTS = [['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '超高'], ['max', '最大']];
+const EFFORT_LABEL = Object.fromEntries(EFFORTS);
+const EFFORT_LEVEL_RE = /(?:[-_: ](minimal|low|medium|high|xhigh|max|thinking))$/i;
+const LABEL_EFFORT_RE = /\s*\((minimal|low|medium|high|xhigh|max|thinking)\)\s*$/i;
 
-// An Antigravity model is stored as "agy:<its name for it>"; anything else is Claude's.
 const isAgyModel = (m = SETTINGS.model) => String(m || '').startsWith('agy:');
+function normEffort(e) {
+	const v = String(e || '').toLowerCase();
+	if (v === 'minimal') return 'low';
+	if (v === 'thinking') return 'high';
+	return EFFORT_LABEL[v] ? v : '';
+}
+function parseAgyModelMeta(m) {
+	const rawId = String(m?.id || '');
+	const slug = rawId.replace(/^agy:/, '');
+	const em = EFFORT_LEVEL_RE.exec(slug);
+	const lm = LABEL_EFFORT_RE.exec(String(m?.name || ''));
+	const rawEffort = (em?.[1] || lm?.[1] || '').toLowerCase();
+	const effort = normEffort(rawEffort);
+	const baseSlug = em ? slug.slice(0, em.index) : slug;
+	const baseName = String(m?.name || slug).replace(LABEL_EFFORT_RE, '').trim() || baseSlug;
+	return { id: rawId, slug, name: m?.name || slug, baseSlug, baseName, rawEffort, effort };
+}
+function groupAgyModels(models = []) {
+	const families = new Map();
+	for (const m of models) {
+		const meta = parseAgyModelMeta(m);
+		let fam = families.get(meta.baseSlug);
+		if (!fam) {
+			fam = { key: meta.baseSlug, name: meta.baseName, items: [], variants: {} };
+			families.set(meta.baseSlug, fam);
+		}
+		fam.items.push(meta);
+		if (meta.effort && !fam.variants[meta.effort]) fam.variants[meta.effort] = meta;
+	}
+	return [...families.values()].map((fam) => {
+		const def = fam.variants.high || fam.variants.medium || fam.variants.xhigh || fam.variants.low || fam.items[0];
+		return { ...fam, defaultId: def.id, hasVariants: Object.keys(fam.variants).length > 1 };
+	});
+}
+function pickAgyVariant(fam, targetEffort) {
+	if (!fam) return null;
+	if (fam.variants[targetEffort]) return fam.variants[targetEffort];
+	const order = ['low', 'medium', 'high', 'xhigh', 'max'];
+	const idx = Math.max(0, order.indexOf(targetEffort));
+	let best = null, bestDist = 99;
+	for (const [k, v] of Object.entries(fam.variants)) {
+		const ki = order.indexOf(k);
+		const d = Math.abs(ki - idx);
+		if (ki >= 0 && d < bestDist) { best = v; bestDist = d; }
+	}
+	return best || fam.items[0];
+}
+function displayModelSummary() {
+	const base = String(SETTINGS.modelName || 'Sonnet 5.5').replace(LABEL_EFFORT_RE, '').trim();
+	let eff = SETTINGS.effort;
+	if (isAgyModel()) {
+		const m = EFFORT_LEVEL_RE.exec(String(SETTINGS.model).replace(/^agy:/, ''));
+		if (m) eff = normEffort(m[1]) || eff;
+	}
+	const effText = EFFORT_LABEL[eff] || eff;
+	return effText ? `${base} · ${effText}` : base;
+}
+function updateSettingsBadges() {
+	if ($('#val-model')) $('#val-model').textContent = displayModelSummary();
+	const m = MODES.find((x) => x.id === SETTINGS.mode) || MODES[1];
+	if ($('#val-mode')) {
+		$('#val-mode').textContent = m.zh || m.label;
+		$('#val-mode').classList.toggle('val-warn', m.id === 'auto' || m.id === 'bypassPermissions');
+	}
+	if ($('#val-phone')) $('#val-phone').textContent = typeof bgOn === 'function' && bgOn() ? '后台运行中' : '已开启';
+}
+
 function applySettings(s) {
 	const prevMode = SETTINGS.mode;
 	const prevAgy = isAgyModel();
@@ -394,9 +480,10 @@ function applySettings(s) {
 	$('#mode-icon').setAttribute('href', '#m-' + m.id);
 	$('#mode-label').textContent = m.label;
 	if (prevMode !== SETTINGS.mode) { chip.classList.remove('flash'); void chip.offsetWidth; chip.classList.add('flash'); }
-	$('#model-label').textContent = SETTINGS.modelName || 'Sonnet 5.5';
+	$('#model-label').textContent = displayModelSummary();
 	$('#t-autoupdate').checked = SETTINGS.autoUpdate !== false;
 	$('#t-fast').checked = !!SETTINGS.fastMode;
+	updateSettingsBadges();
 }
 function pushSettings(patch) {
 	applySettings(patch);
@@ -410,7 +497,7 @@ function renderModeMenu() {
 	for (const m of MODES) {
 		const b = el('button', 'menu-row' + (m.id === SETTINGS.mode ? ' sel' : ''));
 		b.dataset.mode = m.id;
-		b.innerHTML = `${ic('m-' + m.id)}<span class="mr-text"><span>${esc(m.label)}</span><small>${esc(m.desc)}</small></span>${ic('i-check', 'check')}`;
+		b.innerHTML = `${ic('m-' + m.id)}<span class="mr-text"><span>${esc(m.zh || m.label)} (${esc(m.label)})</span><small>${esc(m.desc)}</small></span>${ic('i-check', 'check')}`;
 		b.addEventListener('click', () => chooseMode(m.id));
 		list.appendChild(b);
 	}
@@ -424,65 +511,154 @@ function chooseMode(id) {
 			title: '开启 Full access？',
 			msg: '开启后助手做任何事都不会再问你，包括刷机、重启、删除系统文件和读取个人数据。只在你清楚它要做什么的时候使用。',
 			ok: '开启', danger: true,
-			onOk: () => { pushSettings({ mode: id }); toast('已切换到 Full access'); },
+			onOk: () => { pushSettings({ mode: id }); toast('已切换到 完全权限'); },
 		});
 		return;
 	}
 	pushSettings({ mode: id });
-	toast('已切换到 ' + (MODES.find((m) => m.id === id)?.label || id));
+	const m = MODES.find((x) => x.id === id);
+	toast('已切换到 ' + (m?.zh || m?.label || id));
 }
 $('#btn-mode').addEventListener('click', (e) => { renderModeMenu(); openMenu('menu-mode', e.currentTarget); });
 
-/* ---------------- model menu ---------------- */
-function modelRow(id, name, desc) {
-	const sel = SETTINGS.model === id || (SETTINGS.modelName === name && isAgyModel(id) === isAgyModel());
-	const b = el('button', 'menu-row' + (sel ? ' sel' : ''));
-	b.innerHTML = `<span class="mr-text"><span>${esc(name)}</span>${desc ? `<small>${esc(desc)}</small>` : ''}</span>${ic('i-check', 'check')}`;
-	b.addEventListener('click', () => { pushSettings({ model: id, modelName: name }); closeMenu(); });
+/* ---------------- unified model & thinking sheet ---------------- */
+let modelSheetProvider = 'claude';
+let showMoreClaudeModels = false;
+function modelCard(id, name, desc, { badge = '', sel = false, onSelect } = {}) {
+	const b = el('button', 'model-card' + (sel ? ' sel' : ''));
+	b.innerHTML = `<div class="mc-main"><div class="mc-title"><span>${esc(name)}</span>${badge ? `<span class="badge builtin">${esc(badge)}</span>` : ''}</div>${desc ? `<div class="mc-sub">${esc(desc)}</div>` : ''}</div>${ic('i-check', 'mc-check')}`;
+	b.addEventListener('click', onSelect);
 	return b;
 }
-// A row that leads to signing in, where an account's models would be.
-function signInRow(label, provider) {
-	const b = el('button', 'menu-row subtle');
-	b.innerHTML = `<span class="mr-text"><span>${esc(label)}</span></span>`;
-	b.addEventListener('click', () => { closeMenu(); showLogin(provider); });
+function signInModelCard(label, desc, provider) {
+	const b = el('button', 'model-card');
+	b.innerHTML = `<div class="mc-main"><div class="mc-title"><span>${esc(label)}</span></div><div class="mc-sub">${esc(desc)}</div></div>${ic('i-chev', 'chev')}`;
+	b.addEventListener('click', () => { closeLayer('sheet'); showLogin(provider, true); });
 	return b;
 }
-function renderModelMenu() {
-	const list = $('#model-list'), more = $('#more-model-list'), agyList = $('#agy-model-list');
-	list.innerHTML = ''; more.innerHTML = ''; agyList.innerHTML = '';
-	if (accounts.claude) {
-		MODELS.forEach((m) => list.appendChild(modelRow(m.id, m.name, m.desc)));
-		MORE_MODELS.forEach(([id, name]) => more.appendChild(modelRow(id, name)));
-	} else list.appendChild(signInRow('登录 Claude 账号', 'claude'));
-	const inMore = accounts.claude && MORE_MODELS.some(([id]) => id === SETTINGS.model);
-	more.classList.toggle('hidden', !inMore);
-	$('#more-models-toggle').classList.toggle('hidden', !accounts.claude);
-	$('#more-models-toggle').classList.toggle('expanded', inMore);
-	// Antigravity's models are whatever its CLI lists for this account, read when the menu opens.
-	if (!accounts.agy) agyList.appendChild(signInRow('用 Google 账号登录 Antigravity', 'agy'));
-	else if (agyState?.models?.length) agyState.models.forEach((m) => agyList.appendChild(modelRow(m.id, m.name)));
-	else agyList.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
-	$('#claude-model-opts').classList.toggle('hidden', isAgyModel() || !accounts.claude);
+function renderModelSheet() {
+	$$('#model-provider-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.provider === modelSheetProvider));
+	const list = $('#model-list');
+	const more = $('#more-model-list');
+	const moreToggle = $('#more-models-toggle');
+	list.innerHTML = '';
+	more.innerHTML = '';
+
+	let activeAgyFam = null;
+	if (modelSheetProvider === 'claude') {
+		if (accounts.claude) {
+			MODELS.forEach((m) => {
+				const sel = !isAgyModel() && (SETTINGS.model === m.id || SETTINGS.modelName === m.name);
+				list.appendChild(modelCard(m.id, m.name, m.desc, {
+					sel,
+					onSelect: () => { pushSettings({ model: m.id, modelName: m.name }); renderModelSheet(); },
+				}));
+			});
+			MORE_MODELS.forEach(([id, name]) => {
+				const sel = !isAgyModel() && (SETTINGS.model === id || SETTINGS.modelName === name);
+				more.appendChild(modelCard(id, name, '', {
+					sel,
+					onSelect: () => { pushSettings({ model: id, modelName: name }); renderModelSheet(); },
+				}));
+			});
+			const inMore = MORE_MODELS.some(([id]) => id === SETTINGS.model);
+			if (inMore) showMoreClaudeModels = true;
+			moreToggle.classList.remove('hidden');
+			more.classList.toggle('hidden', !showMoreClaudeModels);
+			moreToggle.classList.toggle('expanded', showMoreClaudeModels);
+		} else {
+			moreToggle.classList.add('hidden');
+			more.classList.add('hidden');
+			list.appendChild(signInModelCard('登录 Claude 账号', '用 Claude Pro / Max 订阅使用 Opus、Sonnet 与 Haiku', 'claude'));
+		}
+		$('#claude-fast-row').classList.toggle('hidden', !accounts.claude);
+	} else {
+		moreToggle.classList.add('hidden');
+		more.classList.add('hidden');
+		$('#claude-fast-row').classList.add('hidden');
+		if (!accounts.agy) {
+			list.appendChild(signInModelCard('用 Google 账号登录 Antigravity', '登录后即可统一选择 Gemini 等 Google 模型与思考程度', 'agy'));
+		} else if (agyState?.models?.length) {
+			const fams = groupAgyModels(agyState.models);
+			const curSlug = isAgyModel() ? String(SETTINGS.model).replace(/^agy:/, '') : '';
+			fams.forEach((fam) => {
+				const sel = fam.items.some((it) => it.slug === curSlug);
+				if (sel) activeAgyFam = fam;
+				const variantLabels = Object.keys(fam.variants).map((k) => EFFORT_LABEL[k]).filter(Boolean);
+				const sub = fam.hasVariants
+					? `支持思考调节：${variantLabels.join(' / ')}`
+					: (fam.items[0]?.effort ? `预设思考：${EFFORT_LABEL[fam.items[0].effort]}` : '标准预设');
+				list.appendChild(modelCard(fam.defaultId, fam.name, sub, {
+					badge: sel ? '当前' : '',
+					sel,
+					onSelect: () => {
+						const chosen = pickAgyVariant(fam, SETTINGS.effort);
+						pushSettings({ model: chosen.id, modelName: fam.name, effort: chosen.effort || SETTINGS.effort });
+						renderModelSheet();
+					},
+				}));
+			});
+		} else {
+			list.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
+		}
+	}
+
+	// Unified effort control works for both Claude and Antigravity
 	const seg = $('#effort-seg');
 	seg.innerHTML = '';
+	let currentEff = SETTINGS.effort || 'high';
+	let effortNote = '已统一同步思考程度';
+	if (modelSheetProvider === 'agy') {
+		if (!isAgyModel()) {
+			effortNote = '点选上方模型即可应用当前档位';
+		} else if (activeAgyFam?.hasVariants) {
+			const curMeta = activeAgyFam.items.find((it) => 'agy:' + it.slug === SETTINGS.model);
+			if (curMeta?.effort) currentEff = curMeta.effort;
+			effortNote = activeAgyFam.variants[SETTINGS.effort]
+				? `当前档位：${EFFORT_LABEL[currentEff] || currentEff}`
+				: `已映射至接近档位：${EFFORT_LABEL[currentEff] || currentEff}`;
+		} else if (activeAgyFam) {
+			effortNote = '此模型使用固定思考模式';
+		}
+	} else {
+		effortNote = `当前档位：${EFFORT_LABEL[currentEff] || currentEff}`;
+	}
+	$('#effort-note').textContent = effortNote;
 	EFFORTS.forEach(([id, label]) => {
-		const b = el('button', id === SETTINGS.effort ? 'sel' : '', esc(label));
-		b.addEventListener('click', () => { pushSettings({ effort: id }); $$('#effort-seg button').forEach((x) => x.classList.toggle('sel', x === b)); });
+		const b = el('button', id === currentEff ? 'sel' : '', esc(label));
+		b.addEventListener('click', () => {
+			if (modelSheetProvider === 'agy' && isAgyModel() && activeAgyFam) {
+				const chosen = pickAgyVariant(activeAgyFam, id);
+				pushSettings({ model: chosen.id, modelName: activeAgyFam.name, effort: id });
+			} else {
+				pushSettings({ effort: id });
+			}
+			renderModelSheet();
+		});
 		seg.appendChild(b);
 	});
 }
-$('#more-models-toggle').addEventListener('click', (e) => {
-	const more = $('#more-model-list');
-	more.classList.toggle('hidden');
-	e.currentTarget.classList.toggle('expanded', !more.classList.contains('hidden'));
+function openModelSheet() {
+	modelSheetProvider = isAgyModel() ? 'agy' : 'claude';
+	showMoreClaudeModels = false;
+	renderModelSheet();
+	openSheet('sheet-model');
+	if (accounts.agy) loadAgy().then(() => { if (openSheetId === 'sheet-model') renderModelSheet(); });
+}
+$$('#model-provider-seg button').forEach((b) => b.addEventListener('click', () => {
+	modelSheetProvider = b.dataset.provider === 'agy' ? 'agy' : 'claude';
+	renderModelSheet();
+	if (modelSheetProvider === 'agy' && accounts.agy && !agyState?.models?.length) {
+		loadAgy().then(() => { if (openSheetId === 'sheet-model') renderModelSheet(); });
+	}
+}));
+$('#more-models-toggle').addEventListener('click', () => {
+	showMoreClaudeModels = !showMoreClaudeModels;
+	$('#more-model-list').classList.toggle('hidden', !showMoreClaudeModels);
+	$('#more-models-toggle').classList.toggle('expanded', showMoreClaudeModels);
 });
 $('#t-fast').addEventListener('change', (e) => pushSettings({ fastMode: e.target.checked }));
-$('#btn-model').addEventListener('click', (e) => {
-	renderModelMenu();
-	openMenu('menu-model', e.currentTarget);
-	if (accounts.agy) loadAgy().then(() => { if (openMenuId === 'menu-model') renderModelMenu(); });
-});
+$('#btn-model').addEventListener('click', openModelSheet);
 
 /* ---------------- usage ring ---------------- */
 let usageData = null;
@@ -884,6 +1060,7 @@ function renderTranscript(sess) {
 			else if (m.role === 'perm') addPermission({ ...m, sessionId: sess.id });
 			else if (m.role === 'sys') sysline(m.text);
 		}
+		groupProcessBlocks({ staticMode: true });
 	}
 	for (const c of thread.children) c.classList.add('static'); // history appears at once, only new messages animate in
 	// Opened midway: what is already written.
@@ -891,6 +1068,61 @@ function renderTranscript(sess) {
 	if (sess?.liveText) appendAssistant(sess.liveText);
 	renderQueue(sess?.queue, sess?.queueHeld);
 	thread.scrollTop = thread.scrollHeight;
+}
+
+function isProcessStep(node) {
+	if (!node || node.nodeType !== 1) return false;
+	if (node.classList.contains('think')) return !node.classList.contains('live');
+	if (node.classList.contains('tool')) return !$('.tool-state .spin', node);
+	if (node.classList.contains('cmd-out')) return true;
+	return false;
+}
+function updateProcessGroupHead(grp) {
+	const inner = $('.process-inner', grp);
+	if (!inner) return;
+	const tools = [...inner.querySelectorAll('.tool')];
+	const thinks = [...inner.querySelectorAll('.think')];
+	const cmdOuts = [...inner.querySelectorAll('.cmd-out')];
+	const errCount = tools.filter((t) => t.classList.contains('failed')).length;
+	const total = tools.length + cmdOuts.length + thinks.length;
+	let title = '执行过程';
+	if (tools.length && errCount) title = `执行了 ${tools.length} 步（${errCount} 步出错）`;
+	else if (tools.length) title = `已完成 ${tools.length} 步操作`;
+	else if (cmdOuts.length) title = `命令输出（${cmdOuts.length}）`;
+	$('.process-title', grp).textContent = title;
+	$('.process-count', grp).textContent = `${tools.length || total} 步`;
+	grp.classList.toggle('has-err', errCount > 0);
+}
+function syncProcessGroups() {
+	const openByDefault = !look.collapseProcess;
+	$$('.process-group', thread).forEach((grp) => {
+		const hasErr = grp.classList.contains('has-err');
+		grp.classList.toggle('open', openByDefault || hasErr);
+	});
+}
+function groupProcessBlocks({ staticMode = false } = {}) {
+	const kids = [...thread.children];
+	let i = 0;
+	while (i < kids.length) {
+		if (!isProcessStep(kids[i])) { i++; continue; }
+		let j = i;
+		while (j < kids.length && isProcessStep(kids[j])) j++;
+		const run = kids.slice(i, j);
+		const hasToolOrCmd = run.some((x) => x.classList.contains('tool') || x.classList.contains('cmd-out'));
+		if (hasToolOrCmd || run.length >= 2) {
+			const grp = el('div', 'process-group');
+			if (staticMode) grp.classList.add('static');
+			grp.innerHTML = `<button class="process-head" type="button">${ic('i-spark')}<span class="process-title">执行过程</span><span class="process-count"></span>${ic('i-chev', 'chev')}</button><div class="process-body"><div class="process-inner"></div></div>`;
+			const inner = $('.process-inner', grp);
+			thread.insertBefore(grp, run[0]);
+			run.forEach((node) => inner.appendChild(node));
+			updateProcessGroupHead(grp);
+			const hasErr = grp.classList.contains('has-err');
+			if (!look.collapseProcess || hasErr) grp.classList.add('open');
+			$('.process-head', grp).addEventListener('click', () => grp.classList.toggle('open'));
+		}
+		i = j;
+	}
 }
 
 /* ---------------- the background screen ---------------- */
@@ -910,6 +1142,7 @@ function renderBgScreen(st) {
 		$('#bg-sheet-title').textContent = bgScreen.app || '后台屏幕';
 	} else if (bgSheetOpen) closeLayer('sheet');
 	bgFrames();
+	if (typeof updateSettingsBadges === 'function') updateSettingsBadges();
 }
 async function bgFrames() {
 	clearTimeout(bgFrameTimer);
@@ -1034,9 +1267,9 @@ input.addEventListener('keydown', (e) => {
 });
 
 let attachedScopes = [];
-const SCOPE_ICON = { app: 'i-app', folder: 'i-folder', file: 'i-file', image: 'i-image' };
+const SCOPE_ICON = { app: 'i-app', folder: 'i-folder', file: 'i-file', image: 'i-image', github: 'i-github' };
 function addScope(scope) {
-	if (!attachedScopes.some((s) => s.type === scope.type && (s.path === scope.path && s.package === scope.package))) {
+	if (!attachedScopes.some((s) => s.type === scope.type && s.path === scope.path && s.package === scope.package && s.repo === scope.repo && s.branch === scope.branch)) {
 		attachedScopes.push(scope);
 		renderScopes();
 	}
@@ -1049,7 +1282,11 @@ function renderScopes() {
 		const badge = el('div', 'scope-badge');
 		if (s.type === 'image' && s.dataUrl) { const img = el('img', 'scope-thumb'); img.src = s.dataUrl; img.alt = ''; badge.appendChild(img); }
 		else badge.insertAdjacentHTML('beforeend', ic(SCOPE_ICON[s.type] || 'i-file'));
-		const text = s.type === 'app' ? (s.name || s.package) : s.type === 'file' ? (s.name || s.path.split('/').pop()) : s.type === 'image' ? (s.name || '图片') : s.path;
+		const text = s.type === 'app' ? (s.name || s.package)
+			: s.type === 'file' ? (s.name || s.path.split('/').pop())
+			: s.type === 'image' ? (s.name || '图片')
+			: s.type === 'github' ? `${s.repo}${s.branch ? '@' + s.branch : ''}`
+			: s.path;
 		badge.appendChild(el('span', 'scope-text', esc(text)));
 		const del = el('button', 'scope-del', ic('i-x'));
 		del.setAttribute('aria-label', '移除');
@@ -1071,8 +1308,11 @@ async function send() {
 	let fullPrompt = rawText;
 	if (attachedScopes.length) {
 		const lines = attachedScopes.map((s) => ({
-			app: `- 手机应用: ${s.name} (${s.package})`, folder: `- 目标文件夹: ${s.path}`, file: `- 目标文件: ${s.path}`,
+			app: `- 手机应用: ${s.name} (${s.package})`,
+			folder: `- 目标文件夹: ${s.path}`,
+			file: `- 目标文件: ${s.path}`,
 			image: `- 附件图片: ${s.path}`,
+			github: `- GitHub 项目: ${s.repo}${s.branch ? ` (分支: ${s.branch})` : ''}${s.path ? ` (路径: ${s.path})` : ''} — ${s.url || `https://github.com/${s.repo}`}（可通过 GitHub MCP 工具或 git/gh CLI 操作该仓库）`,
 		}[s.type] || '')).filter(Boolean).join('\n');
 		fullPrompt = `【指定操作范围与上下文】\n${lines}\n\n【用户指令】\n${rawText || '请根据上述指定的上下文进行分析或处理。'}`;
 	}
@@ -1276,6 +1516,7 @@ $$('#menu-attach .tile').forEach((t) => t.addEventListener('click', () => {
 	if (act === 'album') $('#file-image').click();
 	else if (act === 'app') openAppsSheet();
 	else if (act === 'files') openFsSheet();
+	else if (act === 'github') openGithubSheet();
 }));
 $('#file-image').addEventListener('change', (e) => {
 	const f = e.target.files[0];
@@ -1367,6 +1608,192 @@ $('#fs-search').addEventListener('input', (e) => {
 	clearTimeout(fsSearchTimer);
 	const q = e.target.value.trim();
 	fsSearchTimer = setTimeout(() => (q.startsWith('/') ? loadFsPath(q) : loadFsPath(curFsPath, q || undefined)), 350);
+});
+
+/* ---------------- github project picker & MCP ---------------- */
+let ghStatusData = null;
+let ghReposCache = [];
+let ghReposError = '';
+let ghSearchTimer = null;
+let ghSearchSeq = 0;
+let ghTokenOpen = false;
+function renderGithubStatus(st) {
+	ghStatusData = st || { configured: false, enabled: false, recent: [] };
+	const badge = $('#gh-mcp-badge');
+	const on = !!(ghStatusData.configured && ghStatusData.enabled);
+	const offDisabled = !!(ghStatusData.configured && !ghStatusData.enabled);
+	badge.className = 'badge' + (on ? ' connected' : offDisabled ? ' needs-auth' : '');
+	badge.textContent = on ? 'MCP 已连接' : offDisabled ? '已禁用' : '未连接';
+	$('#gh-status-title').textContent = ghStatusData.login ? `GitHub · @${ghStatusData.login}` : 'GitHub MCP';
+	$('#gh-status-sub').textContent = ghStatusData.configured
+		? `令牌 ${ghStatusData.token || ''} 已配置，助手可通过 GitHub MCP 与 git/gh 直接读写仓库、分支、Issue 与 PR`
+		: '绑定个人访问令牌后，助手可通过 MCP 直接读写仓库代码、分支、Issue 与 PR';
+	$('#gh-token-toggle').textContent = ghTokenOpen ? '收起' : (ghStatusData.configured ? '更换' : '配置');
+	$('#gh-token-disconnect').classList.toggle('hidden', !ghStatusData.configured);
+	$('#gh-token-box').classList.toggle('hidden', !ghTokenOpen);
+}
+function makeGithubRepoRow(item, { removable = false } = {}) {
+	const row = el('div', 'pick-row');
+	const tags = [];
+	if (item.private) tags.push('<span class="gh-tag">私有</span>');
+	if (item.branch) tags.push(`<span class="gh-tag">${ic('i-branch', 'sm')} ${esc(item.branch)}</span>`);
+	if (item.language) tags.push(`<span class="gh-tag">${esc(item.language)}</span>`);
+	const descHtml = item.description ? `<span>${esc(item.description)}</span>` : '';
+	row.innerHTML = `<div class="pick-ic">${ic('i-github')}</div><div class="pick-main"><div class="pick-name">${esc(item.repo)}</div><div class="gh-meta">${tags.join('')}${descHtml}</div></div>${removable ? `<button class="gh-del" type="button" aria-label="移除记录">${ic('i-x')}</button>` : ic('i-chev', 'chev')}`;
+	if (removable) {
+		$('.gh-del', row).addEventListener('click', async (e) => {
+			e.stopPropagation();
+			const r = await api('/api/github/forget', { repo: item.repo });
+			if (r.ok) {
+				renderGithubStatus(r);
+				renderGithubList({ query: $('#gh-repo-input').value.trim() });
+			}
+		});
+	}
+	row.addEventListener('click', () => attachGithubRepo(item));
+	return row;
+}
+function renderGithubList({ loading = false, query = '' } = {}) {
+	const list = $('#gh-list');
+	list.innerHTML = '';
+	const q = query.trim().toLowerCase();
+	const recentAll = ghStatusData?.recent || [];
+	const recent = q ? recentAll.filter((x) => x.repo.toLowerCase().includes(q) || (x.description || '').toLowerCase().includes(q)) : recentAll;
+	const recentSet = new Set(recent.map((x) => x.repo));
+	const repos = ghReposCache.filter((x) => !recentSet.has(x.repo) && (!q || x.repo.toLowerCase().includes(q) || (x.description || '').toLowerCase().includes(q)));
+
+	const frag = document.createDocumentFragment();
+	if (recent.length) {
+		frag.appendChild(el('div', 'gh-sec-h', '最近关联'));
+		recent.forEach((item) => frag.appendChild(makeGithubRepoRow(item, { removable: true })));
+	}
+	if (ghStatusData?.configured) {
+		frag.appendChild(el('div', 'gh-sec-h', q ? '搜索到的仓库' : '我的仓库'));
+		if (loading) {
+			const sp = el('div', 'empty-state', '<span class="spin"></span>');
+			frag.appendChild(sp);
+		} else if (ghReposError) {
+			frag.appendChild(el('div', 'empty-state', esc(ghReposError)));
+		} else if (repos.length) {
+			repos.forEach((item) => frag.appendChild(makeGithubRepoRow(item)));
+		} else if (!recent.length) {
+			frag.appendChild(el('div', 'empty-state', q ? '没有匹配的仓库，可直接点右侧「关联」' : '暂无仓库，可在上方输入 owner/repo'));
+		}
+	} else if (!recent.length) {
+		frag.appendChild(el('div', 'empty-state', '在上方输入 owner/repo 或 GitHub 仓库链接直接关联；绑定 Token 后可浏览全部私有/公开仓库并启用 GitHub MCP'));
+	}
+	list.appendChild(frag);
+}
+async function loadGithubRepos(q = '') {
+	if (!ghStatusData?.configured) {
+		ghReposCache = [];
+		ghReposError = '';
+		renderGithubList({ query: q });
+		return;
+	}
+	const seq = ++ghSearchSeq;
+	if (!ghReposCache.length || q) renderGithubList({ loading: true, query: q });
+	const r = await getJSON('/api/github/repos' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+	if (seq !== ghSearchSeq) return;
+	if (r.ok) {
+		ghReposCache = r.repos || [];
+		ghReposError = '';
+	} else {
+		ghReposCache = [];
+		ghReposError = r.error || '读取仓库失败';
+	}
+	renderGithubList({ query: q });
+}
+async function refreshGithubSheet() {
+	$('#gh-list').innerHTML = '<div class="empty-state"><span class="spin"></span></div>';
+	const st = await getJSON('/api/github/status');
+	if (st.ok) renderGithubStatus(st);
+	else renderGithubStatus(null);
+	await loadGithubRepos($('#gh-repo-input').value.trim());
+}
+function openGithubSheet() {
+	$('#gh-repo-input').value = '';
+	$('#gh-token-input').value = '';
+	ghTokenOpen = false;
+	ghReposError = '';
+	openSheet('sheet-github');
+	refreshGithubSheet();
+}
+async function attachGithubRepo(target) {
+	const raw = typeof target === 'string' ? target.trim() : target?.repo;
+	if (!raw) { $('#gh-repo-input').focus(); return; }
+	const meta = typeof target === 'object' && target ? target : {};
+	const r = await api('/api/github/link', {
+		repo: raw,
+		description: meta.description || '',
+		private: !!meta.private,
+	});
+	if (!r.ok) { toast(r.error || '请输入有效的 owner/repo 或 GitHub 链接'); return; }
+	addScope({
+		type: 'github',
+		repo: r.repo,
+		url: r.url || meta.url || `https://github.com/${r.repo}`,
+		branch: r.branch || meta.branch || '',
+		path: r.path || '',
+	});
+	closeLayer('sheet');
+	toast(r.mcp ? `已关联 ${r.repo}（GitHub MCP 已就绪）` : `已关联 ${r.repo}`);
+	if (!$('#page-settings').classList.contains('hidden')) refreshExtraSettingsStatus();
+}
+$('#gh-token-toggle').addEventListener('click', () => {
+	ghTokenOpen = !ghTokenOpen;
+	renderGithubStatus(ghStatusData);
+	if (ghTokenOpen) setTimeout(() => $('#gh-token-input').focus(), 80);
+});
+async function submitGithubToken() {
+	const token = $('#gh-token-input').value.trim();
+	if (!token) { $('#gh-token-input').focus(); toast('请先粘贴 GitHub Token'); return; }
+	const btn = $('#gh-token-save');
+	btn.disabled = true;
+	btn.innerHTML = '<span class="spin sm"></span>连接中';
+	const r = await api('/api/github/connect', { token });
+	btn.disabled = false;
+	btn.textContent = '连接';
+	if (!r.ok) { toast(r.error || '连接失败'); return; }
+	$('#gh-token-input').value = '';
+	ghTokenOpen = false;
+	renderGithubStatus(r);
+	toast(`已连接 @${r.login || 'GitHub'}（MCP 已启用）`);
+	loadGithubRepos($('#gh-repo-input').value.trim());
+	refreshExtraSettingsStatus();
+}
+$('#gh-token-save').addEventListener('click', submitGithubToken);
+$('#gh-token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitGithubToken(); } });
+$('#gh-token-disconnect').addEventListener('click', () => {
+	showDialog({
+		title: '断开 GitHub 连接？',
+		msg: '这会移除已保存的 GitHub Token 并停用 GitHub MCP 连接器。',
+		ok: '断开',
+		danger: true,
+		onOk: async () => {
+			const r = await api('/api/github/disconnect');
+			ghReposCache = [];
+			ghReposError = '';
+			ghTokenOpen = false;
+			if (r.ok) renderGithubStatus(r);
+			renderGithubList({ query: $('#gh-repo-input').value.trim() });
+			refreshExtraSettingsStatus();
+			toast('已断开 GitHub 连接');
+		},
+	});
+});
+$('#gh-repo-attach').addEventListener('click', () => attachGithubRepo($('#gh-repo-input').value));
+$('#gh-repo-input').addEventListener('keydown', (e) => {
+	if (e.key === 'Enter') { e.preventDefault(); attachGithubRepo($('#gh-repo-input').value); }
+});
+$('#gh-repo-input').addEventListener('input', (e) => {
+	clearTimeout(ghSearchTimer);
+	const q = e.target.value.trim();
+	if (/^https?:\/\//i.test(q) || /^[\w.-]+\/[\w.-]+/.test(q)) {
+		renderGithubList({ query: q });
+		return;
+	}
+	ghSearchTimer = setTimeout(() => loadGithubRepos(q), 350);
 });
 
 /* ================================================================ conversations drawer */
@@ -1544,10 +1971,6 @@ $('#row-clear').addEventListener('click', () => {
 const SUBSCRIPTION_LABEL = { pro: 'Pro', max: 'Max', max5x: 'Max 5x', max20x: 'Max 20x', team: 'Team', enterprise: 'Enterprise' };
 const AUTH_METHOD_LABEL = { 'claude.ai': 'Claude 账号' };
 const API_PROVIDER_LABEL = { firstParty: 'Anthropic', bedrock: 'AWS Bedrock', vertex: 'Google Vertex', foundry: 'Azure Foundry', gateway: '企业网关' };
-let account = null;
-let loggedIn = false;
-let accounts = { claude: false, agy: false }; // which of the two is signed in; either is enough to chat
-let agyState = null; // /api/agy/status: the CLI, its login, its models
 async function refreshAccount() {
 	const r = await getJSON('/api/account');
 	account = r.ok && r.account ? r.account : null;
@@ -1556,13 +1979,15 @@ async function refreshAccount() {
 	const plan = account ? (SUBSCRIPTION_LABEL[account.subscriptionType] ? `Claude ${SUBSCRIPTION_LABEL[account.subscriptionType]}` : (account.orgName || '已登录')) : '';
 	// With only Antigravity signed in, the drawer says so rather than "not signed in".
 	const who = email || (accounts.agy ? 'Antigravity' : '');
-	for (const [av, em, pl, out] of [['#drawer-avatar', '#drawer-email', '#drawer-plan', '点此登录'], ['#set-avatar', '#set-email', '#set-plan', '登录 Claude 账号']]) {
-		$(av).textContent = initial;
-		$(av).classList.toggle('out', !who);
-		$(em).textContent = who || '未登录';
-		$(pl).textContent = email ? plan : accounts.agy && pl === '#drawer-plan' ? '已用 Google 账号登录' : out;
-	}
+	$('#drawer-avatar').textContent = initial;
+	$('#drawer-avatar').classList.toggle('out', !who);
+	$('#drawer-email').textContent = who || '未登录';
+	$('#drawer-plan').textContent = email ? plan : accounts.agy ? '已用 Google 账号登录' : '点此登录';
+	if ($('#set-avatar-badge')) $('#set-avatar-badge').innerHTML = who ? esc(initial) : ic('i-key');
+	$('#set-email').textContent = who || '未登录';
+	$('#set-plan').textContent = email ? plan : accounts.agy ? '已用 Google 账号登录' : '登录 Claude 账号';
 	$('#val-agy').textContent = accounts.agy ? '已登录' : '';
+	updateSettingsBadges();
 }
 async function loadAgy(fresh) {
 	const r = await getJSON('/api/agy/status' + (fresh ? '?fresh=1' : ''));
@@ -1647,14 +2072,120 @@ PAGE_OPEN['page-account'] = () => {
 	}));
 };
 
+async function refreshExtraSettingsStatus() {
+	const [px, gh, rt, sp, mem] = await Promise.all([
+		getJSON('/api/proxy'),
+		getJSON('/api/github/status'),
+		getJSON('/api/runtime'),
+		getJSON('/api/systemprompt'),
+		getJSON('/api/memory'),
+	]);
+	if (px.ok && $('#val-net')) $('#val-net').textContent = px.proxy ? `代理 ${px.proxy}` : '直连';
+	if (gh.ok && $('#val-github')) {
+		$('#val-github').textContent = gh.configured
+			? (gh.enabled ? (gh.login ? `@${gh.login}` : 'MCP 已连') : '已禁用')
+			: '未连接';
+	}
+	if ($('#engine-dot') && $('#engine-line')) {
+		$('#engine-dot').className = 'engine-dot ' + (rt.ok ? 'ok' : 'err');
+		$('#engine-line').textContent = rt.ok
+			? `本机引擎 · 运行中${rt.chat?.version ? ' · ' + rt.chat.version : ''}`
+			: '本机引擎 · 未检测到 Claude Code';
+	}
+	const promptSet = !!(sp.ok && sp.text && sp.text.trim());
+	const memCount = mem.ok ? noteCount(mem.text) : 0;
+	if ($('#val-prompt')) $('#val-prompt').textContent = promptSet ? '已设置' : '未设置';
+	if ($('#val-memory')) $('#val-memory').textContent = memCount ? `${memCount} 条` : '';
+	if ($('#val-persona')) {
+		$('#val-persona').textContent = promptSet && memCount
+			? `提示词 · ${memCount} 条笔记`
+			: promptSet ? '已设提示词'
+			: memCount ? `${memCount} 条笔记`
+			: '未设置';
+	}
+}
+function filterSettings(raw) {
+	const q = String(raw || '').trim().toLowerCase();
+	let visible = 0;
+	const top = $('#set-top-card');
+	if (top) {
+		const topMatch = !q || top.textContent.toLowerCase().includes(q) || '账号 引擎 本机 claude antigravity'.includes(q);
+		top.classList.toggle('hidden', !topMatch);
+		if (topMatch) visible++;
+	}
+	$$('#page-settings .set-group').forEach((grp) => {
+		let hits = 0;
+		grp.querySelectorAll('.row, .row-col').forEach((row) => {
+			const hay = `${row.dataset.search || ''} ${row.textContent || ''}`.toLowerCase();
+			const match = !q || hay.includes(q);
+			row.classList.toggle('hidden', !match);
+			if (match) hits++;
+		});
+		grp.classList.toggle('hidden', !hits);
+		visible += hits;
+	});
+	$('#settings-empty').classList.toggle('hidden', visible > 0);
+}
+$('#settings-search').addEventListener('input', (e) => filterSettings(e.target.value));
+$('#set-model-row').addEventListener('click', openModelSheet);
+$('#set-mode-row').addEventListener('click', (e) => { renderModeMenu(); openMenu('menu-mode', e.currentTarget); });
+$('#set-phone-row').addEventListener('click', () => {
+	if (bgOn()) { $('#bg-row').click(); return; }
+	showDialog({
+		title: '手机操控已开启',
+		msg: '助手会在后台虚拟屏幕中操作手机应用，不占用你当前的屏幕。后台任务运行期间，点击输入栏上方或这里的入口即可实时查看与接管画面。',
+		cancel: '',
+		ok: '知道了',
+	});
+});
+$('#set-net-row').addEventListener('click', async () => {
+	const px = await getJSON('/api/proxy');
+	showDialog({
+		title: '网络代理',
+		msg: '留空表示直连；如果手机上开着代理软件，可填写本地 HTTP 代理地址。',
+		input: true,
+		value: px.ok ? (px.proxy || '') : '',
+		placeholder: 'http://127.0.0.1:7890',
+		ok: '保存并测试',
+		onOk: async (v) => {
+			const r = await api('/api/proxy', { proxy: String(v || '').trim() });
+			if (!r.ok) { toast(r.error || '保存失败'); return; }
+			refreshExtraSettingsStatus();
+			const where = r.proxy ? `代理 ${r.proxy}` : '直连';
+			toast(r.reachable ? `已保存，${where}可正常连接` : `已保存，但${where}暂时连不上（${r.summary || ''}）`);
+		},
+	});
+});
+$('#set-github-row').addEventListener('click', openGithubSheet);
+$('#set-engine').addEventListener('click', async () => {
+	const rt = await getJSON('/api/runtime');
+	if (rt.ok && rt.chat) {
+		showDialog({
+			title: '本机引擎运行中',
+			msg: `引擎：${rt.chat.label}（${rt.chat.version}）\n工作目录：${rt.cwd || '—'}\nNode.js：${rt.node || '—'}`,
+			cancel: '',
+			ok: '知道了',
+		});
+	} else {
+		const tried = (rt.tried || []).map((t) => `${t.ok ? '✓' : '✗'} ${t.label}：${t.detail}`).join('\n');
+		showDialog({
+			title: '未检测到 Claude Code',
+			msg: tried || '请检查 Claude Code 运行环境或使用 /doctor 命令排查。',
+			cancel: '',
+			ok: '知道了',
+		});
+	}
+});
+
 PAGE_OPEN['page-settings'] = async () => {
+	$('#settings-search').value = '';
+	filterSettings('');
 	updateLookValues();
 	refreshAccount();
 	loadUpdate();
-	refreshMemoryRow();
-	const sp = await getJSON('/api/systemprompt');
-	$('#val-prompt').textContent = sp.ok && sp.text && sp.text.trim() ? '已设置' : '未设置';
+	refreshExtraSettingsStatus();
 };
+PAGE_OPEN['page-persona'] = () => refreshExtraSettingsStatus();
 $('#t-autoupdate').addEventListener('change', (e) => pushSettings({ autoUpdate: e.target.checked }));
 
 /* ---------------- the assistant's notes ---------------- */
@@ -1663,6 +2194,7 @@ async function refreshMemoryRow() {
 	const r = await getJSON('/api/memory');
 	const n = r.ok ? noteCount(r.text) : 0;
 	$('#val-memory').textContent = n ? `${n} 条` : '';
+	refreshExtraSettingsStatus();
 }
 PAGE_OPEN['page-memory'] = async () => {
 	$('#memory-text').value = '';
@@ -1689,6 +2221,7 @@ $('#prompt-save').addEventListener('click', async () => {
 	const r = await api('/api/systemprompt', { text });
 	if (r.ok === false) { toast('保存失败'); return; }
 	$('#val-prompt').textContent = text.trim() ? '已设置' : '未设置';
+	refreshExtraSettingsStatus();
 	closePage('page-prompt');
 	toast('已保存，从新对话开始生效');
 });
@@ -1999,6 +2532,7 @@ function connect() {
 				if (m.sessionId) runningIds.delete(m.sessionId);
 				if (mine) {
 					endAssistant();
+					groupProcessBlocks();
 					setRunning(false);
 					markTurnTime(m.durationMs);
 					if (m.subtype && m.subtype !== 'success') sysline(stoppedIds.has(m.sessionId) ? '已停止' : `这一轮没有做完${m.errors?.[0] ? `：${m.errors[0]}` : '，可以再发一次试试'}`);
@@ -2015,13 +2549,16 @@ function connect() {
 			case 'bgscreen': renderBgScreen(m); break;
 			case 'queue': if (mine) renderQueue(m.queue, m.held); break;
 			case 'skills_updated': loadSlashCommands(); break;
-			case 'mcp_updated': break;
+			case 'mcp_updated':
+				if (!$('#sheet-github').classList.contains('hidden')) refreshGithubSheet();
+				if (!$('#page-settings').classList.contains('hidden')) refreshExtraSettingsStatus();
+				break;
 			case 'plugins_updated': case 'plugin_job': case 'skill_draft': case 'mcp_login_url': case 'mcp_login_done':
 				marketEvent(m);
 				break;
 			case 'error':
 				if (m.sessionId) runningIds.delete(m.sessionId);
-				if (mine) { endAssistant(); setRunning(false); sysline('出错了：' + m.message); } else renderSidebar();
+				if (mine) { endAssistant(); groupProcessBlocks(); setRunning(false); sysline('出错了：' + m.message); } else renderSidebar();
 				break;
 			case 'login_url': loginUrl(m.url, m.mode, m.provider); break;
 			case 'login_status': loginStatus(m); break;

@@ -3,24 +3,24 @@
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-	<meta name="theme-color" content="#F5F6F2">
+	<meta name="theme-color" content="#EDF2FB">
 	<meta name="color-scheme" content="light dark">
 	<meta name="mobile-web-app-capable" content="yes">
 	<title>DroidAgent</title>
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
 	<link rel="apple-touch-icon" href="icon-192.png">
-	<link rel="stylesheet" href="style.css?v=12">
+	<link rel="stylesheet" href="style.css?v=14">
 	<!-- applies the saved theme and font before the first paint -->
-	<script src="themes.js?v=8"></script>
+	<script src="themes.js?v=10"></script>
 </head>
 <body>
 	<!-- icon sprite: one stroke style everywhere -->
 	<svg width="0" height="0" style="position:absolute" aria-hidden="true">
 		<defs>
 			<!-- the app mark, as in brand/icon.svg -->
-			<linearGradient id="brand-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1F6B51"/><stop offset="1" stop-color="#0D3527"/></linearGradient>
-			<symbol id="brand-mark" viewBox="0 0 108 108"><rect width="108" height="108" rx="24" fill="url(#brand-bg)"/><g transform="translate(54 54) scale(0.94) translate(-54 -54)"><path d="M54 37 V28" fill="none" stroke="#F4F1E8" stroke-width="4" stroke-linecap="round"/><circle cx="54" cy="25" r="5.2" fill="#E9B949"/><rect x="27" y="37" width="54" height="44" rx="19" fill="#F4F1E8"/><rect x="41" y="51" width="7.5" height="14" rx="3.75" fill="#123F30"/><rect x="59.5" y="51" width="7.5" height="14" rx="3.75" fill="#123F30"/></g></symbol>
+			<linearGradient id="brand-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3B66B8"/><stop offset="1" stop-color="#223D7A"/></linearGradient>
+			<symbol id="brand-mark" viewBox="0 0 108 108"><rect width="108" height="108" rx="24" fill="url(#brand-bg)"/><g transform="translate(54 54) scale(0.94) translate(-54 -54)"><path d="M54 37 V28" fill="none" stroke="#F4F6FB" stroke-width="4" stroke-linecap="round"/><circle cx="54" cy="25" r="5.2" fill="#8BB2FF"/><rect x="27" y="37" width="54" height="44" rx="19" fill="#F4F6FB"/><rect x="41" y="51" width="7.5" height="14" rx="3.75" fill="#223D7A"/><rect x="59.5" y="51" width="7.5" height="14" rx="3.75" fill="#223D7A"/></g></symbol>
 			<!-- Liquid glass: a lens map that bends what lies behind the composer toward its middle at
 			     the edges (red = horizontal shift, green = vertical; mid-grey = none). -->
 			<filter id="glass-lens" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB" primitiveUnits="objectBoundingBox">
@@ -69,6 +69,13 @@
 			<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2.5 9a14 14 0 0119 0M5.5 12.5a9.5 9.5 0 0113 0M8.7 16a5 5 0 016.6 0"/><circle cx="12" cy="19.2" r="1" fill="currentColor"/></symbol>
 			<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8M12 13v8"/></symbol>
 			<symbol id="i-sweep" viewBox="0 0 24 24"><path d="M14 4l6 6M17 7l-6.5 6.5"/><path d="M10.5 13.5L4 20h7l3-3z"/></symbol>
+			<symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l2.5 2.5M14 9l2 2"/></symbol>
+			<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.5-3 7.8-7 9.5-4-1.7-7-5-7-9.5V6l7-3z"/></symbol>
+			<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M5 20a7 7 0 0114 0"/></symbol>
+			<symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M10 4a2 2 0 014 0h3a2 2 0 012 2v3a2 2 0 010 4v4a2 2 0 01-2 2H6a2 2 0 01-2-2v-3a2 2 0 010-4V6a2 2 0 012-2h4z"/></symbol>
+			<symbol id="i-collapse" viewBox="0 0 24 24"><path d="M4 12h16M12 3v6M9.5 6.5L12 9l2.5-2.5M12 21v-6M9.5 17.5L12 15l2.5 2.5"/></symbol>
+			<symbol id="i-github" viewBox="0 0 24 24"><path d="M9 19c-4.5 1.5-4.5-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 00-1.3-3.2 4.2 4.2 0 00-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 00-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 00-.1 3.2A4.6 4.6 0 004 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></symbol>
+			<symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M6 8.5v7M18 10.5c0 4-3 5-12 5"/></symbol>
 			<!-- permission modes -->
 			<symbol id="m-default" viewBox="0 0 24 24"><path d="M5 18.5V6.5A2.5 2.5 0 017.5 4h9A2.5 2.5 0 0119 6.5v7a2.5 2.5 0 01-2.5 2.5H9z"/><path d="M10 8.8a2.2 2.2 0 113.4 1.8c-.8.5-1.4.9-1.4 1.9M12 14.2v.1"/></symbol>
 			<symbol id="m-acceptEdits" viewBox="0 0 24 24"><path d="M4 20h4L18.5 9.5a2.8 2.8 0 00-4-4L4 16z"/><path d="M14.5 19.5l2 2 4-4.5"/></symbol>
@@ -82,12 +89,12 @@
 
 	<div id="app">
 		<header id="bar">
-			<button id="btn-menu" class="icon-btn" aria-label="对话列表"><svg class="ic"><use href="#i-menu"/></svg></button>
+			<button id="btn-menu" class="icon-btn float-btn" aria-label="对话列表"><svg class="ic"><use href="#i-menu"/></svg></button>
 			<div class="bar-title">
 				<span id="chat-title" class="chat-title">新对话</span>
 				<span id="status" class="status connecting"><i class="dot"></i><span id="status-text">正在连接</span></span>
 			</div>
-			<button id="btn-new" class="icon-btn" aria-label="新对话"><svg class="ic"><use href="#i-new"/></svg></button>
+			<button id="btn-new" class="icon-btn float-btn" aria-label="新对话"><svg class="ic"><use href="#i-new"/></svg></button>
 		</header>
 
 		<main id="thread" aria-live="polite"></main>
@@ -103,7 +110,7 @@
 				<div class="composer-bar">
 					<button id="btn-attach" class="chip-btn round" aria-label="添加内容"><svg class="ic"><use href="#i-plus"/></svg></button>
 					<button id="btn-mode" class="chip-btn" aria-label="执行模式"><svg class="ic"><use id="mode-icon" href="#m-acceptEdits"/></svg><span id="mode-label">Accept edits</span></button>
-					<button id="btn-model" class="chip-btn ghostly" aria-label="模型"><span id="model-label">Sonnet 5.5</span><svg class="ic sm"><use href="#i-down"/></svg></button>
+					<button id="btn-model" class="chip-btn ghostly" aria-label="模型"><span id="model-label">Sonnet 5.5 · 超高</span><svg class="ic sm"><use href="#i-down"/></svg></button>
 					<span class="spacer"></span>
 					<button id="btn-usage" class="usage-ring none" aria-label="用量"><svg viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="15"/><circle id="usage-arc" class="arc" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="0 100"/></svg><span id="usage-pct">–</span></button>
 					<button id="btn-send" class="send" aria-label="发送" disabled><svg class="ic"><use href="#i-up"/></svg></button>
@@ -118,9 +125,10 @@
 
 	<div id="menu-attach" class="menu hidden" role="menu">
 		<div class="tiles">
-			<button class="tile" data-act="album"><span class="tile-ic"><svg class="ic"><use href="#i-image"/></svg></span>相册</button>
-			<button class="tile" data-act="files"><span class="tile-ic"><svg class="ic"><use href="#i-folder"/></svg></span>文件</button>
-			<button class="tile" data-act="app"><span class="tile-ic"><svg class="ic"><use href="#i-app"/></svg></span>应用</button>
+			<button class="tile" data-act="album"><span class="tile-ic ic-blue"><svg class="ic"><use href="#i-image"/></svg></span>相册</button>
+			<button class="tile" data-act="files"><span class="tile-ic ic-orange"><svg class="ic"><use href="#i-folder"/></svg></span>文件</button>
+			<button class="tile" data-act="app"><span class="tile-ic ic-purple"><svg class="ic"><use href="#i-app"/></svg></span>应用</button>
+			<button class="tile" data-act="github"><span class="tile-ic ic-slate"><svg class="ic"><use href="#i-github"/></svg></span>GitHub</button>
 		</div>
 	</div>
 
@@ -128,23 +136,6 @@
 		<div class="menu-head">执行模式</div>
 		<div id="mode-list" class="menu-list"></div>
 		<p id="mode-agy-note" class="menu-note hidden">Antigravity 的对话：执行命令和写文件走 DroidAgent 的工具，按这里选的模式放行或问你。它自带的其他工具没法逐步确认，只有 Full access 下不受限。</p>
-	</div>
-
-	<div id="menu-model" class="menu hidden" role="menu">
-		<div class="menu-head">Claude</div>
-		<div id="model-list" class="menu-list"></div>
-		<button id="more-models-toggle" class="menu-row subtle"><span>更多模型</span><svg class="ic sm"><use href="#i-down"/></svg></button>
-		<div id="more-model-list" class="menu-list hidden"></div>
-		<div class="menu-sep"></div>
-		<div class="menu-head">Antigravity</div>
-		<div id="agy-model-list" class="menu-list"></div>
-		<!-- Claude's own knobs: an Antigravity model carries its thinking level in its name. -->
-		<div id="claude-model-opts">
-			<div class="menu-sep"></div>
-			<div class="menu-head">思考强度</div>
-			<div id="effort-seg" class="seg"></div>
-			<label class="menu-row switch-row"><span class="mr-text"><span>快速模式</span><small>同一个模型，输出更快，用量消耗更多</small></span><span class="sw"><input type="checkbox" id="t-fast"><i></i></span></label>
-		</div>
 	</div>
 
 	<div id="menu-usage" class="menu hidden" role="dialog" aria-label="用量">
@@ -181,43 +172,93 @@
 
 	<!-- ===== full-screen pages ===== -->
 	<section id="page-settings" class="page hidden" aria-label="设置">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>设置</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>设置</h1></header>
 		<div class="page-body">
-			<button id="set-account" class="account-card">
-				<span id="set-avatar" class="avatar lg out">·</span>
-				<span class="account-text"><span id="set-email">未登录</span><small id="set-plan">登录 Claude 账号</small></span>
-				<svg class="ic chev"><use href="#i-chev"/></svg>
-			</button>
+			<label class="search-field pill-search">
+				<svg class="ic sm"><use href="#i-search"/></svg>
+				<input id="settings-search" type="search" placeholder="搜索设置" autocomplete="off">
+			</label>
 
-			<div class="list">
-				<button class="row" data-page="page-agy"><svg class="ic row-ic"><use href="#i-spark"/></svg><span class="row-text">Antigravity<small>用 Google 账号登录，使用 Gemini 等模型</small></span><span id="val-agy" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+			<div class="engine-card" id="set-top-card">
+				<button id="set-account" class="engine-top">
+					<span id="set-avatar-badge" class="badge-ic lg ic-blue"><svg class="ic"><use href="#i-key"/></svg></span>
+					<span class="account-text"><span id="set-email">未登录</span><small id="set-plan">登录 Claude 账号</small></span>
+					<svg class="ic chev"><use href="#i-chev"/></svg>
+				</button>
+				<button id="set-engine" class="engine-foot">
+					<i id="engine-dot" class="engine-dot ok"></i>
+					<span id="engine-line" class="engine-line">本机引擎 · 运行中</span>
+					<svg class="ic chev"><use href="#i-chev"/></svg>
+				</button>
 			</div>
 
-			<h2 class="group-label">外观</h2>
-			<div class="list">
-				<button class="row" data-page="page-theme"><svg class="ic row-ic"><use href="#i-palette"/></svg><span class="row-text">主题</span><span id="val-theme" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row" data-page="page-font"><svg class="ic row-ic"><use href="#i-font"/></svg><span class="row-text">字体</span><span id="val-font" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row" data-page="page-bg"><svg class="ic row-ic"><use href="#i-wall"/></svg><span class="row-text">聊天背景</span><span id="val-bg" class="row-val">主题插画</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+			<div class="set-group" data-group="ai">
+				<h2 class="group-label">AI</h2>
+				<div class="list">
+					<button class="row" id="set-model-row" data-search="模型 claude antigravity gemini 思考"><span class="badge-ic ic-blue"><svg class="ic"><use href="#i-spark"/></svg></span><span class="row-text">模型</span><span id="val-model" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" id="set-mode-row" data-search="权限 执行模式 ask auto full access plan"><span class="badge-ic ic-blue"><svg class="ic"><use href="#i-shield"/></svg></span><span class="row-text">权限</span><span id="val-mode" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" data-page="page-persona" data-search="个性化 系统提示词 经验笔记"><span class="badge-ic ic-blue"><svg class="ic"><use href="#i-user"/></svg></span><span class="row-text">个性化</span><span id="val-persona" class="row-val">未设置</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				</div>
 			</div>
 
-			<h2 class="group-label">助手</h2>
-			<div class="list">
-				<button class="row" data-page="page-market"><svg class="ic row-ic"><use href="#i-box"/></svg><span class="row-text">扩展市场<small>技能、连接器和插件</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row" data-page="page-memory"><svg class="ic row-ic"><use href="#i-spark"/></svg><span class="row-text">经验笔记<small>助手做事时记下的用法和教训，下次直接用</small></span><span id="val-memory" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row" data-page="page-prompt"><svg class="ic row-ic"><use href="#i-doc"/></svg><span class="row-text">系统提示词</span><span id="val-prompt" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+			<div class="set-group" data-group="cap">
+				<h2 class="group-label">能力</h2>
+				<div class="list">
+					<button class="row" id="set-phone-row" data-search="手机操控 后台屏幕 截屏"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-tap"/></svg></span><span class="row-text">手机操控</span><span id="val-phone" class="row-val">已开启</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" id="set-net-row" data-search="联网搜索 网络代理 proxy"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-globe"/></svg></span><span class="row-text">联网搜索</span><span id="val-net" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" id="set-github-row" data-search="github 项目 仓库 mcp 令牌 token"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-github"/></svg></span><span class="row-text">GitHub 项目</span><span id="val-github" class="row-val">未连接</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" data-page="page-market" data-search="插件 扩展市场 技能 连接器 mcp"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-puzzle"/></svg></span><span class="row-text">扩展与插件</span><span class="row-val">技能 · MCP</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" data-page="page-agy" data-search="antigravity google gemini agy"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-spark"/></svg></span><span class="row-text">Antigravity</span><span id="val-agy" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				</div>
 			</div>
 
-			<h2 class="group-label">通用</h2>
-			<div class="list">
-				<button class="row" data-page="page-version"><svg class="ic row-ic"><use href="#i-info"/></svg><span class="row-text">版本与更新<small id="update-sub-row">正在读取</small></span><span id="val-version" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
-				<button class="row danger" id="row-clear"><svg class="ic row-ic"><use href="#i-trash"/></svg><span class="row-text">清空全部对话</span></button>
+			<div class="set-group" data-group="look">
+				<h2 class="group-label">外观</h2>
+				<div class="list">
+					<button class="row" data-page="page-theme" data-search="主题 雾蓝 深色 浅色"><span class="badge-ic ic-purple"><svg class="ic"><use href="#i-palette"/></svg></span><span class="row-text">主题</span><span class="row-val val-theme-wrap"><i id="val-theme-dot" class="theme-dot"></i><span id="val-theme"></span></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<div class="row row-col" data-search="对话字号 字体大小 小 标准 大 特大">
+						<div class="row-top-line">
+							<span class="badge-ic ic-purple"><span class="aa-glyph">Aa</span></span>
+							<span class="row-text">对话字号</span>
+						</div>
+						<div id="font-size-seg" class="seg size-seg" role="group" aria-label="对话字号">
+							<button data-size="small">小</button>
+							<button data-size="normal" class="sel">标准</button>
+							<button data-size="large">大</button>
+							<button data-size="xlarge">特大</button>
+						</div>
+					</div>
+					<label class="row" data-search="完成后收起过程 折叠 工具 思考"><span class="badge-ic ic-purple"><svg class="ic"><use href="#i-collapse"/></svg></span><span class="row-text">完成后收起过程</span><span class="sw check-sw"><input type="checkbox" id="t-collapse-process"><i><svg class="sw-ck" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></i></span></label>
+					<button class="row" data-page="page-font" data-search="字体"><span class="badge-ic ic-purple"><svg class="ic"><use href="#i-font"/></svg></span><span class="row-text">字体</span><span id="val-font" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row" data-page="page-bg" data-search="聊天背景 壁纸 插画"><span class="badge-ic ic-purple"><svg class="ic"><use href="#i-wall"/></svg></span><span class="row-text">聊天背景</span><span id="val-bg" class="row-val">跟随主题</span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				</div>
 			</div>
+
+			<div class="set-group" data-group="gen">
+				<h2 class="group-label">通用</h2>
+				<div class="list">
+					<button class="row" data-page="page-version" data-search="版本 更新 检查"><span class="badge-ic ic-slate"><svg class="ic"><use href="#i-info"/></svg></span><span class="row-text">版本与更新<small id="update-sub-row">正在读取</small></span><span id="val-version" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+					<button class="row danger" id="row-clear" data-search="清空 全部对话 删除"><span class="badge-ic ic-red"><svg class="ic"><use href="#i-trash"/></svg></span><span class="row-text">清空全部对话</span></button>
+				</div>
+			</div>
+
+			<div id="settings-empty" class="empty-state hidden">没有匹配的设置项</div>
 			<p class="foot-note">DroidAgent 是开源项目<br><a href="https://github.com/budong4/droidagent" target="_blank" rel="noopener">在 GitHub 上查看源码</a></p>
 		</div>
 	</section>
 
+	<section id="page-persona" class="page hidden" aria-label="个性化">
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>个性化</h1></header>
+		<div class="page-body">
+			<div class="list">
+				<button class="row" data-page="page-prompt"><span class="badge-ic ic-blue"><svg class="ic"><use href="#i-doc"/></svg></span><span class="row-text">系统提示词<small>自定义助手的回复风格、语言和工作偏好</small></span><span id="val-prompt" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+				<button class="row" data-page="page-memory"><span class="badge-ic ic-purple"><svg class="ic"><use href="#i-spark"/></svg></span><span class="row-text">经验笔记<small>助手跨对话记住的工具用法和经验教训</small></span><span id="val-memory" class="row-val"></span><svg class="ic chev"><use href="#i-chev"/></svg></button>
+			</div>
+		</div>
+	</section>
+
 	<section id="page-version" class="page hidden" aria-label="版本与更新">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>版本与更新</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>版本与更新</h1></header>
 		<div class="page-body">
 			<div class="ver-hero">
 				<svg class="mark" viewBox="0 0 108 108" aria-hidden="true"><use href="#brand-mark"/></svg>
@@ -226,7 +267,7 @@
 				<button id="btn-check-update" class="pill-btn">检查更新</button>
 			</div>
 			<div class="list">
-				<label class="row"><svg class="ic row-ic"><use href="#i-refresh"/></svg><span class="row-text">自动更新<small>有新版本时在后台下载并安装，不打断正在进行的对话</small></span><span class="sw"><input type="checkbox" id="t-autoupdate"><i></i></span></label>
+				<label class="row"><span class="badge-ic ic-blue"><svg class="ic"><use href="#i-refresh"/></svg></span><span class="row-text">自动更新<small>有新版本时在后台下载并安装，不打断正在进行的对话</small></span><span class="sw check-sw"><input type="checkbox" id="t-autoupdate"><i><svg class="sw-ck" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></i></span></label>
 			</div>
 			<h2 class="group-label">更新记录</h2>
 			<div id="changelog" class="changelog"><div class="empty-state"><span class="spin"></span></div></div>
@@ -234,17 +275,17 @@
 	</section>
 
 	<section id="page-account" class="page hidden" aria-label="账号">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>账号</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>账号</h1></header>
 		<div id="account-body" class="page-body"></div>
 	</section>
 
 	<section id="page-agy" class="page hidden" aria-label="Antigravity">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>Antigravity</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>Antigravity</h1></header>
 		<div id="agy-body" class="page-body"></div>
 	</section>
 
 	<section id="page-theme" class="page hidden" aria-label="主题">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>主题</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>主题</h1></header>
 		<div class="page-body">
 			<h2 class="group-label">纯色</h2>
 			<div id="themes-solid" class="theme-grid"></div>
@@ -255,7 +296,7 @@
 	</section>
 
 	<section id="page-font" class="page hidden" aria-label="字体">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>字体</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>字体</h1></header>
 		<div class="page-body">
 			<div id="font-list" class="list items"></div>
 			<p class="foot-note">均为开源免费字体。第一次使用时只下载屏幕上用到的字，之后保存在手机里。</p>
@@ -263,7 +304,7 @@
 	</section>
 
 	<section id="page-bg" class="page hidden" aria-label="聊天背景">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>聊天背景</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>聊天背景</h1></header>
 		<div class="page-body">
 			<div id="bg-preview" class="bg-preview"></div>
 			<div id="bg-dim-group">
@@ -279,7 +320,7 @@
 	</section>
 
 	<section id="page-memory" class="page hidden" aria-label="经验笔记">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>经验笔记</h1><button id="memory-save" class="pill-btn accent">保存</button></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>经验笔记</h1><button id="memory-save" class="pill-btn accent bar-right">保存</button></header>
 		<div class="page-body fill">
 			<p class="hint">助手查过、试过才弄明白的事，会自己记在这里，每次新对话开始时都会读。写错的、不想要的，直接改掉或删掉。</p>
 			<textarea id="memory-text" class="editor" placeholder="还没有笔记。助手做事时学到的用法和教训会出现在这里。"></textarea>
@@ -287,7 +328,7 @@
 	</section>
 
 	<section id="page-prompt" class="page hidden" aria-label="系统提示词">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>系统提示词</h1><button id="prompt-save" class="pill-btn accent">保存</button></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>系统提示词</h1><button id="prompt-save" class="pill-btn accent bar-right">保存</button></header>
 		<div class="page-body fill">
 			<p class="hint">这里的内容会加在助手的系统提示词后面，从新对话开始生效。</p>
 			<textarea id="prompt-text" class="editor" placeholder="例如：回答尽量简短；分析 APK 时先列出权限和组件。"></textarea>
@@ -295,7 +336,7 @@
 	</section>
 
 	<section id="page-market" class="page hidden" aria-label="扩展市场">
-		<header class="page-bar"><button class="icon-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>扩展市场</h1></header>
+		<header class="page-bar centered"><button class="icon-btn float-btn page-back" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button><h1>扩展市场</h1></header>
 		<div class="page-body">
 			<div class="seg market-seg" id="market-seg"><button data-v="skills" class="sel">技能</button><button data-v="connectors">连接器</button><button data-v="plugins">插件</button></div>
 			<label class="search-field"><svg class="ic sm"><use href="#i-search"/></svg><input id="market-search" type="search" placeholder="搜索" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
@@ -309,6 +350,55 @@
 
 	<!-- ===== pickers (bottom sheets) ===== -->
 	<div id="sheet-scrim" class="scrim hidden"></div>
+	<section id="sheet-model" class="sheet model-sheet hidden" aria-label="模型与思考">
+		<div class="grip"></div>
+		<div class="sheet-head"><h3>模型与思考</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
+		<div id="model-provider-seg" class="seg provider-seg">
+			<button data-provider="claude" class="sel">Claude</button>
+			<button data-provider="agy">Antigravity</button>
+		</div>
+		<div class="sheet-scroll">
+			<div id="model-list" class="model-cards"></div>
+			<button id="more-models-toggle" class="menu-row subtle"><span>更多模型</span><svg class="ic sm"><use href="#i-down"/></svg></button>
+			<div id="more-model-list" class="model-cards hidden"></div>
+			<div class="model-opts-card">
+				<div class="opts-head"><span>思考程度</span><small id="effort-note"></small></div>
+				<div id="effort-seg" class="seg"></div>
+				<label id="claude-fast-row" class="menu-row switch-row"><span class="mr-text"><span>快速模式</span><small>同一个模型，输出更快，用量消耗更多</small></span><span class="sw check-sw"><input type="checkbox" id="t-fast"><i><svg class="sw-ck" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></i></span></label>
+			</div>
+		</div>
+	</section>
+
+	<section id="sheet-github" class="sheet hidden" aria-label="GitHub 项目">
+		<div class="grip"></div>
+		<div class="sheet-head"><h3>GitHub 项目</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
+		<div id="github-mcp-card" class="gh-mcp-card">
+			<div class="gh-mcp-top">
+				<span class="badge-ic ic-slate"><svg class="ic"><use href="#i-github"/></svg></span>
+				<div class="gh-mcp-info">
+					<div class="gh-mcp-title"><span id="gh-status-title">GitHub MCP</span><span id="gh-mcp-badge" class="badge">未连接</span></div>
+					<div id="gh-status-sub" class="gh-mcp-sub">绑定个人访问令牌后，助手可通过 MCP 直接读写仓库代码、分支、Issue 与 PR</div>
+				</div>
+				<button id="gh-token-toggle" class="pill-btn">配置</button>
+			</div>
+			<div id="gh-token-box" class="gh-token-box hidden">
+				<div class="inline-form">
+					<input id="gh-token-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 GitHub Token (ghp_ / github_pat_)">
+					<button id="gh-token-save" class="pill-btn accent">连接</button>
+				</div>
+				<div class="gh-token-foot">
+					<a href="https://github.com/settings/tokens/new?description=DroidAgent&scopes=repo,read:user" target="_blank" rel="noopener">生成 Classic Token (含 repo 权限)</a>
+					<button id="gh-token-disconnect" class="text-btn danger hidden">断开连接</button>
+				</div>
+			</div>
+		</div>
+		<div class="inline-form gh-link-form">
+			<input id="gh-repo-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入 owner/repo 或 GitHub 仓库链接">
+			<button id="gh-repo-attach" class="pill-btn accent">关联</button>
+		</div>
+		<div id="gh-list" class="sheet-list"></div>
+	</section>
+
 	<section id="sheet-apps" class="sheet hidden" aria-label="选择应用">
 		<div class="grip"></div>
 		<div class="sheet-head"><h3>选择应用</h3><button class="icon-btn sm sheet-close" aria-label="关闭"><svg class="ic sm"><use href="#i-x"/></svg></button></div>
@@ -389,7 +479,7 @@
 		</div>
 	</div>
 
-	<script src="app.js?v=16"></script>
-	<script src="market.js?v=5"></script>
+	<script src="app.js?v=18"></script>
+	<script src="market.js?v=6"></script>
 </body>
 </html>

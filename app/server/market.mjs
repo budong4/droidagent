@@ -362,3 +362,27 @@ export async function inspectPluginDir(root) {
 		runsCode: unreadable || otherCode || hooks.length > 0 || mcp.some((m) => m.local),
 	};
 }
+
+// A GitHub repository as the owner may type or paste it: owner/repo, a github.com link (to the
+// repo, a branch, a file), or an ssh/git URL. Returns { repo, owner, name, url, branch, path } or null.
+export function parseGithubRepo(input) {
+	let s = String(input ?? '').trim();
+	if (!s || s.length > 300 || /\s/.test(s)) return null;
+	let branch = '';
+	let path = '';
+	s = s.replace(/^git@github\.com:/i, 'https://github.com/').replace(/^(git|ssh):\/\/(git@)?github\.com\//i, 'https://github.com/');
+	if (/^(https?:\/\/)?(www\.)?github\.com\//i.test(s)) {
+		let u;
+		try { u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`); } catch { return null; }
+		const parts = u.pathname.split('/').filter(Boolean);
+		if (parts.length < 2) return null;
+		s = `${parts[0]}/${parts[1]}`;
+		if ((parts[2] === 'tree' || parts[2] === 'blob') && parts[3]) { branch = parts[3]; path = parts.slice(4).join('/'); }
+	} else if (/[:@]/.test(s)) return null;
+	const m = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/.exec(s.replace(/\.git$/i, '').replace(/\/+$/, ''));
+	if (!m || m[2] === '.' || m[2] === '..') return null;
+	const [, owner, name] = m;
+	if (branch && !/^[\w./-]{1,200}$/.test(branch)) branch = '';
+	if (path && (!/^[\w./ -]{1,500}$/.test(path) || path.split('/').includes('..'))) path = '';
+	return { repo: `${owner}/${name}`, owner, name, url: `https://github.com/${owner}/${name}`, branch, path };
+}

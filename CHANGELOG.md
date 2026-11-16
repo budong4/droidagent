@@ -2,6 +2,19 @@
 
 每个版本的说明会显示在 GitHub Releases 和 App 更新后的提示里。发布新版本时，在最上面加一节，并同步修改 `apk/AndroidManifest.xml` 的 `versionName` / `versionCode`。
 
+## 1.8.1
+
+- 界面整体改版（默认「雾蓝」主题）：
+  - 柔和高透渐变底色、圆角白卡分组、悬浮圆形顶栏按钮与居中页头
+  - 设置页重排为「AI / 能力 / 外观 / 通用」分组，支持顶部即时搜索、对话字号 4 档切换（小 / 标准 / 大 / 特大）与「完成后收起过程」开关
+  - 对话中已完成的多步思考、工具调用与命令输出可自动收起为折叠摘要（出错步骤保留展开）
+- 统一模型与思考程度选择：
+  - 底部合并为「模型与思考」统一面板，顶部切换 `Claude | Antigravity`，Antigravity 同系模型自动去重分组
+  - 统一的「思考程度」分段控制（低 / 中 / 高 / 超高 / 最大）同时作用于 Claude 与 Antigravity，并在 Claude 下保留快速模式开关
+- 左下角 `+` 菜单新增「GitHub」项目关联（也可在「设置 → GitHub 项目」打开）：
+  - 绑定个人访问令牌（Token）后自动配置并启用 GitHub MCP 连接器，同时向终端命令注入 `GH_TOKEN` / `GITHUB_TOKEN`，让助手直接读写仓库代码、分支、Issue 与 PR
+  - 支持浏览与搜索个人仓库、记录最近关联仓库、直接粘贴 `owner/repo` 或 GitHub 链接作为上下文范围随消息发送
+
 ## 1.8.0
 
 - 新增第二种登录方式：用 Google 账号登录 Antigravity，使用它的模型（Gemini 等，取决于你的 Google AI 套餐）。Claude 和 Antigravity 登录任意一个就能用，也可以两个都登录

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import {
 	safeId, parseSkillSource, normalizeMarketplaceSource, isPluginId, parseFrontmatter, validateSkillText,
 	findSkillRoots, findEscapingSymlinks, mergePlugins, normalizeRegistry, buildMcpEntry, inspectPluginDir,
-	resolveInside, inspectSkillDir, mergeSlashCommands, compatibleMarketplace, COMPAT_MARKETPLACE,
+	resolveInside, inspectSkillDir, mergeSlashCommands, compatibleMarketplace, COMPAT_MARKETPLACE, parseGithubRepo,
 } from '../app/server/market.mjs';
 
 async function tmp() { return mkdtemp(join(tmpdir(), 'market-test-')); }
@@ -340,4 +340,13 @@ test('compatibleMarketplace keeps only what Claude Code 2.1.112 can read, under 
 	assert.deepEqual(json.owner, official.owner);
 	assert.equal(official.plugins.length, 5); // the input is left alone
 	assert.deepEqual(compatibleMarketplace(null).json.plugins, []);
+});
+
+test('parseGithubRepo understands owner/repo, links to a repo, branch or file, and git URLs', () => {
+	assert.deepEqual(parseGithubRepo('budong4/droidagent'), { repo: 'budong4/droidagent', owner: 'budong4', name: 'droidagent', url: 'https://github.com/budong4/droidagent', branch: '', path: '' });
+	assert.equal(parseGithubRepo('https://github.com/a/b.git').repo, 'a/b');
+	assert.equal(parseGithubRepo('github.com/a/b/').repo, 'a/b');
+	assert.deepEqual(parseGithubRepo('https://github.com/a/b/tree/dev/src/x'), { repo: 'a/b', owner: 'a', name: 'b', url: 'https://github.com/a/b', branch: 'dev', path: 'src/x' });
+	assert.equal(parseGithubRepo('git@github.com:a/b.git').repo, 'a/b');
+	for (const bad of ['', 'a', 'a/b/c', '../x', 'a/..', '-x/y', 'https://gitlab.com/a/b', 'a b/c', 'x@y/z', '--upload-pack=x/y']) assert.equal(parseGithubRepo(bad), null, bad);
 });
