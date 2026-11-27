@@ -46,7 +46,9 @@ test('the channel hands over what was pushed, in order, then ends', async () => 
 test('Claude model names and thinking', () => {
 	assert.equal(getSdkModel('Opus 5.5'), 'opus');
 	assert.equal(getSdkModel(''), 'sonnet');
-	assert.equal(getSdkModel('opus-4.8'), 'opus');
+	assert.equal(getSdkModel('opus-4.8'), 'claude-opus-4-8', 'an older model runs as itself, not as the newest of its family');
+	assert.equal(getSdkModel('haiku-4.5'), 'claude-haiku-4-5');
+	assert.equal(getSdkModel('sonnet'), 'sonnet');
 	assert.equal(thinkingFor('sonnet').type, 'adaptive');
 	assert.equal(thinkingFor('haiku-4.5').type, 'enabled');
 });

@@ -226,7 +226,10 @@ function updateLookValues() {
 $$('#font-size-seg button').forEach((b) => b.addEventListener('click', () => {
 	if (look.fontSize !== b.dataset.size) setLook({ fontSize: b.dataset.size });
 }));
-$('#t-translate-think')?.addEventListener('change', (e) => setLook({ translateThinking: e.target.checked }));
+$('#t-translate-think')?.addEventListener('change', (e) => {
+	setLook({ translateThinking: e.target.checked });
+	$$('.think').forEach((c) => { renderThinkLang(c); if (c.classList.contains('open')) pumpTranslate(c); });
+});
 $('#t-collapse-process')?.addEventListener('change', (e) => {
 	setLook({ collapseProcess: e.target.checked });
 	if (typeof syncProcessGroups === 'function') syncProcessGroups();
@@ -385,31 +388,41 @@ let account = null;
 let loggedIn = false;
 let accounts = { claude: false, agy: false }; // which of the two is signed in; either is enough to chat
 let agyState = null; // /api/agy/status: the CLI, its login, its models
-const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', fastMode: false, mode: 'acceptEdits', autoUpdate: true };
+const SETTINGS = { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh', efforts: {}, fastMode: false, mode: 'acceptEdits', autoUpdate: true };
 const MODES = [
-	{ id: 'default', label: 'Ask', zh: '每次询问', desc: '只读操作直接做，其他每一步都先问你' },
-	{ id: 'acceptEdits', label: 'Accept edits', zh: '自动编辑', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
-	{ id: 'plan', label: 'Plan', zh: '仅计划', desc: '只读分析，先拿出计划，你同意后再动手' },
-	{ id: 'auto', label: 'Auto', zh: '自动执行', desc: '全部自动执行，只有刷机、重启、格式化这类高危操作才问你' },
-	{ id: 'bypassPermissions', label: 'Full access', zh: '完全权限', desc: '完全放开，任何操作都不再询问' },
+	{ id: 'default', label: 'Ask', zh: '每次询问', chip: '询问', desc: '只读操作直接做，其他每一步都先问你' },
+	{ id: 'acceptEdits', label: 'Accept edits', zh: '自动编辑', chip: '自动编辑', desc: '自动改文件、跑常规命令，有风险的操作先问你' },
+	{ id: 'plan', label: 'Plan', zh: '仅计划', chip: '计划', desc: '只读分析，先拿出计划，你同意后再动手' },
+	{ id: 'auto', label: 'Auto', zh: '自动执行', chip: '自动', desc: '全部自动执行，只有刷机、重启、格式化这类高危操作才问你' },
+	{ id: 'bypassPermissions', label: 'Full access', zh: '完全权限', chip: '完全权限', desc: '完全放开，任何操作都不再询问' },
 ];
 const MODELS = [
 	{ id: 'opus', name: 'Opus 5.5', desc: '能力最强，适合复杂架构与复杂推理' },
 	{ id: 'sonnet', name: 'Sonnet 5.5', desc: '日常首选，速度与深度思考兼顾' },
-	{ id: 'fable', name: 'Fable 5.1', desc: '擅长长文本推演，会消耗额外用量' },
+	{ id: 'fable', name: 'Fable 5.2', desc: '最强的模型，适合最难的推理和长时间任务，用量消耗最多' },
 	{ id: 'haiku', name: 'Haiku 5.5', desc: '响应最快，适合轻量与高频任务' },
 ];
-const MORE_MODELS = [['haiku-4.5', 'Haiku 4.5'], ['sonnet-5', 'Sonnet 5'], ['opus-5', 'Opus 5'], ['fable-5', 'Fable 5'], ['opus-4.8', 'Opus 4.8'], ['opus-4.7', 'Opus 4.7'], ['opus-4.6', 'Opus 4.6'], ['sonnet-4.6', 'Sonnet 4.6']];
+const MORE_MODELS = [['fable-5.1', 'Fable 5.1'], ['opus-5', 'Opus 5'], ['sonnet-5', 'Sonnet 5'], ['fable-5', 'Fable 5'], ['opus-4.8', 'Opus 4.8'], ['opus-4.7', 'Opus 4.7'], ['opus-4.6', 'Opus 4.6'], ['sonnet-4.6', 'Sonnet 4.6'], ['haiku-4.5', 'Haiku 4.5']];
 const EFFORTS = [['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '超高'], ['max', '最大']];
 const EFFORT_LABEL = Object.fromEntries(EFFORTS);
 const EFFORT_LEVEL_RE = /(?:[-_: ](minimal|low|medium|high|xhigh|max|thinking))$/i;
 const LABEL_EFFORT_RE = /\s*\((minimal|low|medium|high|xhigh|max|thinking)\)\s*$/i;
 
-const isAgyModel = (m = SETTINGS.model) => String(m || '').startsWith('agy:');
+// The model of the conversation on screen: its own once it has one, else what a new one gets.
+let curSession = null;
+function effModel() {
+	const s = curSession;
+	return s?.model
+		? { model: s.model, modelName: s.modelName || s.model, effort: s.effort || SETTINGS.effort }
+		: { model: SETTINGS.model, modelName: SETTINGS.modelName, effort: SETTINGS.effort };
+}
+const isAgyModel = (m = effModel().model) => String(m || '').startsWith('agy:');
+const engineOf = (m) => (isAgyModel(m) ? 'agy' : 'claude');
 function normEffort(e) {
 	const v = String(e || '').toLowerCase();
 	if (v === 'minimal') return 'low';
 	if (v === 'thinking') return 'high';
+	if (v === 'extra') return 'xhigh';
 	return EFFORT_LABEL[v] ? v : '';
 }
 function parseAgyModelMeta(m) {
@@ -428,40 +441,59 @@ function groupAgyModels(models = []) {
 	for (const m of models) {
 		const meta = parseAgyModelMeta(m);
 		let fam = families.get(meta.baseSlug);
-		if (!fam) {
-			fam = { key: meta.baseSlug, name: meta.baseName, items: [], variants: {} };
-			families.set(meta.baseSlug, fam);
-		}
+		if (!fam) { fam = { key: meta.baseSlug, name: meta.baseName, items: [], variants: {} }; families.set(meta.baseSlug, fam); }
 		fam.items.push(meta);
 		if (meta.effort && !fam.variants[meta.effort]) fam.variants[meta.effort] = meta;
 	}
-	return [...families.values()].map((fam) => {
-		const def = fam.variants.high || fam.variants.medium || fam.variants.xhigh || fam.variants.low || fam.items[0];
-		return { ...fam, defaultId: def.id, hasVariants: Object.keys(fam.variants).length > 1 };
-	});
+	return [...families.values()];
 }
-function pickAgyVariant(fam, targetEffort) {
-	if (!fam) return null;
-	if (fam.variants[targetEffort]) return fam.variants[targetEffort];
-	const order = ['low', 'medium', 'high', 'xhigh', 'max'];
-	const idx = Math.max(0, order.indexOf(targetEffort));
-	let best = null, bestDist = 99;
-	for (const [k, v] of Object.entries(fam.variants)) {
-		const ki = order.indexOf(k);
-		const d = Math.abs(ki - idx);
-		if (ki >= 0 && d < bestDist) { best = v; bestDist = d; }
+const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+// agy acp's own thinking levels (Low, Medium, High, Extra, Max), set on the conversation before
+// each message; what a running conversation reports replaces this list.
+const AGY_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Antigravity's models as the sheet lists them. One that comes in named levels (Gemini 4 Carbon
+// High / Medium / Low) is one entry whose levels are those models; any other model is an entry of
+// its own, whose levels are agy's thinking levels.
+function agyEntries(models = agyState?.models || []) {
+	const own = agyState?.levels?.length > 1 ? agyState.levels : AGY_LEVELS;
+	const out = [];
+	const single = (it) => ({ key: it.id, name: it.name, ids: [it.id], levels: own });
+	for (const fam of groupAgyModels(models)) {
+		const levels = EFFORT_ORDER.filter((k) => fam.variants[k]);
+		if (levels.length >= 2) {
+			out.push({ key: 'agy-fam:' + fam.key, name: fam.name, ids: levels.map((k) => fam.variants[k].id), variants: fam.variants, levels });
+			fam.items.filter((it) => !it.effort || fam.variants[it.effort] !== it).forEach((it) => out.push(single(it)));
+		} else fam.items.forEach((it) => out.push(single(it)));
 	}
-	return best || fam.items[0];
+	return out;
 }
-function displayModelSummary() {
-	const base = String(SETTINGS.modelName || 'Sonnet 5.5').replace(LABEL_EFFORT_RE, '').trim();
-	let eff = SETTINGS.effort;
-	if (isAgyModel()) {
-		const m = EFFORT_LEVEL_RE.exec(String(SETTINGS.model).replace(/^agy:/, ''));
-		if (m) eff = normEffort(m[1]) || eff;
+const agyEntryOf = (model) => agyEntries().find((e) => e.ids.includes(model));
+// A level this model takes, as close as possible to the one asked for.
+function nearestEffort(levels, want) {
+	if (!levels.length) return '';
+	if (levels.includes(want)) return want;
+	const at = Math.max(0, EFFORT_ORDER.indexOf(want || 'high'));
+	return levels.reduce((best, l) => (Math.abs(EFFORT_ORDER.indexOf(l) - at) < Math.abs(EFFORT_ORDER.indexOf(best) - at) ? l : best), levels[0]);
+}
+// The level actually in use for a model, and the levels it offers.
+function levelOf(m = effModel()) {
+	if (isAgyModel(m.model)) {
+		const e = agyEntryOf(m.model);
+		if (e?.variants) { const v = Object.values(e.variants).find((x) => x.id === m.model); return { levels: e.levels, effort: v?.effort || '' }; }
+		if (e) return { levels: e.levels, effort: nearestEffort(e.levels, m.effort) };
+		// The list isn't in yet: what the model's own name says, else the conversation's level.
+		const v = EFFORT_LEVEL_RE.exec(String(m.model).replace(/^agy:/, ''));
+		return { levels: AGY_LEVELS, effort: (v && normEffort(v[1])) || nearestEffort(AGY_LEVELS, m.effort) };
 	}
-	const effText = EFFORT_LABEL[eff] || eff;
-	return effText ? `${base} · ${effText}` : base;
+	const levels = claudeEfforts(m.model);
+	return { levels, effort: nearestEffort(levels, m.effort) };
+}
+// A Claude model by the name the sheet gives it now (a name saved earlier can be out of date).
+const claudeName = (id) => MODELS.find((x) => x.id === id)?.name || MORE_MODELS.find(([x]) => x === id)?.[1] || '';
+function displayModelSummary(m = effModel()) {
+	const base = (!isAgyModel(m.model) && claudeName(m.model)) || String(m.modelName || m.model || '').replace(LABEL_EFFORT_RE, '').trim() || 'Sonnet 5.5';
+	const { effort } = levelOf(m);
+	return effort ? `${base} · ${EFFORT_LABEL[effort] || effort}` : base;
 }
 function updateSettingsBadges() {
 	if ($('#val-model')) $('#val-model').textContent = displayModelSummary();
@@ -472,26 +504,42 @@ function updateSettingsBadges() {
 	}
 	if ($('#val-phone')) $('#val-phone').textContent = typeof bgOn === 'function' && bgOn() ? '后台运行中' : '已开启';
 }
-
+// The model chip, and what depends on which of the two agents the conversation on screen uses:
+// the usage ring and the slash commands are that agent's.
+let shownEngine = null;
+function renderModelChip() {
+	$('#model-label').textContent = displayModelSummary();
+	$('#btn-model').dataset.engine = engineOf(effModel().model);
+	updateSettingsBadges();
+	const eng = engineOf(effModel().model);
+	if (shownEngine && shownEngine !== eng) { usageData = null; renderUsageRing(); loadUsage(true); loadSlashCommands(); }
+	shownEngine = eng;
+}
 function applySettings(s) {
 	const prevMode = SETTINGS.mode;
-	const prevAgy = isAgyModel();
 	Object.assign(SETTINGS, s || {});
-	if (prevAgy !== isAgyModel()) { usageData = null; renderUsageRing(); loadUsage(true); loadSlashCommands(); } // another account's numbers and commands
 	const m = MODES.find((x) => x.id === SETTINGS.mode) || MODES[1];
 	const chip = $('#btn-mode');
 	chip.dataset.mode = m.id;
 	$('#mode-icon').setAttribute('href', '#m-' + m.id);
-	$('#mode-label').textContent = m.label;
+	$('#mode-label').textContent = m.chip || m.zh;
 	if (prevMode !== SETTINGS.mode) { chip.classList.remove('flash'); void chip.offsetWidth; chip.classList.add('flash'); }
-	$('#model-label').textContent = displayModelSummary();
 	$('#t-autoupdate').checked = SETTINGS.autoUpdate !== false;
 	$('#t-fast').checked = !!SETTINGS.fastMode;
-	updateSettingsBadges();
+	renderModelChip();
 }
 function pushSettings(patch) {
 	applySettings(patch);
 	api('/api/settings', patch);
+}
+// A model (and level) picked: this conversation's from now on, and what the next new one starts
+// with. `key`: where the level is remembered, so coming back to this model brings it back.
+function pickModel({ model, modelName, effort }, key) {
+	const efforts = key && effort ? { [key]: effort } : null;
+	if (curSession) Object.assign(curSession, { model, modelName, effort });
+	Object.assign(SETTINGS, { model, modelName, effort }, efforts ? { efforts: { ...(SETTINGS.efforts || {}), ...efforts } } : {});
+	renderModelChip();
+	api('/api/settings', { model, modelName, effort, ...(efforts ? { efforts } : {}), sessionId: curSession?.id });
 }
 
 /* ---------------- mode menu ---------------- */
@@ -526,17 +574,19 @@ function chooseMode(id) {
 $('#btn-mode').addEventListener('click', (e) => { renderModeMenu(); openMenu('menu-mode', e.currentTarget); });
 
 /* ---------------- model sheet: pick a model, then that model's own thinking levels ---------------- */
-// The levels each Claude model takes (my reading of what each accepts; anything unlisted gets
-// low/medium/high). Antigravity's come from the variants its CLI lists for that model.
+// The levels each Claude model takes (the server has the same table: CLAUDE_EFFORTS in
+// backends/claude.mjs). Anything unlisted gets low/medium/high; none: the model has no levels.
 const CLAUDE_EFFORTS = {
-	opus: ['low', 'medium', 'high', 'xhigh', 'max'], sonnet: ['low', 'medium', 'high', 'xhigh', 'max'], fable: ['low', 'medium', 'high', 'xhigh', 'max'],
-	haiku: ['low', 'medium', 'high'], 'opus-5': ['low', 'medium', 'high', 'max'], 'sonnet-5': ['low', 'medium', 'high', 'max'], 'fable-5': ['low', 'medium', 'high', 'max'],
-	'opus-4.8': ['low', 'medium', 'high', 'max'], 'opus-4.7': ['low', 'medium', 'high', 'max'], 'opus-4.6': ['low', 'medium', 'high', 'max'], 'sonnet-4.6': ['low', 'medium', 'high'],
+	opus: ['low', 'medium', 'high', 'xhigh', 'max'], sonnet: ['low', 'medium', 'high', 'xhigh', 'max'], fable: ['low', 'medium', 'high', 'xhigh', 'max'], haiku: ['low', 'medium', 'high', 'xhigh', 'max'],
+	'fable-5.1': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-5': ['low', 'medium', 'high', 'xhigh', 'max'], 'sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'], 'fable-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+	'opus-4.8': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-4.7': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-4.6': ['low', 'medium', 'high', 'max'], 'sonnet-4.6': ['low', 'medium', 'high', 'max'],
 	'haiku-4.5': [],
 };
 const claudeEfforts = (id) => CLAUDE_EFFORTS[id] ?? ['low', 'medium', 'high'];
 let modelSheetProvider = 'claude';
 let showMoreClaudeModels = false;
+// The level to start a model on: the one last picked for it, else the nearest to the current one.
+const rememberedEffort = (key, levels) => nearestEffort(levels, (SETTINGS.efforts || {})[key] || effModel().effort);
 // One model: its name and what it is for; once chosen, the thinking levels it takes, right under it.
 function modelCard({ name, desc = '', sel = false, efforts = [], effort = '', onSelect, onEffort }) {
 	const card = el('div', 'model-card' + (sel ? ' sel' : ''));
@@ -566,37 +616,66 @@ function signInModelCard(label, desc, provider) {
 	b.addEventListener('click', () => { closeLayer('sheet'); showLogin(provider, true); });
 	return b;
 }
-// A level this model takes, as close as possible to the one asked for.
-function nearestEffort(levels, want) {
-	if (!levels.length) return want;
-	if (levels.includes(want)) return want;
-	const order = ['low', 'medium', 'high', 'xhigh', 'max'];
-	const at = Math.max(0, order.indexOf(want));
-	return levels.reduce((best, l) => (Math.abs(order.indexOf(l) - at) < Math.abs(order.indexOf(best) - at) ? l : best), levels[0]);
+// Picked: said in a toast; a level picked closes the sheet (the choice is made).
+function modelChosen(close) {
+	renderModelSheet();
+	if (close) setTimeout(() => { if (openSheetId === 'sheet-model') closeLayer('sheet'); toast('已换成 ' + displayModelSummary()); }, 240);
 }
 function claudeCard(id, name, desc) {
-	const sel = !isAgyModel() && (SETTINGS.model === id || SETTINGS.modelName === name);
-	const efforts = claudeEfforts(id);
+	const cur = effModel();
+	const sel = !isAgyModel(cur.model) && cur.model === id;
+	const levels = claudeEfforts(id);
 	return modelCard({
-		name, desc, sel, efforts, effort: nearestEffort(efforts, SETTINGS.effort),
-		onSelect: () => { if (!sel) pushSettings({ model: id, modelName: name, effort: nearestEffort(efforts, SETTINGS.effort) }); renderModelSheet(); },
-		onEffort: (e) => { pushSettings({ effort: e }); renderModelSheet(); },
+		name, desc, sel, efforts: levels, effort: nearestEffort(levels, cur.effort),
+		onSelect: () => { if (!sel) pickModel({ model: id, modelName: name, effort: rememberedEffort(id, levels) || cur.effort }, id); modelChosen(levels.length <= 1); },
+		onEffort: (e) => { pickModel({ model: id, modelName: name, effort: e }, id); modelChosen(true); },
+	});
+}
+function agyCard(entry) {
+	const cur = effModel();
+	const sel = entry.ids.includes(cur.model);
+	const { effort } = sel ? levelOf(cur) : { effort: '' };
+	return modelCard({
+		name: entry.name, sel, efforts: entry.levels, effort,
+		desc: entry.variants ? `${entry.levels.length} 档思考` : '',
+		onSelect: () => {
+			if (!sel) {
+				const e = rememberedEffort(entry.key, entry.levels);
+				const model = entry.variants ? entry.variants[e].id : entry.ids[0];
+				pickModel({ model, modelName: entry.name, effort: e }, entry.key);
+			}
+			modelChosen(entry.levels.length <= 1);
+		},
+		onEffort: (e) => {
+			pickModel({ model: entry.variants ? entry.variants[e].id : entry.ids[0], modelName: entry.name, effort: e }, entry.key);
+			modelChosen(true);
+		},
 	});
 }
 function renderModelSheet() {
-	$$('#model-provider-seg button').forEach((b) => b.classList.toggle('sel', b.dataset.provider === modelSheetProvider));
+	$$('#model-provider-seg button').forEach((b) => {
+		b.classList.toggle('sel', b.dataset.provider === modelSheetProvider);
+		b.classList.toggle('in-use', b.dataset.provider === engineOf(effModel().model));
+	});
 	const list = $('#model-list');
 	const more = $('#more-model-list');
 	const moreToggle = $('#more-models-toggle');
 	list.innerHTML = '';
 	more.innerHTML = '';
 	const claudeTab = modelSheetProvider === 'claude';
+	// Changing agents mid-conversation: say that the new one is told what happened so far.
+	const started = !!$('#thread .msg.user');
+	const hint = $('#model-hint');
+	hint.textContent = started && engineOf(effModel().model) !== modelSheetProvider
+		? `选 ${claudeTab ? 'Claude' : 'Antigravity'} 的模型后，这段对话接着由它回答，前面的内容会一起交给它。`
+		: started ? '只改这段对话的模型；新对话会沿用最后选的。' : '';
+	hint.classList.toggle('hidden', !hint.textContent);
 	$('#claude-fast-card').classList.toggle('hidden', !claudeTab || !accounts.claude);
 	if (claudeTab) {
 		if (accounts.claude) {
 			MODELS.forEach((m) => list.appendChild(claudeCard(m.id, m.name, m.desc)));
 			MORE_MODELS.forEach(([id, name]) => more.appendChild(claudeCard(id, name, '')));
-			if (!isAgyModel() && MORE_MODELS.some(([id]) => id === SETTINGS.model)) showMoreClaudeModels = true;
+			if (!isAgyModel() && MORE_MODELS.some(([id]) => id === effModel().model)) showMoreClaudeModels = true;
 			moreToggle.classList.remove('hidden');
 			more.classList.toggle('hidden', !showMoreClaudeModels);
 			moreToggle.classList.toggle('expanded', showMoreClaudeModels);
@@ -617,34 +696,10 @@ function renderModelSheet() {
 		list.innerHTML = `<div class="empty-state">${agyState ? esc(agyState.modelsError || '没有读到模型列表') : '<span class="spin"></span>'}</div>`;
 		return;
 	}
-	const curSlug = isAgyModel() ? String(SETTINGS.model).replace(/^agy:/, '') : '';
-	for (const fam of groupAgyModels(agyState.models)) {
-		const cur = fam.items.find((it) => it.slug === curSlug);
-		// Named variants (…-high, …-low) are the levels; a model without them takes the thinking
-		// level agy itself offers in the conversation, once one has run.
-		const variantLevels = ['low', 'medium', 'high', 'xhigh', 'max'].filter((k) => fam.variants[k]);
-		const ownLevels = !variantLevels.length && cur && agyState.levels?.length > 1 ? agyState.levels : [];
-		const levels = variantLevels.length ? variantLevels : ownLevels;
-		list.appendChild(modelCard({
-			name: fam.name, sel: !!cur, efforts: levels, effort: variantLevels.length ? cur?.effort || '' : nearestEffort(ownLevels, SETTINGS.effort),
-			desc: variantLevels.length > 1 ? `${variantLevels.length} 档思考` : '',
-			onSelect: () => {
-				if (cur) return;
-				const chosen = pickAgyVariant(fam, SETTINGS.effort);
-				pushSettings({ model: chosen.id, modelName: fam.name, effort: chosen.effort || SETTINGS.effort });
-				renderModelSheet();
-			},
-			onEffort: (e) => {
-				const v = fam.variants[e];
-				if (v) pushSettings({ model: v.id, modelName: fam.name, effort: e });
-				else pushSettings({ effort: e }); // agy's own level: set at the next message
-				renderModelSheet();
-			},
-		}));
-	}
+	agyEntries().forEach((entry) => list.appendChild(agyCard(entry)));
 }
 function openModelSheet() {
-	modelSheetProvider = isAgyModel() ? 'agy' : 'claude';
+	modelSheetProvider = engineOf(effModel().model);
 	showMoreClaudeModels = false;
 	renderModelSheet();
 	openSheet('sheet-model');
@@ -724,7 +779,7 @@ function renderUsageBody(err) {
 let usageLoading = null;
 function loadUsage(fresh) {
 	if (usageLoading) return usageLoading;
-	usageLoading = getJSON('/api/usage' + (fresh ? '?fresh=1' : '')).then((r) => {
+	usageLoading = getJSON(`/api/usage?sessionId=${encodeURIComponent(curSession?.id || '')}${fresh ? '&fresh=1' : ''}`).then((r) => {
 		usageLoading = null;
 		if (r.ok) { usageData = r; usageAt = Date.now(); renderUsageRing(); if (openMenuId === 'menu-usage') renderUsageBody(); }
 		else if (openMenuId === 'menu-usage') renderUsageBody(r.error || '读取用量失败');
@@ -1033,53 +1088,97 @@ function addImages(card, urls) {
 }
 
 /* ---------------- thinking ---------------- */
-// Open while Claude is thinking, so the reasoning can be followed as it comes; folds into
-// "思考了 N 秒" afterwards (tap to read it again).
+// Open while the assistant is thinking, so the reasoning can be followed as it comes; folds into
+// "思考了 N 秒" afterwards (tap to read it again). Written in another language, it shows in Chinese
+// (Settings → Appearance turns that off): translated sentence by sentence as it is written, the
+// newest one shown as written until its translation is in.
+const translateOn = () => look.translateThinking !== false;
+function thinkCard(open) {
+	const card = el('div', 'think' + (open ? ' live open' : ''));
+	card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span><span class="think-time">0 秒</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div class="think-inner"><div class="think-orig"></div><div class="think-zh hidden"><span class="zh-done"></span><span class="zh-tail"></span></div><button class="think-lang hidden"></button></div></div>`;
+	Object.assign(card, { _src: '', _zh: '', _done: 0, _busy: false, _err: '', _same: false });
+	$('.think-head', card).addEventListener('click', () => {
+		card.classList.toggle('open');
+		if (card.classList.contains('open')) pumpTranslate(card);
+	});
+	$('.think-lang', card).addEventListener('click', () => {
+		if (card._err) { card._err = ''; pumpTranslate(card); } else card.classList.toggle('show-orig');
+		renderThinkLang(card);
+	});
+	return card;
+}
 function startThink() {
 	if (curThink) return curThink;
 	killWelcome();
-	const card = el('div', 'think live open');
-	card.innerHTML = `<div class="think-head">${ic('i-spark')}<span class="think-label">正在思考</span><span class="think-time">0 秒</span>${ic('i-chev', 'chev')}</div><div class="think-body"><div></div><div class="think-zh hidden"></div><button class="think-lang hidden"></button></div>`;
-	$('.think-head', card).addEventListener('click', () => { card.classList.toggle('open'); if (card.classList.contains('open')) translateThink(card); });
-	$('.think-lang', card).addEventListener('click', () => { card.classList.toggle('show-orig'); syncThinkLang(card); });
+	const card = thinkCard(true);
 	thread.appendChild(card);
-	curThink = { card, body: $('.think-body > div', card), start: Date.now() };
+	curThink = { card, body: $('.think-orig', card), start: Date.now() };
 	scroll();
 	return curThink;
 }
 function addThinkDelta(text) {
 	const t = startThink();
-	if (t.card.classList.contains('open')) growing(() => { t.body.textContent += text; });
-	else t.body.textContent += text;
+	const add = () => { t.body.textContent += text; t.card._src += text; renderThinkLang(t.card); };
+	if (t.card.classList.contains('open')) growing(add); else add();
+	queueTranslate(t.card);
 }
-// Opened after the fact: in Chinese when it was written in another language (the setting is on by default).
-function syncThinkLang(card) {
-	const orig = card.classList.contains('show-orig') || !card.dataset.zh;
-	$('.think-body > div', card).classList.toggle('hidden', !orig);
-	$('.think-zh', card).classList.toggle('hidden', orig);
-	const b = $('.think-lang', card);
-	b.classList.toggle('hidden', !card.dataset.zh && !card.classList.contains('translating'));
-	b.textContent = card.classList.contains('translating') ? '正在翻译成中文…' : orig ? '看中文' : '看原文';
+// What of it is finished: up to the last paragraph or sentence end while it is still being written;
+// all of it once it is done.
+function readyPart(card) {
+	const rest = card._src.slice(card._done);
+	if (!card.classList.contains('live')) return rest;
+	const m = /^[\s\S]*(?:\n|[.!?。！？;；:](?=\s))\s*/.exec(rest);
+	return m ? m[0] : '';
 }
-async function translateThink(card) {
-	if (look.translateThinking === false || card.classList.contains('live') || card.dataset.zh || card.classList.contains('translating') || card.dataset.same) return;
-	const text = $('.think-body > div', card).textContent;
-	if (!text.trim()) return;
-	card.classList.add('translating');
-	syncThinkLang(card);
-	const r = await api('/api/translate', { text, sessionId: curSession?.id });
-	card.classList.remove('translating');
-	if (r.ok && r.same) card.dataset.same = '1';
-	else if (r.ok && r.text) { card.dataset.zh = '1'; $('.think-zh', card).textContent = r.text; }
-	else $('.think-lang', card).textContent = '没能翻译：' + (r.error || '请重试');
-	syncThinkLang(card);
-	if (!r.ok) $('.think-lang', card).classList.remove('hidden');
+function queueTranslate(card) {
+	if (!translateOn() || card._same || card._err || !card.classList.contains('open')) return;
+	// At most every half second while it streams: a timer already set is left to run.
+	if (!card._timer) card._timer = setTimeout(() => { card._timer = null; pumpTranslate(card); }, 500);
+}
+async function pumpTranslate(card) {
+	if (!translateOn() || card._same || card._busy || card._err) return;
+	const part = readyPart(card);
+	if (!part) return renderThinkLang(card);
+	if (!part.trim()) { card._zh += part; card._done += part.length; return renderThinkLang(card); }
+	card._busy = true;
+	renderThinkLang(card);
+	const r = await api('/api/translate', { text: part });
+	card._busy = false;
+	if (r.ok && r.same) card._same = true;
+	else if (r.ok) { card._zh += r.text; card._done += part.length; }
+	else card._err = r.error || '连不上翻译服务';
+	const follow = card.classList.contains('open') && atBottom();
+	renderThinkLang(card);
+	if (follow && card === curThink?.card) thread.scrollTop = thread.scrollHeight;
+	if (r.ok && !r.same && card._done < card._src.length && (card.classList.contains('open') || !card.classList.contains('live'))) pumpTranslate(card);
+}
+// Which of the two shows, and what the switch under it says.
+function renderThinkLang(card) {
+	const orig = $('.think-orig', card), zh = $('.think-zh', card), btn = $('.think-lang', card);
+	const translating = translateOn() && !card._same && !!card._src.trim();
+	const showOrig = !translating || card.classList.contains('show-orig');
+	orig.classList.toggle('hidden', !showOrig);
+	zh.classList.toggle('hidden', showOrig);
+	if (!showOrig) {
+		$('.zh-done', zh).textContent = card._zh;
+		$('.zh-tail', zh).textContent = card._src.slice(card._done);
+	}
+	btn.classList.toggle('hidden', !translating);
+	btn.classList.toggle('err', !!card._err);
+	const pending = card._done < card._src.length;
+	btn.textContent = card._err ? `没能翻译：${card._err}。点这里重试`
+		: showOrig ? '看中文'
+		: pending && (card._busy || !card.classList.contains('live')) ? '正在翻译…'
+		: '看原文';
 }
 function closeThinkCard(card, ms, hasText) {
 	card.classList.remove('live', 'open');
 	$('.think-label', card).textContent = '思考了';
 	$('.think-time', card).textContent = fmtSecs(Math.max(ms, 1000));
 	card.classList.toggle('empty', !hasText);
+	// Followed as it was written: the rest is translated too, ready for when it is opened again.
+	if (card._done > 0 || card._busy) pumpTranslate(card);
+	renderThinkLang(card);
 }
 function endThink(ms) {
 	if (!curThink) return;
@@ -1087,10 +1186,12 @@ function endThink(ms) {
 	closeThinkCard(t.card, ms ?? Date.now() - t.start, !!t.body.textContent.trim());
 }
 function addThinkStatic(text, ms) {
-	const t = startThink();
-	t.body.textContent = text || '';
-	curThink = null;
-	closeThinkCard(t.card, ms || 0, !!(text || '').trim());
+	killWelcome();
+	const card = thinkCard(false);
+	$('.think-orig', card).textContent = text || '';
+	card._src = text || '';
+	thread.appendChild(card);
+	closeThinkCard(card, ms || 0, !!(text || '').trim());
 }
 function sysline(t) { const e = el('div', 'sysline'); e.textContent = t; thread.appendChild(e); scroll(); }
 // What a Claude Code command such as /context printed.
@@ -1145,14 +1246,15 @@ function addPermission(p) {
 	const decide = (d) => {
 		if (d === 'stop') stoppedIds.add(sid);
 		api('/api/permission', { id: p.id, decision: d, sessionId: sid });
-		mark(d);
+		if (permMarks.has(p.id)) permMarks.get(p.id)(d); else mark(d);
 	};
 	$('.yes', card).addEventListener('click', () => decide('allow'));
 	$('.no', card).addEventListener('click', () => decide('deny'));
 	$('.stop', card).addEventListener('click', () => decide('stop'));
 	if (p.verdict) mark(p.verdict);
-	else permMarks.set(p.id, mark);
+	else permMarks.set(p.id, (d) => { permMarks.delete(p.id); mark(d); syncComposerHint(); });
 	thread.appendChild(card);
+	syncComposerHint();
 	scroll(true);
 }
 
@@ -1243,6 +1345,7 @@ function renderQuestionCard(q) {
 		return `<div class="ask-q"><div class="ask-q-text">${esc(x.question)}</div>${done ? `<div class="ask-a ${a ? '' : 'none'}">${a ? esc(a) : q.verdict === 'expired' ? '已失效' : '没有回答'}</div>` : ''}</div>`;
 	}).join('');
 	entry.card.className = 'ask-card' + (done ? ' done' : '');
+	queueMicrotask(syncComposerHint);
 	entry.card.innerHTML = `<div class="ask-top">${ic('i-spark')}<span>${done ? '助手问了你' : '助手在等你回答'}</span></div>${rows}${done ? '' : '<button class="primary ask-open">回答</button>'}`;
 	$('.ask-open', entry.card)?.addEventListener('click', () => openAsk(q));
 }
@@ -1336,7 +1439,6 @@ function buildWelcome() {
 }
 
 /* ---------------- transcript ---------------- */
-let curSession = null;
 // What the owner typed: send() wraps attachments in a block of their own for Claude.
 const typedText = (t) => String(t || '').replace(/^【指定操作范围与上下文】[\s\S]*?【用户指令】\n?/, '');
 function renderTranscript(sess) {
@@ -1347,6 +1449,7 @@ function renderTranscript(sess) {
 	askCards.clear();
 	curAssistant = null; curThink = null; curTodoEl = null;
 	chatTitle.textContent = sess?.title || '新对话';
+	renderModelChip(); // this conversation's own model
 	if (!sess || !sess.messages || !sess.messages.length) buildWelcome();
 	else {
 		for (const m of sess.messages) {
@@ -1520,6 +1623,7 @@ function setRunning(v) {
 	running = v;
 	if (!v) stopActivity();
 	updateSendState();
+	syncComposerHint();
 }
 
 // What the conversation on screen is doing right now and for how long, just above the input:
@@ -1546,6 +1650,23 @@ setInterval(() => {
 	if (activity.on) renderActivity();
 	if (curThink) $('.think-time', curThink.card).textContent = fmtSecs(Date.now() - curThink.start);
 }, 1000);
+// The turn is waiting on the owner: what they type now is their reply (the server takes it so).
+function waitingOn() {
+	for (const { q } of askCards.values()) if (!q.verdict) return { kind: 'ask', q };
+	if (permMarks.size) return { kind: 'perm' };
+	return null;
+}
+function syncComposerHint() {
+	const w = running ? waitingOn() : null;
+	input.placeholder = w?.kind === 'ask' ? '直接输入你的回答，或点上面的「回答」'
+		: w?.kind === 'perm' ? '不同意的话，直接告诉它你想怎么做'
+		: running ? '可以接着输入，等这一轮结束就发出' : '给 DroidAgent 发消息';
+}
+$('#activity').addEventListener('click', () => {
+	const w = waitingOn();
+	if (w?.kind === 'ask') openAsk(w.q);
+	else if (w?.kind === 'perm') $('.perm:not(.done)', thread)?.scrollIntoView({ behavior: REDUCED ? 'auto' : 'smooth', block: 'center' });
+});
 function updateSendState() {
 	const has = !!input.value.trim() || attachedScopes.length > 0;
 	const showStop = running && !has;
@@ -1630,6 +1751,7 @@ async function send() {
 	autosize();
 	hideSlash();
 	const sid = curSession?.id;
+	const kept = attachedScopes;
 	const scopes = attachedScopes.map(({ dataUrl, ...s }) => s); // the picture is already on the phone
 	attachedScopes = [];
 	renderScopes();
@@ -1640,12 +1762,18 @@ async function send() {
 	const r = await api('/api/send', { text: fullPrompt, scopes, sessionId: sid });
 	if (!r.ok) {
 		if (!wasRunning) { runningIds.delete(sid); if (curSession?.id === sid) setRunning(false); }
-		sysline('发送失败：' + (r.error || '连不上助手服务'));
+		bubble?.remove();
+		// What was typed comes back, unless something new has been typed since.
+		if (!input.value.trim()) { input.value = rawText; attachedScopes = kept; renderScopes(); autosize(); updateSendState(); }
+		toast('没发出去：' + (r.error === 'empty' ? '内容是空的' : r.error || '连不上助手服务') + '，内容已放回输入框');
+	} else if (r.answered === 'question') {
+		bubble?.remove(); // it answered the question it was waiting on: the question card shows it
 	} else if (r.queued && bubble) {
 		bubble.remove(); bubble = null;
 	} else if (!r.queued && !bubble && curSession?.id === sid) {
 		bubble = addUser(shown);
 	}
+	syncComposerHint();
 	fetchSessions();
 }
 $('#btn-send').addEventListener('click', send);
@@ -2127,6 +2255,7 @@ async function fetchSessions() {
 	if (r.activeSession && (!curSession || curSession.id === r.activeSession.id)) {
 		curSession = r.activeSession;
 		chatTitle.textContent = curSession.title || '新对话';
+		renderModelChip();
 	}
 	// Opened while this conversation is mid-turn: offer Stop. (Never clears it here: right after
 	// sending, the server may not list the turn yet; the turn's own result event clears it.)
@@ -2869,6 +2998,13 @@ function connect() {
 				runningIds.clear(); pendingIds.clear();
 				break;
 			case 'settings': applySettings(m.settings); break;
+			case 'session_model':
+				if (curSession && m.sessionId === curSession.id) {
+					Object.assign(curSession, { model: m.model, modelName: m.modelName, effort: m.effort });
+					renderModelChip();
+					if (openSheetId === 'sheet-model') renderModelSheet();
+				}
+				break;
 			case 'bgscreen': renderBgScreen(m); break;
 			case 'queue': if (mine) renderQueue(m.queue, m.held); break;
 			case 'skills_updated': loadSlashCommands(); break;
