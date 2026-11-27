@@ -6,14 +6,40 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
+// The older models the sheet offers, by their API ids: the family's alias would start its newest.
+const MODEL_IDS = {
+	'fable-5.1': 'claude-fable-5-1', 'opus-5': 'claude-opus-5', 'sonnet-5': 'claude-sonnet-5', 'fable-5': 'claude-fable-5',
+	'opus-4.8': 'claude-opus-4-8', 'opus-4.7': 'claude-opus-4-7', 'opus-4.6': 'claude-opus-4-6', 'sonnet-4.6': 'claude-sonnet-4-6', 'haiku-4.5': 'claude-haiku-4-5',
+};
 export function getSdkModel(m) {
 	if (!m) return 'sonnet';
 	const lower = String(m).toLowerCase();
+	if (MODEL_IDS[lower]) return MODEL_IDS[lower];
 	if (lower.startsWith('opus')) return 'opus';
 	if (lower.startsWith('sonnet')) return 'sonnet';
 	if (lower.startsWith('haiku')) return 'haiku';
 	if (lower.startsWith('fable')) return 'fable';
 	return lower;
+}
+
+// The thinking levels (effort) each model takes; the page's model sheet has the same table
+// (CLAUDE_EFFORTS in app.js). xhigh came with Opus 4.7; Opus 4.6 and Sonnet 4.6 stop at max
+// without it; Haiku 4.5 takes none (thinking there is a token budget), so no effort is sent.
+// Anything unlisted takes low/medium/high.
+export const CLAUDE_EFFORTS = {
+	opus: ['low', 'medium', 'high', 'xhigh', 'max'], sonnet: ['low', 'medium', 'high', 'xhigh', 'max'], fable: ['low', 'medium', 'high', 'xhigh', 'max'], haiku: ['low', 'medium', 'high', 'xhigh', 'max'],
+	'fable-5.1': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-5': ['low', 'medium', 'high', 'xhigh', 'max'], 'sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'], 'fable-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+	'opus-4.8': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-4.7': ['low', 'medium', 'high', 'xhigh', 'max'], 'opus-4.6': ['low', 'medium', 'high', 'max'], 'sonnet-4.6': ['low', 'medium', 'high', 'max'],
+	'haiku-4.5': [],
+};
+const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+// The level to ask this model for: the one picked, or the nearest it takes; undefined for none.
+export function effortFor(model, want) {
+	const levels = CLAUDE_EFFORTS[String(model || '')] ?? ['low', 'medium', 'high'];
+	if (!levels.length) return undefined;
+	if (levels.includes(want)) return want;
+	const at = Math.max(0, EFFORT_ORDER.indexOf(want || 'high'));
+	return levels.reduce((best, l) => (Math.abs(EFFORT_ORDER.indexOf(l) - at) < Math.abs(EFFORT_ORDER.indexOf(best) - at) ? l : best), levels[0]);
 }
 
 // Older models take a fixed budget instead of adaptive thinking.
@@ -102,7 +128,7 @@ const SDK_CLI_PKGS = {
 	x64: ['claude-agent-sdk-linux-x64', 'claude-agent-sdk-linux-x64-musl'],
 };
 // The legacy CLI's own aliases point at the models it knew in April 2026; ask for current ones by id.
-const LEGACY_MODEL_IDS = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5', fable: 'claude-fable-5-1' };
+const LEGACY_MODEL_IDS = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5', fable: 'claude-fable-5-2' };
 
 // `serverDir` is where server.mjs lives: its node_modules holds the SDK, legacy-sdk the Node one.
 export function createClaudeBackend({ log, serverDir }) {
@@ -227,7 +253,7 @@ export function createClaudeBackend({ log, serverDir }) {
 		const options = {
 			cwd,
 			model: modelFor(spec, settings.model),
-			effort: settings.effort || 'xhigh',
+			effort: effortFor(settings.model, settings.effort),
 			// Ask for the thinking text itself (summarized), not just its token count, so the app can
 			// show what Claude is weighing.
 			thinking: thinkingFor(settings.model),
@@ -239,6 +265,7 @@ export function createClaudeBackend({ log, serverDir }) {
 			canUseTool,
 			stderr: (d) => log('[claude]', `[${tag}]`, String(d).trim().slice(0, 300)),
 		};
+		if (options.effort === undefined) delete options.effort; // a model without levels
 		if (mcpServers && Object.keys(mcpServers).length) options.mcpServers = mcpServers;
 		if (plugins?.length) options.plugins = plugins;
 		if (resume) options.resume = resume;

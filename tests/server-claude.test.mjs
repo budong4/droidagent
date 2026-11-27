@@ -16,6 +16,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const home = mkdtempSync(join(tmpdir(), 'droidagent-claude-'));
 const work = join(home, 'work');
 const sdkLog = join(home, 'sdk.jsonl');
+const agyLog = join(home, 'agy.jsonl');
 let server, port, base;
 const events = [];
 const waiters = new Set();
@@ -124,6 +125,7 @@ async function storedWhen(id, ready) {
 // The conversations the SDK was started for (naming one is a start too, with no instructions added).
 const chatStarts = () => sdk().filter((l) => l.start?.append);
 const sdk = () => (existsSync(sdkLog) ? readFileSync(sdkLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
+const agyRuns = () => (existsSync(agyLog) ? readFileSync(agyLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
 
 before(async () => {
 	// A copy of the server with the stand-in SDK beside it, as node_modules would hold the real one.
@@ -147,7 +149,7 @@ before(async () => {
 	server = spawn(process.execPath, [join(app, 'server', 'server.mjs')], {
 		env: {
 			HOME: home, PATH: `${bin}:/usr/bin:/bin`, AGENT_PORT: String(port), AGENT_CWD: work, AGENT_PROXY_FILE: join(home, 'proxy.env'),
-			DROIDAGENT_NO_UPDATE: '1', AGENT_AGY_BIN: join(HERE, 'fake-agy.mjs'), FAKE_SDK_LOG: sdkLog, AGENT_BG_DIR: join(home, 'bg'),
+			DROIDAGENT_NO_UPDATE: '1', AGENT_AGY_BIN: join(HERE, 'fake-agy.mjs'), FAKE_SDK_LOG: sdkLog, FAKE_AGY_LOG: agyLog, AGENT_BG_DIR: join(home, 'bg'),
 		},
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
@@ -228,11 +230,11 @@ test('tool steps: allowed by the mode, or put to the owner; settings reach the l
 	assert.deepEqual({ ok: refused.ok, summary: refused.summary }, { ok: false, summary: '用户拒绝了这个操作' });
 
 	// Mode and model changes are pushed to the process that is already running.
-	await api('/api/settings', { mode: 'plan', model: 'opus', modelName: 'Opus 5.5' });
+	await api('/api/settings', { mode: 'plan', model: 'opus', modelName: 'Opus 5.5', sessionId: id });
 	await new Promise((r) => setTimeout(r, 100));
 	assert.ok(sdk().some((l) => l.setPermissionMode === 'plan'));
 	assert.ok(sdk().some((l) => l.setModel === 'opus'));
-	await api('/api/settings', { mode: 'acceptEdits', model: 'sonnet', modelName: 'Sonnet 5.5' });
+	await api('/api/settings', { mode: 'acceptEdits', model: 'sonnet', modelName: 'Sonnet 5.5', sessionId: id });
 	const names = (await api(`/api/commands?sessionId=${id}`)).commands.map((c) => c.name);
 	assert.ok(names.includes('compact'), 'the live conversation\'s own command list');
 });
@@ -244,31 +246,34 @@ test('moving a conversation to the other agent and back: each resumes its own th
 	await say(id, 'first, with Claude');
 	const startsBefore = chatStarts().length;
 
-	await api('/api/settings', { model: 'agy:gemini-3.8-flash', modelName: 'Gemini 3.8 Flash' });
+	await api('/api/settings', { model: 'agy:gemini-3.8-flash', modelName: 'Gemini 3.8 Flash', sessionId: id });
 	await new Promise((r) => setTimeout(r, 100));
 	assert.ok(!sdk().some((l) => String(l.setModel).startsWith('agy:')), "an Antigravity model is never pushed to Claude's process");
 	const viaAgy = await say(id, 'second, with Antigravity');
-	assert.match(viaAgy.events.find((e) => e.type === 'notice').text, /从这里开始由 Antigravity 回答。它看不到前面由 Claude 完成的内容/);
+	assert.match(viaAgy.events.find((e) => e.type === 'notice').text, /从这里开始由 Antigravity 回答，前面 Claude 那部分对话会一起交给它/);
+	// What it did not see goes with the message, as a record ahead of it.
+	const agyPrompt = agyRuns().filter((r) => r.acp && r.prompt).at(-1).prompt;
+	assert.match(agyPrompt, /【前情】[\s\S]*用户：first, with Claude\nClaude：claude says: first, with Claude\n【前情完】\n\nsecond, with Antigravity$/);
 	assert.equal(viaAgy.events.filter((e) => e.type === 'assistant_delta').map((e) => e.text).join(''), 'echo(gemini-3.8-flash/extra): second, with Antigravity');
 	let sess = await storedWhen(id, (x) => x.agyConversationId && x.messages.at(-1)?.role === 'assistant');
 	assert.equal(sess.backend, 'agy');
 	assert.equal(sess.claudeSessionId, 'claude-session-1', "Claude's thread is kept for when it comes back");
 	assert.ok(sess.agyConversationId);
 
-	await api('/api/settings', { model: 'sonnet', modelName: 'Sonnet 5.5' });
+	await api('/api/settings', { model: 'sonnet', modelName: 'Sonnet 5.5', sessionId: id });
 	const back = await say(id, 'third, with Claude again');
-	assert.match(back.events.find((e) => e.type === 'notice').text, /从这里开始由 Claude 回答。它只记得自己之前参与的部分/);
-	assert.equal(back.result.text, 'claude says: third, with Claude again');
+	assert.match(back.events.find((e) => e.type === 'notice').text, /从这里开始由 Claude 回答，前面 Antigravity 那部分对话会一起交给它/);
+	// Claude remembers its own part; only Antigravity's goes with the message.
+	assert.match(back.result.text, /^claude says: 【前情】[\s\S]*用户：second, with Antigravity\nAntigravity：echo\(gemini-3\.8-flash\/extra\): second, with Antigravity\n【前情完】\n\nthird, with Claude again$/);
+	assert.ok(!back.result.text.includes('first, with Claude'), 'what Claude already had is not sent again');
 	const starts = chatStarts();
 	assert.equal(starts.length, startsBefore + 1);
 	assert.equal(starts.at(-1).start.resume, 'claude-session-1');
-	sess = await storedWhen(id, (x) => x.messages.at(-1)?.text === 'claude says: third, with Claude again');
+	sess = await storedWhen(id, (x) => x.messages.at(-1)?.role === 'assistant' && /third, with Claude again$/.test(x.messages.at(-1).text));
 	assert.equal(sess.backend, 'claude');
-	assert.deepEqual(sess.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => m.text), [
-		'first, with Claude', 'claude says: first, with Claude',
-		'second, with Antigravity', 'echo(gemini-3.8-flash/extra): second, with Antigravity',
-		'third, with Claude again', 'claude says: third, with Claude again',
-	]);
+	assert.deepEqual(sess.messages.filter((m) => m.role === 'user').map((m) => m.text), ['first, with Claude', 'second, with Antigravity', 'third, with Claude again'], 'the record is not saved into the conversation');
+	assert.deepEqual(sess.messages.filter((m) => m.role === 'assistant').map((m) => m.by), ['claude', 'agy', 'claude']);
+	assert.deepEqual({ model: sess.model, others: (await api('/api/status')).settings.model }, { model: 'sonnet', others: 'sonnet' }, 'kept on the conversation, and what new ones start with');
 });
 
 test('signing out of Claude while Antigravity is signed in moves to a model that can answer', async () => {
@@ -330,4 +335,49 @@ test("a file change shows what changed; a picture a step returned is kept and sh
 	const sess = await storedWhen(id, (x) => x.messages.some((m) => m.images));
 	assert.deepEqual(sess.messages.find((m) => m.images).images, shot.images);
 	assert.ok(sess.messages.find((m) => m.name === 'Edit').diff);
+});
+
+test('each conversation keeps its own model and level; a new one starts with the last picked', async () => {
+	const a = await newSession();
+	await say(a, 'on opus');
+	await api('/api/settings', { model: 'opus', modelName: 'Opus 5.5', effort: 'medium', sessionId: a });
+	const b = await newSession();
+	await api('/api/settings', { model: 'haiku-4.5', modelName: 'Haiku 4.5', effort: 'high', sessionId: b });
+	await say(b, 'on haiku');
+	// Haiku 4.5 has no thinking levels: no effort is asked for at all.
+	const hb = sdk().filter((l) => l.start?.model === 'claude-haiku-4-5').at(-1);
+	assert.ok(hb && !('effort' in hb.start), JSON.stringify(hb));
+	// Back in the first conversation: still Opus at medium, whatever was picked since.
+	await say(a, 'still opus?');
+	const sa = await storedWhen(a, (x) => x.messages.filter((m) => m.role === 'user').length === 2);
+	assert.deepEqual({ model: sa.model, effort: sa.effort }, { model: 'opus', effort: 'medium' });
+	assert.equal(chatStarts().at(-1).start.effort, 'medium', 'its process was started again with its own level');
+	// A new conversation starts with what was picked last.
+	const c = await newSession();
+	await say(c, 'new one');
+	assert.equal(stored(c).model, 'haiku-4.5');
+	await api('/api/settings', { model: 'sonnet', modelName: 'Sonnet 5.5', effort: 'xhigh' });
+});
+
+test('typing while the assistant waits on the owner: the answer to its question, or what to do instead of the step', async () => {
+	const id = await newSession();
+	let from = events.length;
+	await api('/api/send', { text: 'ask: Which one?|A|B', sessionId: id });
+	const q = await waitFor((e) => e.type === 'question' && e.sessionId === id, { from });
+	assert.deepEqual(await api('/api/send', { text: 'neither, wait', sessionId: id }), { ok: true, answered: 'question' });
+	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
+	assert.deepEqual(sdk().filter((l) => l.asked).at(-1).asked.updatedInput.answers, { 'Which one?': 'neither, wait' });
+	assert.equal((await storedWhen(id, (x) => x.messages.find((m) => m.id === q.id)?.verdict)).messages.find((m) => m.id === q.id).verdict, 'answered');
+
+	await api('/api/settings', { mode: 'default' });
+	from = events.length;
+	await api('/api/send', { text: 'tool: rm -rf /sdcard/Download', sessionId: id });
+	await waitFor((e) => e.type === 'permission' && e.sessionId === id, { from });
+	assert.deepEqual(await api('/api/send', { text: 'move it to the bin instead', sessionId: id }), { ok: true, answered: 'permission' });
+	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
+	const refused = events.slice(from).find((e) => e.type === 'tool_result');
+	assert.match(refused.summary, /move it to the bin instead/, 'Claude is told what the owner said instead');
+	const sess = await storedWhen(id, (x) => x.messages.some((m) => m.text === 'move it to the bin instead'));
+	assert.equal(sess.messages.filter((m) => m.role === 'perm').at(-1).verdict, 'deny');
+	await api('/api/settings', { mode: 'acceptEdits' });
 });

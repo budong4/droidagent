@@ -20,12 +20,13 @@ import {
 } from './market.mjs';
 import { isReadOnlyBash } from './policy.mjs';
 import { AGY_PREFIX, BACKEND_NAMES, backendOf, agySlug } from './backends/common.mjs';
-import { createClaudeBackend, thinkingFor } from './backends/claude.mjs';
+import { createClaudeBackend, thinkingFor, effortFor } from './backends/claude.mjs';
 import { createAgyBackend, usageGroupFor } from './backends/antigravity.mjs';
 import { startSignIn } from './backends/agy_oauth.mjs';
 import { sourcesOf, mergeSources, queryOf } from './sources.mjs';
 import { createBrowser, chromiumPath, aptInstallChromium } from './browser.mjs';
 import { configOption, levelsOf } from './backends/agy_acp.mjs';
+import { translateToChinese, mostlyChinese } from './translate.mjs';
 import { enabledClaudePlugins, claudePluginsForAgy, agyPluginsForClaude } from './backends/shared_plugins.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -61,6 +62,7 @@ const settings = {
 	model: 'sonnet',          // opus | sonnet | haiku | fable | etc.; "agy:<slug>" is one of Antigravity's
 	modelName: 'Sonnet 5.5',  // Display name
 	effort: 'xhigh',          // low | medium | high | xhigh | max
+	efforts: {},              // the level last picked for each model: { model: effort }
 	fastMode: false,          // fast mode toggle
 	mode: 'acceptEdits',      // Claude Code's permission modes: default | acceptEdits | plan | auto | bypassPermissions
 	autoUpdate: true,         // install new releases by itself (off: only report them)
@@ -71,7 +73,12 @@ const MODE_MIGRATE = { ask: 'default', autoEdit: 'acceptEdits' };
 // What the client may change through /api/settings. Screen automation, web access, personal
 // data and showing thinking used to be switches; they are simply on now (the mode decides what
 // needs a confirmation), and "read-only" is what Plan mode is for.
-const SETTING_KEYS = ['model', 'modelName', 'effort', 'fastMode', 'mode', 'autoUpdate'];
+const SETTING_KEYS = ['model', 'modelName', 'effort', 'efforts', 'fastMode', 'mode', 'autoUpdate'];
+// The thinking level picked for each model, so going back to a model brings its own level back.
+function cleanEfforts(v) {
+	if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+	return Object.fromEntries(Object.entries(v).filter(([k, e]) => k.length <= 200 && typeof e === 'string' && e.length <= 20).slice(-200));
+}
 
 // Config files for the Eta-parity features.
 const SYSTEM_PROMPT_FILE = join(homedir(), '.claude', 'agent-system-prompt.md');
@@ -95,6 +102,7 @@ try {
 		settings.mode = MODE_MIGRATE[settings.mode] || settings.mode;
 		if (saved.readonly) settings.mode = 'plan'; // the old read-only switch
 		if (!MODES.includes(settings.mode)) settings.mode = 'acceptEdits';
+		settings.efforts = cleanEfforts(settings.efforts);
 	}
 } catch (e) {
 	log('settings load failed', e?.message);
@@ -610,15 +618,29 @@ async function deliverMessage(id, { text, scopes = [] }, { fromQueue = false } =
 		if (!sess) throw new Error('session not found: ' + id);
 		// Format title from first message
 		if (sess.messages.length === 0 || sess.title === '新对话') sess.title = autoTitleOf(text);
+		// From its first message a conversation keeps its own model, whatever is picked elsewhere.
+		if (!sess.model) Object.assign(sess, { model: settings.model, modelName: settings.modelName, effort: settings.effort });
+		// Its model belongs to an account signed out since: go on with the one in the settings, which
+		// is kept on an account that works (settleModel).
+		else if (backendOf(sess.model) !== backendOf(settings.model) && !(await authState()).accounts[backendOf(sess.model)]) {
+			Object.assign(sess, { model: settings.model, modelName: settings.modelName, effort: settings.effort });
+			broadcast({ type: 'session_model', sessionId: sess.id, model: sess.model, modelName: sess.modelName, effort: sess.effort });
+		}
+		// Kept from before this was recorded: the agent that answered last has all of it, the other none.
+		if (!sess.seen && sess.messages.length) sess.seen = { [sess.backend || 'claude']: sess.messages.length };
+		noteBackendSwitch(sess, backendOf(sess.model)); // said before the message it applies to
 		sess.messages.push({ role: 'user', text, scopes, time: Date.now() });
+		const at = sess.messages.length - 1;
 		await saveSession(sess);
 		const rt = await ensureRuntime(id);
+		const handoff = handoffFor(sess, rt.backend, at);
+		sess.seen = { ...sess.seen, [rt.backend]: sess.messages.length };
 		rt.since = Date.now();
 		rt.label = '正在思考';
 		rt.running = true;
 		rt.lastActive = Date.now();
 		broadcast({ type: 'user_echo', sessionId: id, text, session: sess, ...(fromQueue ? { fromQueue: true } : {}) });
-		rt.pushUser(text);
+		rt.pushUser(handoff + text);
 	} finally {
 		delivering.delete(id);
 	}
@@ -639,6 +661,23 @@ function drainQueue(id) {
 		broadcastQueue(id);
 		broadcast({ type: 'error', sessionId: id, message: `排队的消息没能发出：${e?.message || e}` });
 	});
+}
+
+// The owner's answer to a question the assistant is waiting on; none (or empty) = skipped.
+function answerQuestion(sid, askId, answers) {
+	const rt = sid && runtimes.get(sid);
+	const p = rt?.pending.get(askId);
+	if (!p || p.kind !== 'ask') return false;
+	const clean = answers && typeof answers === 'object'
+		? Object.fromEntries(Object.entries(answers).map(([k, v]) => [String(k), String(v ?? '').slice(0, 2000)]).filter(([, v]) => v.trim()))
+		: null;
+	const ok = clean && Object.keys(clean).length > 0;
+	p.resolve(ok ? { behavior: 'allow', answers: clean } : { behavior: 'deny' });
+	const sess = sessionCache.get(sid);
+	const am = sess?.messages.find((x) => x.role === 'ask' && x.id === askId);
+	if (am) { am.answers = ok ? clean : null; am.verdict = ok ? 'answered' : 'skipped'; saveSession(sess); }
+	broadcast({ type: 'question_resolved', sessionId: sid, id: askId, answers: ok ? clean : null });
+	return true;
 }
 
 // Ends the turn in progress and any confirmation it is waiting on.
@@ -884,27 +923,70 @@ const REF_KEY = { claude: 'claudeSessionId', agy: 'agyConversationId' };
 function noteBackendSwitch(sess, backend) {
 	const prev = sess.backend || 'claude';
 	if (prev !== backend && sess.messages.some((m) => m.role === 'assistant')) {
-		const text = `从这里开始由 ${BACKEND_NAMES[backend]} 回答。${sess[REF_KEY[backend]] ? '它只记得自己之前参与的部分' : `它看不到前面由 ${BACKEND_NAMES[prev]} 完成的内容`}，上面的记录都还在，需要的话把要点再告诉它。`;
+		const text = `从这里开始由 ${BACKEND_NAMES[backend]} 回答，前面 ${BACKEND_NAMES[prev]} 那部分对话会一起交给它。`;
 		sess.messages.push({ role: 'sys', text, time: Date.now() });
 		broadcast({ type: 'notice', sessionId: sess.id, text });
 	}
 	if (sess.backend !== backend) { sess.backend = backend; saveSession(sess); }
 }
 
+// What the agent taking a conversation over has not seen: the turns the other one answered (or,
+// when its own memory of the conversation is gone, all of them), as a short record ahead of the
+// new message. `sess.seen[backend]`: how many of the messages that agent has had in front of it.
+function handoffFor(sess, backend, upto) {
+	const rec = sess.seen?.[backend];
+	const from = Number.isInteger(rec) ? Math.min(rec, upto) : 0;
+	const slice = sess.messages.slice(from, upto);
+	if (!slice.some((m) => m.role === 'assistant')) return '';
+	const clip = (t, n) => { const x = String(t || '').trim(); return x.length > n ? x.slice(0, n) + '…' : x; };
+	const lines = [];
+	let steps = [];
+	const flush = () => { if (steps.length) lines.push(`（做了：${steps.slice(0, 8).join('；')}${steps.length > 8 ? ` 等 ${steps.length} 步` : ''}）`); steps = []; };
+	for (const m of slice) {
+		if (m.role === 'tool') { if (m.kind !== 'todo') steps.push(clip(m.title || m.name, 60) + (m.ok === false ? '（没成功）' : '')); continue; }
+		if (m.role === 'user') { flush(); lines.push(`用户：${clip(typedText(m.text), 1500)}`); }
+		else if (m.role === 'assistant') { flush(); lines.push(`${BACKEND_NAMES[m.by] || '助手'}：${clip(m.text, 2500)}`); }
+		else if (m.role === 'ask' && m.verdict) { flush(); lines.push(`（助手问用户：${(m.questions || []).map((q) => q.question).join(' / ')} → ${m.answers ? Object.values(m.answers).join(' / ') : '没有回答'}）`); }
+	}
+	flush();
+	let text = lines.join('\n');
+	if (text.length > 12000) text = '……（更早的部分省略）\n' + text.slice(text.length - 12000);
+	return `【前情】这段对话前面的一部分你没有参与（是在别的模型上进行的）。下面是那部分的记录，只供你了解情况；里面已经做过的操作不要再做一遍：\n${text}\n【前情完】\n\n`;
+}
+
+// The model a conversation runs on. Each one keeps what it was given at its first message; one
+// without (older ones, or not started) follows the settings, which hold the last picked.
+const modelOf = (sess) => (sess?.model
+	? { model: sess.model, modelName: sess.modelName || sess.model, effort: sess.effort || settings.effort }
+	: { model: settings.model, modelName: settings.modelName, effort: settings.effort });
+// What an agent running a conversation reads: that conversation's model and level, the app's mode.
+function runSettings(sess) {
+	return {
+		get model() { return modelOf(sess).model; },
+		get modelName() { return modelOf(sess).modelName; },
+		get effort() { return modelOf(sess).effort; },
+		get fastMode() { return !!settings.fastMode; },
+		get mode() { return settings.mode; },
+	};
+}
+// What a Claude process takes in only when it starts.
+const fixedAtStart = (sess) => { const m = modelOf(sess); return JSON.stringify([effortFor(m.model, m.effort), !!settings.fastMode, thinkingFor(m.model)]); };
+
 async function startRuntime(id) {
 	let rt = runtimes.get(id);
-	const backend = backendOf(settings.model);
+	const sess = await getOrLoadSessionObj(id);
+	if (!sess) throw new Error('session not found: ' + id);
+	const backend = backendOf(modelOf(sess).model);
 	// An idle process that cannot take a changed setting in, or that belongs to the other agent, is replaced.
 	if (rt && !rt.running && rt.pending.size === 0 && (rt.restartWhenIdle || rt.backend !== backend)) { teardownRuntime(id); rt = null; }
 	if (rt) return rt;
 	await pluginGate; // a plugin being downloaded is enabled for a moment; don't start a session in that window
-	const sess = await getOrLoadSessionObj(id);
-	if (!sess) throw new Error('session not found: ' + id);
 	noteBackendSwitch(sess, backend);
 	if (backend === 'claude' && sess.claudeSessionId && !(await transcriptExists(sess.claudeSessionId))) {
 		log('[sessions] transcript gone, starting over', id.slice(0, 8));
 		sess.claudeSessionId = null;
-		const text = '这段对话时间太久，Claude 已经不记得之前的内容了。上面的记录还在，接下来它会从头开始。';
+		sess.seen = { ...sess.seen, claude: 0 }; // it remembers nothing: all of it goes with the next message
+		const text = '这段对话时间太久，Claude 已经不记得之前的内容了，前面的记录会随下一条消息一起交给它。';
 		sess.messages.push({ role: 'sys', text, time: Date.now() });
 		saveSession(sess);
 		broadcast({ type: 'notice', sessionId: id, text });
@@ -963,11 +1045,11 @@ async function startRuntime(id) {
 	const tag = id.slice(0, 8);
 	const handle = backend === 'agy'
 		? agy.open({
-			tag, cwd: CWD, settings, conversation: sess.agyConversationId || null,
+			tag, cwd: CWD, settings: runSettings(sess), conversation: sess.agyConversationId || null,
 			preamble: agyPreamble, prepareTurn: prepareAgy, canUseTool, mcpServers: [acpStdio(AGENT_TOOLS, agentToolsServer(id, 'ask,browser'))],
 		})
 		: await claude.open({
-			tag, cwd: CWD, settings, resume: sess.claudeSessionId || null, canUseTool,
+			tag, cwd: CWD, settings: runSettings(sess), resume: sess.claudeSessionId || null, canUseTool,
 			systemAppend: [APP_PROMPT, NOTES_PROMPT, loadMemory(), loadSystemPromptAppend()].filter(Boolean).join('\n\n'),
 			mcpServers: { ...await loadMcpServers(), [AGENT_TOOLS]: { type: 'stdio', ...agentToolsServer(id, 'browser') } },
 			plugins: await agyPluginsForClaudeNow(),
@@ -975,7 +1057,7 @@ async function startRuntime(id) {
 
 	rt = {
 		pushUser: handle.send, end: handle.close, q: handle.control, pending, running: false, assistantText: '', lastActive: Date.now(),
-		chatSpec: handle.spec, backend, askOwner, canUseTool,
+		chatSpec: handle.spec, backend, askOwner, canUseTool, fixed: fixedAtStart(sess),
 	};
 	runtimes.set(id, rt);
 	const started = rt;
@@ -1046,14 +1128,14 @@ async function consume(id, events, rt) {
 			broadcast({ type: 'assistant_delta', sessionId: id, text: ev.text });
 		} else if (ev.type === 'text_end') {
 			if (rt.assistantText && sess) {
-				sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
+				sess.messages.push({ role: 'assistant', text: rt.assistantText, by: rt.backend, time: Date.now() });
 				rt.assistantText = '';
 				saveSession(sess);
 			}
 			broadcast({ type: 'assistant_end', sessionId: id });
 		} else if (ev.type === 'text') {
 			if (sess) {
-				sess.messages.push({ role: 'assistant', text: ev.text, time: Date.now() });
+				sess.messages.push({ role: 'assistant', text: ev.text, by: rt.backend, time: Date.now() });
 				saveSession(sess);
 			}
 			broadcast({ type: 'assistant_text', sessionId: id, text: ev.text });
@@ -1103,10 +1185,11 @@ async function consume(id, events, rt) {
 			rt.since = 0;
 			if (rt.thinking) endThinking(sess); // stopped mid-thought: no block_stop will come
 			if (rt.assistantText && sess) {
-				sess.messages.push({ role: 'assistant', text: rt.assistantText, time: Date.now() });
+				sess.messages.push({ role: 'assistant', text: rt.assistantText, by: rt.backend, time: Date.now() });
 				rt.assistantText = '';
 			}
 			if (sess) {
+				sess.seen = { ...sess.seen, [rt.backend]: sess.messages.length }; // its own turn: it has all of it
 				// How long this turn took, shown under its last reply.
 				for (let i = sess.messages.length - 1; i >= 0 && sess.messages[i].role !== 'user'; i--) {
 					if (sess.messages[i].role === 'assistant') {
@@ -1137,50 +1220,57 @@ const TITLE_DIR = join(homedir(), '.claude', 'agent-titles');
 const titling = new Set();
 const cleanTitle = (t) => (String(t || '').split('\n').map((l) => l.trim()).find(Boolean) || '')
 	.replace(/^标题[:：]\s*/, '').replace(/[「」"“”'‘’《》#*`]/g, '').replace(/[。.!！?？,，、；;:：\s]+$/, '').slice(0, 20);
-async function generateTitle(userText, replyText, backend = 'claude') {
+async function generateTitle(userText, replyText, backend = 'claude', model = settings.model) {
 	await mkdir(TITLE_DIR, { recursive: true });
 	const clip = (t, n) => typedText(t).trim().slice(0, n);
 	const system = '你只负责给对话起简短的中文标题。';
 	const prompt = `给下面这段对话起一个标题：不超过 12 个汉字，概括用户想做的事；不要标点、引号、表情和解释，只输出标题本身。\n\n用户：${clip(userText, 800)}\n\n助手：${clip(replyText, 800)}`;
 	// By the agent that answered: the owner may be signed in to only one of the two.
 	const out = backend === 'agy'
-		? await agy.oneShot({ prompt: `${system}\n\n${prompt}`, cwd: TITLE_DIR, model: agySlug(settings.model) })
+		? await agy.oneShot({ prompt: `${system}\n\n${prompt}`, cwd: TITLE_DIR, model: agySlug(model) })
 		: await claude.oneShot({ prompt, system, cwd: TITLE_DIR, model: 'haiku' });
 	return cleanTitle(out);
 }
 // ---------------------------------------------------------------- thinking, in Chinese
-// Models mostly think in English. When the owner opens a thinking block, the model in use
-// translates it (one-off call, no tools); translations are kept by the text's hash.
+// Models mostly think in English. The page asks for each piece as it is written (and for whole
+// blocks opened later); a free online translator does it (translate.mjs), through the app's proxy
+// when one is set. Kept by the text's hash, so the same piece is translated once.
 const TRANSLATIONS_FILE = join(homedir(), '.claude', 'agent-translations.json');
 let translations = null;
 const translating = new Map(); // hash -> promise
-const mostlyChinese = (t) => { const s = String(t || '').replace(/\s+/g, ''); const han = (s.match(/[\u4e00-\u9fff]/g) || []).length; return s.length > 0 && han / s.length > 0.25; };
-async function translateThinking(text, backend) {
-	const src = String(text || '').trim();
-	if (!src) return { ok: true, text: '' };
-	if (mostlyChinese(src)) return { ok: true, text: src, same: true };
+let translationsSave = null;
+function keepTranslations() {
+	clearTimeout(translationsSave);
+	translationsSave = setTimeout(() => {
+		const keys = Object.keys(translations);
+		if (keys.length > 3000) for (const k of keys.slice(0, keys.length - 2500)) delete translations[k];
+		writeJsonAtomic(TRANSLATIONS_FILE, translations).catch(() => {});
+	}, 1500);
+}
+async function translateThinking(text) {
+	const raw = String(text || '');
+	const src = raw.trim();
+	if (!src) return { ok: true, text: raw };
+	if (mostlyChinese(src)) return { ok: true, text: raw, same: true };
+	// The spaces and line breaks around a piece stay: pieces of one block are put back together.
+	const lead = raw.slice(0, raw.indexOf(src[0])), trail = raw.slice(raw.lastIndexOf(src[src.length - 1]) + 1);
 	const key = createHash('sha256').update(src).digest('hex').slice(0, 32);
 	translations ||= await readFile(TRANSLATIONS_FILE, 'utf8').then(JSON.parse).catch(() => ({}));
-	if (translations[key]) return { ok: true, text: translations[key] };
-	if (translating.has(key)) return translating.get(key);
-	const job = (async () => {
-		const LIMIT = 9000;
-		const part = src.length > LIMIT ? src.slice(0, LIMIT) : src;
-		const system = '你是翻译。把用户给的一段 AI 思考过程翻译成自然、通顺的简体中文。只输出译文，不加任何解释或前后缀；代码、命令、文件路径、包名、专有名词保持原样。';
-		await mkdir(TITLE_DIR, { recursive: true });
-		const out = (backend === 'agy'
-			? await agy.oneShot({ prompt: `${system}\n\n---\n${part}`, cwd: TITLE_DIR, model: agySlug(settings.model), timeoutMs: 90000 })
-			: await claude.oneShot({ prompt: part, system, cwd: TITLE_DIR, model: 'haiku', timeoutMs: 90000 })).trim();
-		if (!out) return { ok: false, error: '翻译没有返回结果' };
-		const zh = src.length > LIMIT ? `${out}\n\n（后面还有一部分没有翻译，可以点「原文」查看）` : out;
-		translations[key] = zh;
-		const keys = Object.keys(translations);
-		if (keys.length > 600) for (const k of keys.slice(0, keys.length - 500)) delete translations[k];
-		await writeJsonAtomic(TRANSLATIONS_FILE, translations).catch(() => {});
-		return { ok: true, text: zh };
-	})().catch((e) => ({ ok: false, error: String(e?.message || e) })).finally(() => translating.delete(key));
-	translating.set(key, job);
-	return job;
+	if (translations[key]) return { ok: true, text: lead + translations[key] + trail };
+	if (!translating.has(key)) {
+		const proxy = readProxySetting();
+		const job = translateToChinese(src.slice(0, 40000), proxy ? [proxy, ''] : [''])
+			.then((r) => {
+				if (r.same) return { ok: true, same: true };
+				translations[key] = r.text;
+				keepTranslations();
+				return { ok: true, text: r.text };
+			}, (e) => ({ ok: false, error: String(e?.message || e) }))
+			.finally(() => translating.delete(key));
+		translating.set(key, job);
+	}
+	const r = await translating.get(key);
+	return r.ok && !r.same ? { ok: true, text: lead + r.text + trail } : r.same ? { ok: true, text: raw, same: true } : r;
 }
 async function maybeTitle(id) {
 	const sess = sessionCache.get(id);
@@ -1191,7 +1281,7 @@ async function maybeTitle(id) {
 	if (sess.title !== autoTitleOf(firstUser.text)) { sess.titleSource = 'user'; return; } // renamed by hand before
 	titling.add(id);
 	try {
-		const title = await generateTitle(firstUser.text, firstReply.text, sess.backend || 'claude');
+		const title = await generateTitle(firstUser.text, firstReply.text, sess.backend || 'claude', modelOf(sess).model);
 		if (!title || sess.titleSource) return; // nothing usable, or renamed meanwhile
 		if (sessionCache.get(id) !== sess) return; // deleted meanwhile: saving would bring it back
 		sess.title = title;
@@ -2748,6 +2838,37 @@ const server = createServer(async (req, res) => {
 
 			// Not the picture itself: the conversation's file is rewritten on every event of every turn.
 			const kept = (Array.isArray(scopes) ? scopes : []).map(({ dataUrl, ...s }) => s);
+			// The turn is waiting on the owner: what they type now is their reply to that.
+			const live = runtimes.get(id);
+			if (live?.running && live.pending.size) {
+				const said = typedText(str).trim();
+				const asking = [...live.pending.entries()].find(([, p]) => p.kind === 'ask');
+				if (asking) {
+					// A question: the words are the answer (to each of its questions, if it asked several).
+					const am = sess.messages.find((x) => x.role === 'ask' && x.id === asking[0]);
+					answerQuestion(id, asking[0], Object.fromEntries((am?.questions || [{ question: '回答' }]).map((q) => [q.question, said])));
+					return json(res, { ok: true, answered: 'question' });
+				}
+				if (live.backend === 'claude') {
+					// A step waiting for a yes: turned down with what the owner said instead, and Claude
+					// goes on from there in the same turn, as with "No, and tell Claude what to do" in the terminal.
+					for (const [permId, p] of [...live.pending]) {
+						p.resolve({ behavior: 'deny', message: `用户没有同意这一步，而是回复：${said}\n按用户说的继续。`, interrupt: false });
+						closePermission(id, permId, 'deny');
+					}
+					sess.messages.push({ role: 'user', text: str, scopes: kept, time: Date.now() });
+					saveSession(sess);
+					return json(res, { ok: true, answered: 'permission' });
+				}
+				// Antigravity takes no words with a refusal: the step is stopped, and the message goes next.
+				const q = queues.get(id) || [];
+				q.unshift({ id: randomUUID(), text: str, scopes: kept });
+				queues.set(id, q);
+				heldQueues.delete(id);
+				broadcastQueue(id);
+				interruptTurn(id); // its result sends what waits
+				return json(res, { ok: true, queued: true });
+			}
 			if (runtimes.get(id)?.running || delivering.has(id)) {
 				const q = queues.get(id) || [];
 				q.push({ id: randomUUID(), text: str, scopes: kept });
@@ -2809,28 +2930,14 @@ const server = createServer(async (req, res) => {
 		}
 
 		if (req.method === 'POST' && path === '/api/translate') {
-			const { text, sessionId } = await body(req);
-			const sess = sessionId ? await getOrLoadSessionObj(sessionId) : null;
-			const backend = sess?.backend || backendOf(settings.model);
-			return json(res, await translateThinking(String(text || '').slice(0, 40000), backend));
+			const { text } = await body(req);
+			return json(res, await translateThinking(String(text || '').slice(0, 40000)));
 		}
 		// The owner's answer to the assistant's question. `answers`: { question text: answer }; none = skipped.
 		if (req.method === 'POST' && path === '/api/answer') {
 			const { id: askId, answers, sessionId } = await body(req);
 			const sid = sessionId || activeSessionId;
-			const rt = sid && runtimes.get(sid);
-			const p = rt?.pending.get(askId);
-			if (!p || p.kind !== 'ask') return json(res, { ok: false, error: 'gone' }, 404);
-			const clean = answers && typeof answers === 'object'
-				? Object.fromEntries(Object.entries(answers).map(([k, v]) => [String(k), String(v ?? '').slice(0, 2000)]).filter(([, v]) => v.trim()))
-				: null;
-			const ok = clean && Object.keys(clean).length > 0;
-			p.resolve(ok ? { behavior: 'allow', answers: clean } : { behavior: 'deny' });
-			const sess = sessionCache.get(sid);
-			const am = sess?.messages.find((x) => x.role === 'ask' && x.id === askId);
-			if (am) { am.answers = ok ? clean : null; am.verdict = ok ? 'answered' : 'skipped'; saveSession(sess); }
-			broadcast({ type: 'question_resolved', sessionId: sid, id: askId, answers: ok ? clean : null });
-			return json(res, { ok: true });
+			return answerQuestion(sid, askId, answers) ? json(res, { ok: true }) : json(res, { ok: false, error: 'gone' }, 404);
 		}
 
 		// Stop current run — interrupts only this one conversation's current turn (same granularity
@@ -3094,21 +3201,32 @@ const server = createServer(async (req, res) => {
 
 		// Settings API — these are app-wide, so push live changes to every open conversation, not just one.
 		if (req.method === 'POST' && path === '/api/settings') {
-			const next = await body(req);
+			const { sessionId, ...next } = await body(req);
 			if ('mode' in next && !MODES.includes(next.mode)) delete next.mode; // unknown mode: keep the current one
-			// Fixed when a process starts: effort, fast mode and how thinking is asked for.
-			const fixedAtStart = () => JSON.stringify([settings.effort, settings.fastMode, thinkingFor(settings.model)]);
-			const before = fixedAtStart();
+			if ('efforts' in next) next.efforts = { ...settings.efforts, ...cleanEfforts(next.efforts) };
+			// A model or level picked in a conversation is that conversation's, and what the next new
+			// one starts with; the others keep theirs.
+			const sess = sessionId ? await getOrLoadSessionObj(sessionId) : null;
+			const picked = ['model', 'modelName', 'effort'].filter((k) => k in next);
+			if (sess && picked.length) {
+				if (!sess.model) Object.assign(sess, { model: settings.model, modelName: settings.modelName, effort: settings.effort });
+				for (const k of picked) sess[k] = next[k];
+				saveSession(sess);
+				broadcast({ type: 'session_model', sessionId: sess.id, model: sess.model, modelName: sess.modelName, effort: sess.effort });
+			}
 			for (const k of SETTING_KEYS) if (k in next) settings[k] = next[k];
 			await persistSettings();
-			if (fixedAtStart() !== before) restartRuntimesWhenIdle();
-			for (const rt of runtimes.values()) {
+			for (const [sid, rt] of runtimes) {
 				tell(() => rt.q.setPermissionMode?.(settings.mode === 'plan' ? 'plan' : 'default'));
+				if (rt.backend !== 'claude') continue; // Antigravity takes its model and level before each turn
+				const own = sessionCache.get(sid);
+				// Effort, fast mode and how thinking is asked for are fixed when a process starts.
+				if (fixedAtStart(own) !== rt.fixed) rt.restartWhenIdle = true;
 				// A model of the other agent is not this process's to switch to: the next message replaces it.
-				if (rt.backend === 'claude' && backendOf(settings.model) === 'claude') tell(() => rt.q.setModel?.(claude.modelFor(rt.chatSpec, settings.model)));
+				if (sid === sess?.id && 'model' in next && backendOf(sess.model) === 'claude') tell(() => rt.q.setModel?.(claude.modelFor(rt.chatSpec, sess.model)));
 			}
 			broadcast({ type: 'settings', settings });
-			return json(res, { ok: true, settings });
+			return json(res, { ok: true, settings, ...(sess ? { session: { model: sess.model, modelName: sess.modelName, effort: sess.effort } } : {}) });
 		}
 
 		// ---- The assistant's notes ----
@@ -3529,7 +3647,7 @@ const server = createServer(async (req, res) => {
 		if (path === '/api/commands' && req.method === 'GET') {
 			const sid = url.searchParams.get('sessionId') || activeSessionId;
 			noticeSkillChanges().catch((e) => log('[skills] change scan', e?.message));
-			if (backendOf(settings.model) === 'agy') {
+			if (backendOf(modelOf(sid ? await getOrLoadSessionObj(sid) : null).model) === 'agy') {
 				const art = sid && runtimes.get(sid);
 				let live = [];
 				if (art?.backend === 'agy') live = await art.q.supportedCommands().catch(() => []);
@@ -3555,12 +3673,14 @@ const server = createServer(async (req, res) => {
 		// just to check a number — if nothing is running yet, say so instead of starting a ghost chat.
 		if (path === '/api/usage' && req.method === 'GET') {
 			const fresh = url.searchParams.get('fresh') === '1';
-			if (backendOf(settings.model) === 'agy') {
+			const usid = url.searchParams.get('sessionId') || activeSessionId;
+			const inUse = modelOf(usid ? await getOrLoadSessionObj(usid) : null).model;
+			if (backendOf(inUse) === 'agy') {
 				// agy's own /usage: one group per family of models, the ring shows the one in use.
 				const u = await agy.usage({ fresh });
 				if (!u.ok) return json(res, { ok: false, error: u.error });
 				const win = (g, w) => { const b = g?.buckets.find((x) => x.window === w); return b ? { utilization: b.utilization, resets_at: b.resets_at } : null; };
-				const mine = usageGroupFor(u.groups, agySlug(settings.model));
+				const mine = usageGroupFor(u.groups, agySlug(inUse));
 				return json(res, {
 					ok: true, provider: 'agy', rate_limits_available: true, cost: null, current: mine?.name || null,
 					rate_limits: { five_hour: win(mine, '5h'), seven_day: win(mine, 'week') },

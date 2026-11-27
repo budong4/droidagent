@@ -51,8 +51,23 @@ async function storedWhen(id, ready) {
 	return stored(id);
 }
 
-let google, oauthPort;
+let google, oauthPort, translator;
+const translated = []; // what the stand-in translator was asked
 before(async () => {
+	// A stand-in for the online translator (Google's gtx endpoint, dj=1 answers).
+	const { createServer: httpServer0 } = await import('node:http');
+	const tr = httpServer0((req, res) => {
+		let b = '';
+		req.on('data', (d) => { b += d; });
+		req.on('end', () => {
+			const q = new URLSearchParams(b).get('q') || '';
+			translated.push(q);
+			res.writeHead(200, { 'content-type': 'application/json' });
+			res.end(JSON.stringify({ sentences: [{ trans: `【译】${q}`, orig: q }], src: /[\u4e00-\u9fff]/.test(q) ? 'zh-CN' : 'en' }));
+		});
+	});
+	await new Promise((r) => tr.listen(0, '127.0.0.1', r));
+	translator = { url: `http://127.0.0.1:${tr.address().port}/translate_a/single`, close: () => tr.close() };
 	// A stand-in for Google's token and userinfo endpoints, for signing in to Antigravity.
 	const { createServer: httpServer } = await import('node:http');
 	const g = httpServer((req, res) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => { const f = Object.fromEntries(new URLSearchParams(b)); res.writeHead(req.url === '/token' && f.code !== 'good' ? 400 : 200, { 'content-type': 'application/json' }); res.end(JSON.stringify(req.url === '/token' ? (f.code === 'good' ? { access_token: 'ya29.x', refresh_token: '1//r', expires_in: 3600 } : { error: 'invalid_grant' }) : { email: 'owner@example.com' })); }); });
@@ -71,6 +86,7 @@ before(async () => {
 			HOME: home, PATH: `${bin}:/usr/bin:/bin`, AGENT_PORT: String(port), AGENT_CWD: work, AGENT_PROXY_FILE: join(home, 'proxy.env'),
 			DROIDAGENT_NO_UPDATE: '1', AGENT_AGY_BIN: join(HERE, 'fake-agy.mjs'), FAKE_AGY_LOG: agyLog, AGENT_BG_DIR: join(home, 'bg'),
 			AGENT_CHROMIUM: process.env.AGENT_CHROMIUM || '/usr/bin/google-chrome', AGENT_BROWSER_IDLE_MS: '600000',
+			AGENT_TRANSLATE_URL: translator.url,
 			AGY_OAUTH_TOKEN_URL: `${google.base}/token`, AGY_OAUTH_USERINFO_URL: `${google.base}/userinfo`, AGY_OAUTH_PORT: String(oauthPort),
 		},
 		stdio: ['ignore', 'pipe', 'pipe'],
@@ -104,6 +120,7 @@ after(async () => {
 	await api('/api/browser/stop', {}).catch(() => {});
 	server?.kill('SIGKILL');
 	google?.close();
+	translator?.close();
 	// Chromium can still be flushing its profile for a moment after the server is gone.
 	try { execFileSync('pkill', ['-KILL', '-f', `--user-data-dir=${join(home, '.droidagent', 'browser-profile')}`]); } catch { /* none left */ }
 	for (let i = 0; ; i++) {
@@ -273,10 +290,12 @@ test('usage, slash commands and plugins come from agy itself', async () => {
 	assert.deepEqual(u.rate_limits.five_hour, { utilization: 25, resets_at: '2030-01-01T00:00:00Z' });
 	assert.deepEqual(u.rate_limits.seven_day, { utilization: 60, resets_at: null });
 	assert.deepEqual(u.groups.map((g) => g.name), ['Gemini', 'Claude and GPT']);
-	// The ring follows the model in use: a Claude model on Antigravity draws from the other group.
-	await api('/api/settings', { model: 'agy:claude-sonnet-5-5', modelName: 'Claude Sonnet 5.5 (Thinking)' });
-	assert.equal((await api('/api/usage')).rate_limits.five_hour.utilization, 90);
-	await api('/api/settings', { model: 'agy:gemini-3.8-flash', modelName: 'Gemini 3.8 Flash' });
+	// The ring follows the model of the conversation on screen: a Claude model on Antigravity draws
+	// from the other group.
+	const sid = await newSession();
+	await api('/api/settings', { model: 'agy:claude-sonnet-5-5', modelName: 'Claude Sonnet 5.5 (Thinking)', sessionId: sid });
+	assert.equal((await api(`/api/usage?sessionId=${sid}`)).rate_limits.five_hour.utilization, 90);
+	await api('/api/settings', { model: 'agy:gemini-3.8-flash', modelName: 'Gemini 3.8 Flash', sessionId: sid });
 	const names = (await api('/api/commands')).commands.map((c) => c.name);
 	assert.ok(names.includes('plan') && names.includes('usage') && !names.includes('compact'), names.join(','));
 	assert.ok(names.includes('phone-health'), 'skills are slash commands for agy too');
@@ -382,17 +401,16 @@ test('Antigravity asks the owner a question: a sheet with choices, the answer go
 	await api('/api/settings', { mode: 'acceptEdits' });
 });
 
-test('thinking translated into Chinese by the model in use, once, and not when it already is', async () => {
-	const id = await newSession();
-	await say(id, 'hello');
-	const en = 'Let me check the battery temperature first.';
-	const r = await api('/api/translate', { text: en, sessionId: id });
-	assert.equal(r.ok, true);
-	assert.match(r.text, /^echo: 你是翻译。[\s\S]*Let me check the battery temperature first\.$/, 'the one-off question carries the instruction and the text');
-	const before = runs().filter((x) => x.oneShot).length;
-	assert.deepEqual(await api('/api/translate', { text: en, sessionId: id }), r, 'the same text again: from the kept translations');
-	assert.equal(runs().filter((x) => x.oneShot).length, before);
-	assert.deepEqual(await api('/api/translate', { text: '先看一下电池温度，然后再决定。', sessionId: id }), { ok: true, text: '先看一下电池温度，然后再决定。', same: true });
+test('thinking translated into Chinese by the online translator, once, code kept as written, and not when it already is', async () => {
+	const en = 'Let me run `dumpsys battery` first.\n\n';
+	const r = await api('/api/translate', { text: en });
+	assert.deepEqual(r, { ok: true, text: '【译】Let me run `dumpsys battery` first.\n\n' }, 'the line breaks around a piece stay, for the pieces of one block to join up');
+	assert.equal(translated.at(-1), 'Let me run ⟦0⟧ first.', 'code goes out as a marker and comes back as written');
+	const asked = translated.length;
+	assert.deepEqual(await api('/api/translate', { text: en }), r, 'the same text again: from the kept translations');
+	assert.equal(translated.length, asked);
+	assert.ok(!runs().some((x) => x.oneShot && /翻译/.test(x.prompt)), 'no model is asked');
+	assert.deepEqual(await api('/api/translate', { text: '先看一下电池温度，然后再决定。' }), { ok: true, text: '先看一下电池温度，然后再决定。', same: true });
 });
 
 const hasChromium = existsSync(process.env.AGENT_CHROMIUM || '/usr/bin/google-chrome');

@@ -118,3 +118,15 @@ test("a search's links, a fetched page, links in other tools' text", () => {
 	assert.deepEqual(sourcesOf('Bash', {}, 'https://x.y'), [], 'a command printing a link is not a source');
 	assert.deepEqual(mergeSources([{ url: 'https://a.b/c' }], [{ url: 'https://a.b/c' }, { url: 'ftp://x' }, { url: 'javascript:alert(1)' }]), [{ title: 'a.b', url: 'https://a.b/c' }]);
 });
+
+import { protect, restore, pieces, mostlyChinese } from '../app/server/translate.mjs';
+test('translation: code kept as written, long text cut at paragraph breaks, Chinese left alone', () => {
+	const { out, kept } = protect('Run `ls -la /data` then\n```sh\necho hi\n```\nand `pm list`.');
+	assert.equal(out, 'Run ⟦0⟧ then\n⟦1⟧\nand ⟦2⟧.');
+	assert.equal(restore('运行 ⟦0⟧，然后\n⟦ 1 ⟧\n再 ⟦2⟧。', kept), '运行 `ls -la /data`，然后\n```sh\necho hi\n```\n再 `pm list`。');
+	const text = `${'a'.repeat(30)}.\n\n${'b'.repeat(30)}. ${'c'.repeat(30)}`;
+	assert.deepEqual(pieces(text, 40).map((p) => p.length), [33, 32, 30]);
+	assert.equal(pieces(text, 40).join(''), text);
+	assert.equal(mostlyChinese('先看一下电池温度'), true);
+	assert.equal(mostlyChinese('check `dumpsys battery` 的输出'), false);
+});
