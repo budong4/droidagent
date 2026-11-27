@@ -207,6 +207,8 @@ function sessionMeta(sess) {
 		updatedAt: sess.updatedAt,
 		claudeSessionId: sess.claudeSessionId || null,
 		backend: sess.backend || 'claude',
+		model: sess.model || null,
+		modelName: sess.modelName || null,
 		msgCount: sess.messages?.length || 0,
 		preview: lastMsg?.text ? typedText(lastMsg.text).replace(/\n+/g, ' ').slice(0, 60) : '',
 	};
@@ -243,6 +245,8 @@ async function loadSessionsIndex({ verify = true } = {}) {
 		list = JSON.parse(await readFile(SESSIONS_INDEX, 'utf8'));
 	} catch { /* missing or corrupt — fall through to the rebuild below */ }
 	if (!Array.isArray(list)) return rebuildSessionsIndex();
+	// Written before the list showed each conversation's model: read them all again, once.
+	if (list.some((m) => m && !('model' in m))) return rebuildSessionsIndex();
 	if (!verify) return list;
 	// A conversation present on disk but missing from the index means the index lost entries
 	// (the old failure mode); recover them instead of quietly dropping the history.
@@ -951,7 +955,7 @@ function handoffFor(sess, backend, upto) {
 	flush();
 	let text = lines.join('\n');
 	if (text.length > 12000) text = '……（更早的部分省略）\n' + text.slice(text.length - 12000);
-	return `【前情】这段对话前面的一部分你没有参与（是在别的模型上进行的）。下面是那部分的记录，只供你了解情况；里面已经做过的操作不要再做一遍：\n${text}\n【前情完】\n\n`;
+	return `【前情】这段对话前面的内容你没有看到（之前在别的模型上进行，或者对话回退过）。下面是记录，只供你了解情况；里面已经做过的操作不要再做一遍：\n${text}\n【前情完】\n\n`;
 }
 
 // The model a conversation runs on. Each one keeps what it was given at its first message; one
@@ -3041,6 +3045,39 @@ const server = createServer(async (req, res) => {
 		}
 
 		// New conversation — never touches any other conversation's runtime.
+		// Back to just before one of the owner's messages: it and everything after it are taken out,
+		// and the message comes back to the page to be changed and sent again. Neither agent can
+		// forget part of what it remembers, so both start afresh at the next message, given the part
+		// kept as a record (handoffFor). What was already done on the phone is not undone.
+		if (path === '/api/sessions/rewind' && req.method === 'POST') {
+			const { id, index, text } = await body(req);
+			const sid = id || activeSessionId;
+			const sess = sid ? await getOrLoadSessionObj(sid) : null;
+			if (!sess) return json(res, { ok: false, error: '找不到这段对话' }, 404);
+			if (runtimes.get(sid)?.running || delivering.has(sid) || queues.get(sid)?.length) {
+				return json(res, { ok: false, error: '这一轮还没结束，先点停止再回退' }, 409);
+			}
+			const users = sess.messages.map((m, i) => (m.role === 'user' ? i : -1)).filter((i) => i >= 0);
+			let at = users[Number.isInteger(index) ? index : users.length - 1];
+			// The page counts its own bubbles: if that one isn't the text it showed, go by the text.
+			if (text != null && at !== undefined && typedText(sess.messages[at].text) !== text) {
+				at = [...users].reverse().find((i) => typedText(sess.messages[i].text) === text);
+			}
+			if (at === undefined) return json(res, { ok: false, error: '找不到这条消息' }, 404);
+			const msg = sess.messages[at];
+			sess.messages = sess.messages.slice(0, at);
+			teardownRuntime(sid);
+			sess.claudeSessionId = null;
+			sess.agyConversationId = null;
+			sess.seen = {};
+			if (!sess.messages.length && sess.titleSource !== 'user') { sess.title = '新对话'; delete sess.titleSource; }
+			await saveSession(sess);
+			log('[sessions] rewound', sid.slice(0, 8), 'to message', at);
+			broadcast({ type: 'session_rewound', sessionId: sid, session: forPage(sess) });
+			broadcast({ type: 'sessions_updated', sessions: await loadSessionsIndex({ verify: false }) });
+			return json(res, { ok: true, session: forPage(sess), text: typedText(msg.text), scopes: msg.scopes || [] });
+		}
+
 		if (path === '/api/sessions/new' && req.method === 'POST') {
 			const newSess = await freshSession();
 			activeSessionId = newSess.id;

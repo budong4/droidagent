@@ -1388,3 +1388,24 @@ body { letter-spacing: .005em; }
 /* A turn that did not finish offers to send the same again. */
 .sys-retry { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 2px 10px; border-radius: 999px; font-size: 12.5px; color: var(--accent); background: var(--accent-soft); vertical-align: middle; }
 .sys-retry .ic { width: 14px; height: 14px; }
+
+/* ---- code colours (highlight.js): calm, readable on the code background of light and dark themes ---- */
+:root { --hl-c: #8A9198; --hl-s: #2F7A5E; --hl-n: #B25E22; --hl-k: #7B48A8; --hl-b: #2263A6; --hl-f: #2263A6; --hl-v: #A8376A; --hl-p: #2263A6; --hl-t: #7B48A8; --hl-a: #9A5B1A; --hl-ad: #2F7A4E; --hl-dl: #B23A3A; }
+:root[data-scheme="dark"] { --hl-c: #7C858D; --hl-s: #86CBA8; --hl-n: #E4A46E; --hl-k: #C7A0EC; --hl-b: #82BAF0; --hl-f: #82BAF0; --hl-v: #EE90B6; --hl-p: #82BAF0; --hl-t: #C7A0EC; --hl-a: #E0B07A; --hl-ad: #84D39C; --hl-dl: #F09090; }
+.hl-c { color: var(--hl-c); font-style: italic; }
+.hl-s { color: var(--hl-s); }
+.hl-n { color: var(--hl-n); }
+.hl-k { color: var(--hl-k); }
+.hl-b { color: var(--hl-b); }
+.hl-f { color: var(--hl-f); }
+.hl-v { color: var(--hl-v); }
+.hl-p { color: var(--hl-p); }
+.hl-t { color: var(--hl-t); }
+.hl-a { color: var(--hl-a); }
+.hl-ad { color: var(--hl-ad); }
+.hl-dl { color: var(--hl-dl); }
+
+/* The conversation list: the title, and under it the model the conversation runs on. */
+.session-row .s-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding: 6px 0; }
+.session-row .s-text .s-title { flex: none; }
+.session-row .s-model { font-size: 11.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

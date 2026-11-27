@@ -381,3 +381,35 @@ test('typing while the assistant waits on the owner: the answer to its question,
 	assert.equal(sess.messages.filter((m) => m.role === 'perm').at(-1).verdict, 'deny');
 	await api('/api/settings', { mode: 'acceptEdits' });
 });
+
+test('going back to an earlier message: it and what followed are taken out, and the agent starts afresh with the rest as a record', async () => {
+	const id = await newSession();
+	await say(id, 'one: look at the battery');
+	await say(id, 'two: clear the cache');
+	await say(id, 'three: restart');
+	const r = await api('/api/sessions/rewind', { id, index: 1, text: 'two: clear the cache' });
+	assert.equal(r.ok, true);
+	assert.equal(r.text, 'two: clear the cache', 'the message comes back to be changed');
+	assert.deepEqual(r.session.messages.filter((m) => m.role === 'user').map((m) => m.text), ['one: look at the battery']);
+	const kept = await storedWhen(id, (x) => x.messages.filter((m) => m.role === 'user').length === 1);
+	assert.equal(kept.claudeSessionId, null, "Claude's thread, which holds what was taken out, is not resumed");
+	const starts = chatStarts().length;
+	const t = await say(id, 'two, changed: clear downloads only');
+	assert.equal(chatStarts().length, starts + 1);
+	assert.equal(chatStarts().at(-1).start.resume, null, 'a fresh thread');
+	assert.match(t.result.text, /【前情】[\s\S]*用户：one: look at the battery\n[\s\S]*【前情完】\n\ntwo, changed: clear downloads only$/);
+	assert.ok(!t.result.text.includes('three'), 'nothing of what was taken out');
+	// The list shows each conversation's model.
+	const listed = (await api('/api/sessions')).sessions.find((s) => s.id === id);
+	assert.equal(listed.model, 'sonnet');
+	// Not while a turn runs.
+	const from = events.length;
+	await api('/api/settings', { mode: 'default' });
+	await api('/api/send', { text: 'tool: rm -rf /sdcard/Download', sessionId: id });
+	const card = await waitFor((e) => e.type === 'permission' && e.sessionId === id, { from });
+	const busy = await fetch(base + '/api/sessions/rewind', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, index: 0 }) });
+	assert.equal(busy.status, 409);
+	await api('/api/permission', { id: card.id, decision: 'deny', sessionId: id });
+	await waitFor((e) => e.type === 'result' && e.sessionId === id, { from });
+	await api('/api/settings', { mode: 'acceptEdits' });
+});
