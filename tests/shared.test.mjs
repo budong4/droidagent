@@ -130,3 +130,18 @@ test('translation: code kept as written, long text cut at paragraph breaks, Chin
 	assert.equal(mostlyChinese('先看一下电池温度'), true);
 	assert.equal(mostlyChinese('check `dumpsys battery` 的输出'), false);
 });
+
+import { createRequire } from 'node:module';
+const { highlight, langOf } = createRequire(import.meta.url)('../app/web/highlight.js');
+test('code highlighting: escaped, by language, flags not inside strings', () => {
+	assert.equal(highlight('bash', '<b>&'), '&lt;b&gt;&amp;', 'all text is escaped');
+	assert.equal(highlight('', 'just some words'), 'just some words', 'plain text stays plain');
+	assert.equal(highlight('sh', 'grep -i "a -b" # note'), '<span class="hl-b">grep</span> <span class="hl-a">-i</span> <span class="hl-s">&quot;a -b&quot;</span> <span class="hl-c"># note</span>');
+	assert.equal(highlight('json', '{"k": true}'), '{<span class="hl-p">&quot;k&quot;</span>: <span class="hl-k">true</span>}');
+	assert.equal(highlight('js', 'return f(1)'), '<span class="hl-k">return</span> <span class="hl-f">f</span>(<span class="hl-n">1</span>)');
+	assert.equal(highlight('html', '<a href="x">'), '&lt;<span class="hl-t">a</span> <span class="hl-a">href</span>=<span class="hl-s">&quot;x&quot;</span>&gt;');
+	assert.equal(highlight('diff', '-a\n+b'), '<span class="hl-dl">-a</span>\n<span class="hl-ad">+b</span>');
+	assert.equal(langOf('', '{"a": 1}'), 'json');
+	assert.equal(langOf('', 'adb shell pm list packages'), 'sh');
+	assert.equal(langOf('brainfuck', '+++'), '', 'an unknown language is shown as it is');
+});

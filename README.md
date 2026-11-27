@@ -173,6 +173,8 @@ App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json`
 - **内置浏览器**（`app/server/browser.mjs`）：chroot 里的 Chromium 以无头方式运行，用 Chrome DevTools 协议驱动，按手机尺寸（412×860）渲染。助手的工具 `browser_open / read / click / type / scroll / back / screenshot` 由 `app/server/agent_tools.mjs` 这个本地 MCP 服务提供；它只接受带本次启动随机令牌的请求。你在 App 里看到的是浏览器的实时画面（MJPEG），点按和输入会转发给浏览器。第一次使用时用 apt 装 `chromium` 和中文字体；15 分钟没人用、也没人在看就自动关掉。
 - **搜索来源**（`app/server/sources.mjs`）：从 WebSearch 的链接列表、WebFetch 和浏览器打开的网址、其他工具输出里的链接中提取来源，去重后挂在这一轮回答下面。
 - **思考翻译**（`app/server/translate.mjs`）：思考过程一边生成，页面一边按句子把写完的部分发给 `/api/translate`，用 Google 翻译的免费接口（不需要密钥；被限流时换用它的另一个接口）译成中文，经 App 设置的代理访问，失败时再直连。代码和命令先换成 ⟦n⟧ 标记，译完放回原样；已经是中文的不翻译；结果按内容缓存在 `~/.claude/agent-translations.json`。
+- **回退**：点自己发过的消息 →「回退到这里」（或 /rewind 撤回最后一轮）。对话在这条消息之前截断，这条消息放回输入框；两个后端都从新会话开始，保留下来的部分作为「前情」随下一条消息交给它们（`/api/sessions/rewind`）。已经执行过的操作不会撤销。
+- **代码高亮**（`app/web/highlight.js`）：自带的小型分词器，不依赖第三方库、离线可用，按语言给代码块着色，没写语言时按内容猜；命令步骤里的 Shell 命令也会着色。
 - **改动和图片**：Edit / Write 等工具的输入转成行级差异显示；工具返回的图片存到 `~/.droidagent/media/`，经 `/api/media/` 显示。
 
 ## 配置

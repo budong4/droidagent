@@ -15,6 +15,8 @@ const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 const ic = (id, cls = '') => `<svg class="ic ${cls}"><use href="#${id}"/></svg>`;
+// Code, coloured by language (highlight.js); plain escaped text if that script is missing.
+const hl = (lang, code) => (window.DA_HL ? window.DA_HL.highlight(lang, code) : esc(code));
 
 const thread = $('#thread');
 const input = $('#input');
@@ -801,7 +803,7 @@ function usageSoon() { clearTimeout(usageAfterTurn); usageAfterTurn = setTimeout
 function md(src) {
 	const blocks = [];
 	const code = (lang, body) => {
-		blocks.push(`<div class="code"><div class="code-head"><span>${esc(lang || '代码')}</span><button class="code-copy">${ic('i-copy')}复制</button></div><pre><code>${esc(body.replace(/\n$/, ''))}</code></pre></div>`);
+		blocks.push(`<div class="code"><div class="code-head"><span>${esc(lang || '代码')}</span><button class="code-copy">${ic('i-copy')}复制</button></div><pre><code>${hl(lang, body.replace(/\n$/, ''))}</code></pre></div>`);
 		return `\u0000${blocks.length - 1}\u0000`;
 	};
 	let s = String(src || '').replace(/```([\w+-]*)[^\n]*\n?([\s\S]*?)```/g, (_, lang, body) => code(lang, body));
@@ -882,14 +884,42 @@ function addUser(text) {
 		const acts = el('div', 'user-acts');
 		const cp = el('button', 'msg-act', `${ic('i-copy')}<span>复制</span>`);
 		cp.addEventListener('click', () => { copyText(text); acts.remove(); });
-		const ed = el('button', 'msg-act', `${ic('i-pen')}<span>编辑后重发</span>`);
-		ed.addEventListener('click', () => { input.value = text; input.dispatchEvent(new Event('input')); input.focus(); acts.remove(); });
-		acts.append(cp, ed);
+		const back = el('button', 'msg-act', `${ic('i-undo')}<span>回退到这里</span>`);
+		back.addEventListener('click', () => { acts.remove(); rewindTo(e); });
+		acts.append(cp, back);
 		e.appendChild(acts);
 	});
 	thread.appendChild(e);
 	scroll(true);
 	return e;
+}
+// Back to just before one of the owner's messages: it and what followed are taken out, and it
+// comes back into the box to change and send again. The agents start afresh from the part kept.
+function rewindTo(bubble) {
+	if (running) { toast('这一轮还没结束，先点停止再回退'); return; }
+	const index = [...$$('#thread .msg.user')].indexOf(bubble);
+	const text = bubble.dataset.text;
+	showDialog({
+		title: '回到这条消息之前？',
+		msg: '这条消息和它后面的对话会被删掉，这条消息放回输入框，可以改了再发。已经在手机上做过的事（改过的文件、装的应用等）不会撤销。',
+		ok: '回退',
+		onOk: async () => {
+			const r = await api('/api/sessions/rewind', { id: curSession?.id, index, text });
+			if (!r.ok) { toast(r.error || '回退失败'); return; }
+			curSession = r.session;
+			renderTranscript(curSession);
+			if (!input.value.trim()) {
+				input.value = r.text || '';
+				attachedScopes = r.scopes || [];
+				renderScopes();
+				autosize();
+				updateSendState();
+			}
+			input.focus();
+			toast('已回到这条消息之前');
+			fetchSessions();
+		},
+	});
 }
 function ensureAssistant() {
 	if (curAssistant) return curAssistant;
@@ -1039,7 +1069,7 @@ function addTool(id, name, title, detail, replay, category) {
 	card.innerHTML = `<div class="tool-head"><div class="tool-ic">${toolIcon(name, detail, cat)}</div><div class="tool-title"></div><span class="tool-cat">${esc(cat)}</span><div class="tool-state"><span class="spin"></span></div>${ic('i-chev', 'chev')}</div>`
 		+ `<div class="tool-body"><div class="tool-inner"><div class="tool-sec${detail ? '' : ' hidden'}"><div class="tool-sec-h">${DETAIL_LABEL(name)}</div><pre class="tool-detail"></pre></div><div class="tool-sec res hidden"><div class="tool-sec-h">结果</div><pre class="tool-result"></pre></div></div></div>`;
 	$('.tool-title', card).textContent = title || name;
-	if (detail) $('.tool-detail', card).textContent = detail;
+	if (detail) { if (name === 'Bash') $('.tool-detail', card).innerHTML = hl('sh', detail); else $('.tool-detail', card).textContent = detail; }
 	$('.tool-head', card).addEventListener('click', () => card.classList.toggle('open'));
 	if (String(name).startsWith('mcp__droidagent__browser_')) {
 		const watch = el('button', 'pill-btn tool-watch', `${ic('i-compass')}看浏览器`);
@@ -1265,7 +1295,7 @@ function addPermission(p) {
 	const no = plan ? '继续修改计划' : '拒绝';
 	card.innerHTML = `<div class="ptop"><span class="tag">${esc(plan ? '计划' : cat ? '高危操作' : (p.reason && p.reason !== '需要确认' ? p.reason : '需要你确认'))}</span><span class="pt"></span></div>${p.detail ? (plan ? '<div class="plan md"></div>' : '<pre></pre>') : ''}<div class="pbtns"><button class="yes">${yes}</button><button class="no">${no}</button><button class="stop">停止</button></div><div class="verdict hidden"></div>`;
 	$('.pt', card).textContent = p.title || p.name;
-	if (p.detail) { if (plan) $('.plan', card).innerHTML = md(p.detail); else $('pre', card).textContent = p.detail; }
+	if (p.detail) { if (plan) $('.plan', card).innerHTML = md(p.detail); else if (p.name === 'Bash') $('pre', card).innerHTML = hl('sh', p.detail); else $('pre', card).textContent = p.detail; }
 	const sid = p.sessionId || curSession?.id;
 	// The step it asks about is the card itself while it waits; it shows again once answered.
 	const step = p.verdict ? null : [...thread.querySelectorAll('.tool')].reverse().find((t) => $('.tool-state .spin', t) && $('.tool-title', t)?.firstChild?.textContent === (p.title || p.name));
@@ -1832,6 +1862,7 @@ const APP_COMMANDS = [
 	{ name: 'model', desc: '切换模型和思考强度', run: () => $('#btn-model').click() },
 	{ name: 'mode', aliases: ['permissions'], desc: '切换执行模式（Ask / Accept edits / Plan / Auto / Full access）', run: () => $('#btn-mode').click() },
 	{ name: 'clear', aliases: ['new', 'reset'], desc: '开始一个新对话', run: () => createNewChat() },
+	{ name: 'rewind', aliases: ['undo'], desc: '撤回最后一轮：最后一条消息放回输入框，它和回答一起删掉', run: () => { const last = [...$$('#thread .msg.user')].pop(); if (last) rewindTo(last); else toast('还没有可以撤回的消息'); } },
 	{ name: 'rename', hint: '<新标题>', desc: '重命名当前对话', run: (a) => renameCurrent(a) },
 	{ name: 'resume', desc: '打开对话列表', run: () => openDrawer() },
 	{ name: 'export', desc: '把整段对话复制成 Markdown', run: () => cmdExport() },
@@ -2336,8 +2367,12 @@ function renderSidebar() {
 }
 function sessionRow(s) {
 	const row = el('div', 'session-row' + (curSession && curSession.id === s.id ? ' active' : ''));
-	row.innerHTML = `<span class="s-title"></span>${pendingIds.has(s.id) ? '<span class="live-dot pending"></span>' : runningIds.has(s.id) ? '<span class="live-dot running"></span>' : ''}<button class="s-more" aria-label="更多操作">${ic('i-more', 'sm')}</button>`;
+	row.innerHTML = `<span class="s-text"><span class="s-title"></span><small class="s-model"></small></span>${pendingIds.has(s.id) ? '<span class="live-dot pending"></span>' : runningIds.has(s.id) ? '<span class="live-dot running"></span>' : ''}<button class="s-more" aria-label="更多操作">${ic('i-more', 'sm')}</button>`;
 	$('.s-title', row).textContent = s.title || '新对话';
+	// The model it runs on (each conversation keeps its own).
+	const model = s.model ? ((!isAgyModel(s.model) && claudeName(s.model)) || String(s.modelName || s.model).replace(LABEL_EFFORT_RE, '').trim()) : '';
+	$('.s-model', row).textContent = model;
+	$('.s-model', row).classList.toggle('hidden', !model);
 	const more = $('.s-more', row);
 	more.addEventListener('click', (e) => { e.stopPropagation(); openRowMenu(s, more); });
 	let pressTimer = null, pressed = false;
@@ -2985,6 +3020,13 @@ function connect() {
 				loadSlashCommands();
 				break;
 			case 'sessions_updated': sessionsList = m.sessions || []; renderSidebar(); break;
+			case 'session_rewound':
+				// Rewound elsewhere (this page redraws its own as soon as it hears back).
+				if (curSession && m.sessionId === curSession.id && (curSession.messages?.length || 0) !== (m.session?.messages?.length || 0)) {
+					curSession = m.session;
+					renderTranscript(curSession);
+				}
+				break;
 			case 'user_echo':
 				if (m.sessionId) runningIds.add(m.sessionId);
 				if (mine && m.fromQueue) addUser(typedText(m.text)); // its turn came: it joins the thread now
