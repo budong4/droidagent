@@ -823,10 +823,20 @@ function md(src) {
 	s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
 	s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
 	s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-	s = s.replace(/(?:^(?:[-*+]|\d+\.) .*(?:\n|$))+/gm, (blk) => {
-		const ol = /^\s*\d+\./.test(blk);
-		const items = blk.trim().split('\n').map((l) => l.replace(/^\s*(?:[-*+]|\d+\.)\s+/, '')).map((t) => `<li>${t}</li>`).join('');
-		return `<${ol ? 'ol' : 'ul'}>${items}</${ol ? 'ol' : 'ul'}>`;
+	// Lists, nested by indentation: an item indented under another is a list inside it.
+	s = s.replace(/(?:^ {0,8}(?:[-*+]|\d+\.) .*(?:\n|$))+/gm, (blk) => {
+		let html = '';
+		const open = []; // { indent, tag }
+		for (const line of blk.replace(/\n$/, '').split('\n')) {
+			const m = /^( *)([-*+]|\d+\.) (.*)$/.exec(line);
+			if (!m) continue;
+			const indent = m[1].length, tag = /\d/.test(m[2]) ? 'ol' : 'ul';
+			while (open.length > 1 && indent < open[open.length - 1].indent) html += `</li></${open.pop().tag}>`;
+			if (!open.length || indent > open[open.length - 1].indent) { html += `<${tag}><li>${m[3]}`; open.push({ indent, tag }); }
+			else html += `</li><li>${m[3]}`;
+		}
+		while (open.length) html += `</li></${open.pop().tag}>`;
+		return blk.endsWith('\n') ? html + '\n' : html; // the break after it still ends the paragraph
 	});
 	s = s.split(/\n{2,}/).map((p) => {
 		const t = p.trim();
@@ -844,6 +854,11 @@ let curTodoEl = null;
 const toolEls = new Map();
 
 function atBottom() { return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 140; }
+// Scrolled up from the end: a button to go back to it (most useful while an answer is still coming).
+const jumpBtn = $('#btn-jump');
+function syncJump() { jumpBtn.classList.toggle('show', thread.scrollHeight - thread.scrollTop - thread.clientHeight > 600); }
+thread.addEventListener('scroll', () => requestAnimationFrame(syncJump), { passive: true });
+jumpBtn.addEventListener('click', () => { thread.scrollTo({ top: thread.scrollHeight, behavior: REDUCED ? 'auto' : 'smooth' }); });
 function scroll(force) { if (force || atBottom()) requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; }); }
 // For text that keeps growing. Whether the reader is following is decided before it grows: asked
 // afterwards, one big piece (or a slow phone) looks like they scrolled away, and following stops.
@@ -1193,7 +1208,22 @@ function addThinkStatic(text, ms) {
 	thread.appendChild(card);
 	closeThinkCard(card, ms || 0, !!(text || '').trim());
 }
-function sysline(t) { const e = el('div', 'sysline'); e.textContent = t; thread.appendChild(e); scroll(); }
+function sysline(t, { retry = false } = {}) {
+	const e = el('div', 'sysline');
+	e.textContent = t;
+	if (retry) {
+		const b = el('button', 'sys-retry', `${ic('i-refresh')}重试`);
+		b.addEventListener('click', () => {
+			const last = [...$$('#thread .msg.user')].pop()?.dataset.text;
+			if (!last || running) { toast(running ? '等这一轮结束再重试' : '找不到上一条消息'); return; }
+			b.remove();
+			input.value = last; send();
+		});
+		e.appendChild(b);
+	}
+	thread.appendChild(e);
+	scroll();
+}
 // What a Claude Code command such as /context printed.
 function addCmdOut(text) {
 	killWelcome();
@@ -1230,18 +1260,24 @@ function addPermission(p) {
 	killWelcome();
 	const cat = p.reason === '高危操作';
 	const plan = p.reason === '计划已就绪';
-	const card = el('div', 'perm' + (cat ? ' catastrophic' : ''));
+	const card = el('div', 'perm' + (cat ? ' catastrophic' : '') + (plan ? ' plan-card' : ''));
 	const yes = plan ? '按计划执行' : '允许';
 	const no = plan ? '继续修改计划' : '拒绝';
 	card.innerHTML = `<div class="ptop"><span class="tag">${esc(plan ? '计划' : cat ? '高危操作' : (p.reason && p.reason !== '需要确认' ? p.reason : '需要你确认'))}</span><span class="pt"></span></div>${p.detail ? (plan ? '<div class="plan md"></div>' : '<pre></pre>') : ''}<div class="pbtns"><button class="yes">${yes}</button><button class="no">${no}</button><button class="stop">停止</button></div><div class="verdict hidden"></div>`;
 	$('.pt', card).textContent = p.title || p.name;
 	if (p.detail) { if (plan) $('.plan', card).innerHTML = md(p.detail); else $('pre', card).textContent = p.detail; }
 	const sid = p.sessionId || curSession?.id;
+	// The step it asks about is the card itself while it waits; it shows again once answered.
+	const step = p.verdict ? null : [...thread.querySelectorAll('.tool')].reverse().find((t) => $('.tool-state .spin', t) && $('.tool-title', t)?.firstChild?.textContent === (p.title || p.name));
+	step?.classList.add('awaiting');
 	const mark = (d) => {
+		step?.classList.remove('awaiting');
 		card.classList.add('done');
 		const v = $('.verdict', card);
-		v.classList.remove('hidden');
-		v.textContent = plan && d === 'allow' ? '已同意计划，开始执行' : plan && d === 'deny' ? '已退回，可以接着说要改什么' : (VERDICT[d] || d);
+		const said = plan && d === 'allow' ? '已同意计划，开始执行' : plan && d === 'deny' ? '已退回，可以接着说要改什么' : (VERDICT[d] || d);
+		// A step's card says what was decided where it said what was asked; a plan keeps a line under it.
+		if (plan) { v.classList.remove('hidden'); v.textContent = said; }
+		else { $('.tag', card).textContent = said; card.classList.toggle('refused', d !== 'allow'); }
 	};
 	const decide = (d) => {
 		if (d === 'stop') stoppedIds.add(sid);
@@ -1253,6 +1289,8 @@ function addPermission(p) {
 	$('.stop', card).addEventListener('click', () => decide('stop'));
 	if (p.verdict) mark(p.verdict);
 	else permMarks.set(p.id, (d) => { permMarks.delete(p.id); mark(d); syncComposerHint(); });
+	// Answered, it folds to a line; a tap shows what it was about.
+	card.addEventListener('click', (e) => { if (card.classList.contains('done') && !e.target.closest('a, button')) card.classList.toggle('expanded'); });
 	thread.appendChild(card);
 	syncComposerHint();
 	scroll(true);
@@ -1834,7 +1872,8 @@ function checkSlashInput() {
 	const hit = (name, aliases, desc) => named(name, aliases) || (!anyNamed && q.length > 1 && String(desc || '').toLowerCase().includes(q));
 	const app = APP_COMMANDS.filter((c) => hit(c.name, c.aliases, c.desc)).map((c) => ({ kind: 'app', name: c.name, hint: c.hint || '', desc: c.desc }));
 	const found = slashCommands.filter((c) => hit(c.name, c.aliases, c.description));
-	const ccRow = (c) => ({ kind: 'cc', name: c.name, hint: c.argumentHint || '', desc: CC_DESC[c.name] || c.description || '' });
+	const firstLine = (t) => { const x = String(t || '').trim(); const cut = x.search(/[。！？]|[.!?](\s|$)/); return cut > 1 && cut < x.length - 1 ? x.slice(0, cut) : x; };
+	const ccRow = (c) => ({ kind: 'cc', name: c.name, hint: c.argumentHint || '', desc: CC_DESC[c.name] || firstLine(c.description) });
 	const skills = found.filter((c) => c.kind === 'skill').map(ccRow);
 	const cc = found.filter((c) => c.kind !== 'skill').map(ccRow);
 	const menu = $('#slash-menu');
@@ -2466,7 +2505,7 @@ function renderAgyPage() {
 	if (st.installed && st.loggedIn) {
 		html += `<div class="list"><button class="row" id="agy-to-market"><span class="badge-ic ic-orange"><svg class="ic"><use href="#i-puzzle"/></svg></span><span class="row-text">插件、技能和连接器<small>和 Claude 共用，在「扩展与插件」里管理</small></span><svg class="ic chev"><use href="#i-chev"/></svg></button></div>`;
 	}
-	html += `<h2 class="group-label">它和 Claude 的不同</h2><p class="hint">Antigravity 的对话由 agy 自己完成，和 Claude Code 是两套程序：同一段对话换了模型所属的账号，接手的一方看不到另一方做过的事。执行命令、写文件、技能、连接器、插件里的技能和连接器、经验笔记两边都有；/compact 这类 Claude Code 自己的命令只在 Claude 的对话里。</p>`;
+	html += `<h2 class="group-label">它和 Claude 的不同</h2><p class="hint">Antigravity 的对话由 agy 自己完成，和 Claude Code 是两套程序：同一段对话里换到另一边的模型时，前面的对话会一起交给接手的一方。执行命令、写文件、技能、连接器、插件里的技能和连接器、经验笔记两边都有；/compact 这类 Claude Code 自己的命令只在 Claude 的对话里。</p>`;
 	body.innerHTML = html;
 	$('#agy-login').addEventListener('click', () => showLogin('agy', true));
 	$('#agy-update')?.addEventListener('click', () => { agyInstallLine = { text: '正在检查…' }; renderAgyPage(); api('/api/agy/install', {}); });
@@ -2723,7 +2762,9 @@ function showUpdateNotice(u) {
 	const notes = String(u.notes || '').split('\n').filter((l) => !/^\s*(#|---)/.test(l)).join('\n').trim();
 	$('#whatsnew-ver').textContent = u.from ? `${u.from} → ${u.to}` : u.to;
 	$('#whatsnew-body').innerHTML = notes ? md(notes) : '<p>细节改进和问题修复。</p>';
-	openSheet('sheet-whatsnew');
+	// Not over the box while something is being typed: once the owner leaves it.
+	const open = () => { if (!openSheetId) openSheet('sheet-whatsnew'); };
+	if (document.activeElement === input) input.addEventListener('blur', () => setTimeout(open, 300), { once: true }); else open();
 }
 $('#whatsnew-ok').addEventListener('click', () => closeLayer('sheet'));
 $('#whatsnew-all').addEventListener('click', () => { closeLayer('sheet'); openPage('page-version'); });
@@ -2905,17 +2946,29 @@ function connect() {
 		// screen only update the drawer's live dots.
 		const mine = !m.sessionId || m.sessionId === curSession?.id;
 		switch (m.type) {
-			case 'hello':
+			case 'hello': {
 				// A fresh connection: forget what the last one said was running (after a restart
 				// those turns are gone); the session list right below says what still is.
 				runningIds.clear(); pendingIds.clear(); setRunning(false);
 				applySettings(m.settings);
 				getJSON('/api/bgscreen').then((r) => renderBgScreen(r.ok ? r : null));
-				if (m.activeSession) { curSession = m.activeSession; renderTranscript(curSession); }
+				// Back from the background with the same conversation, unchanged: it stays as it is on
+				// screen (opened steps, the place being read). Changed: redrawn, at the same place.
+				const s = m.activeSession;
+				const same = s && curSession && s.id === curSession.id && (s.messages?.length || 0) === (curSession.messages?.length || 0)
+					&& !s.liveText && !s.liveThinking && thread.children.length > 0;
+				if (s && same) curSession = s;
+				else if (s) {
+					const keep = curSession?.id === s.id && !atBottom() ? thread.scrollTop : null;
+					curSession = s;
+					renderTranscript(curSession);
+					if (keep != null) thread.scrollTop = keep;
+				}
 				showUpdateNotice(m.lastUpdate); // after the redraw, which would wipe it
 				fetchSessions();
 				loadSlashCommands();
 				break;
+			}
 			case 'auth':
 				loggedIn = !!m.loggedIn;
 				accounts = { claude: !!m.accounts?.claude, agy: !!m.accounts?.agy };
@@ -2963,7 +3016,9 @@ function connect() {
 			case 'notice_global': toast(m.text); break;
 			case 'question':
 				if (m.sessionId) pendingIds.add(m.sessionId);
-				if (mine) { addQuestion(m); setActivity('等你回答'); openAsk(m); } else renderSidebar();
+				// The sheet comes up by itself, unless the owner is typing: it would cover the box they
+				// are typing into. The card in the conversation and the hint in the box say it waits.
+				if (mine) { addQuestion(m); setActivity('等你回答'); if (document.activeElement !== input && !openSheetId) openAsk(m); } else renderSidebar();
 				break;
 			case 'question_resolved': {
 				if (m.sessionId) pendingIds.delete(m.sessionId);
@@ -2987,7 +3042,10 @@ function connect() {
 					setRunning(false);
 					markTurnTime(m.durationMs);
 					markTurnSources(m.sources);
-					if (m.subtype && m.subtype !== 'success') sysline(stoppedIds.has(m.sessionId) ? '已停止' : `这一轮没有做完${m.errors?.[0] ? `：${m.errors[0]}` : '，可以再发一次试试'}`);
+					if (m.subtype && m.subtype !== 'success') {
+						if (stoppedIds.has(m.sessionId)) sysline('已停止');
+						else sysline(`这一轮没有做完${m.errors?.[0] ? `：${m.errors[0]}` : ''}`, { retry: true });
+					}
 					fetchSessions();
 				} else renderSidebar();
 				stoppedIds.delete(m.sessionId);
@@ -3017,7 +3075,7 @@ function connect() {
 				break;
 			case 'error':
 				if (m.sessionId) runningIds.delete(m.sessionId);
-				if (mine) { endAssistant(); groupProcessBlocks(); setRunning(false); sysline('出错了：' + m.message); } else renderSidebar();
+				if (mine) { endAssistant(); groupProcessBlocks(); setRunning(false); sysline('出错了：' + m.message, { retry: true }); } else renderSidebar();
 				break;
 			case 'login_url': loginUrl(m.url, m.mode, m.provider); break;
 			case 'login_status': loginStatus(m); break;

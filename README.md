@@ -157,7 +157,9 @@ debian retools                               装逆向分析工具链
 | 反问 | Claude Code 的 `AskUserQuestion`，App 弹出选择框，答案作为工具输入的 `answers` 交回 | App 提供的 `ask_user` 工具（`app/server/agent_tools.mjs`，通过 ACP 的 `mcpServers` 传给每段对话），同一个选择框 |
 | 浏览器 | App 提供的 `browser_*` 工具（同上） | 同一组工具，两边共用一个浏览器 |
 
-同一段对话可以换到另一个账号的模型继续，但两边各记各的：接手的一方看不到另一方做过的事，对话里会有一行说明。
+每段对话记住自己的模型和思考档位（从它的第一条消息起），换模型只影响这段对话，新对话沿用最后选的。同一段对话可以换到另一个账号的模型继续：两边各记各的，所以 App 会把接手的一方没看到的那部分对话（用户的话、回答、做过的步骤）整理成一段「前情」，随下一条消息一起交给它（`handoffFor`，server.mjs），对话里也会有一行说明。
+
+思考档位：Claude 的每个模型按它支持的档位显示（表在 `backends/claude.mjs` 的 `CLAUDE_EFFORTS`，页面里有同一份）；Antigravity 的模型若本身分档（如 Gemini 4 Carbon High / Medium / Low），档位就是这几个变体，否则用 agy 会话自己的思考档位（Low / Medium / High / Extra / Max），每条消息前通过 ACP 设好。每个模型选过的档位会记住。
 
 App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json` 里同步过去的连接器、`~/.gemini/skills` 里的链接），你自己写的条目不会被改动；记录在 `~/.droidagent/agy-managed.json`。旧版本加过的 `droidagent` 工具服务和 `mcp(...)` 放行规则会被自动清理。
 
@@ -170,7 +172,7 @@ App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json`
 - **反问**：两边的反问都汇到同一个选择框（单选 / 多选 / 其他 / 跳过），回答前对话暂停。
 - **内置浏览器**（`app/server/browser.mjs`）：chroot 里的 Chromium 以无头方式运行，用 Chrome DevTools 协议驱动，按手机尺寸（412×860）渲染。助手的工具 `browser_open / read / click / type / scroll / back / screenshot` 由 `app/server/agent_tools.mjs` 这个本地 MCP 服务提供；它只接受带本次启动随机令牌的请求。你在 App 里看到的是浏览器的实时画面（MJPEG），点按和输入会转发给浏览器。第一次使用时用 apt 装 `chromium` 和中文字体；15 分钟没人用、也没人在看就自动关掉。
 - **搜索来源**（`app/server/sources.mjs`）：从 WebSearch 的链接列表、WebFetch 和浏览器打开的网址、其他工具输出里的链接中提取来源，去重后挂在这一轮回答下面。
-- **思考翻译**：展开思考时调用 `/api/translate`，Claude 对话用 Haiku、Antigravity 对话用当前的 agy 模型翻译成中文；已经是中文的不翻译，结果缓存在 `~/.claude/agent-translations.json`。
+- **思考翻译**（`app/server/translate.mjs`）：思考过程一边生成，页面一边按句子把写完的部分发给 `/api/translate`，用 Google 翻译的免费接口（不需要密钥；被限流时换用它的另一个接口）译成中文，经 App 设置的代理访问，失败时再直连。代码和命令先换成 ⟦n⟧ 标记，译完放回原样；已经是中文的不翻译；结果按内容缓存在 `~/.claude/agent-translations.json`。
 - **改动和图片**：Edit / Write 等工具的输入转成行级差异显示；工具返回的图片存到 `~/.droidagent/media/`，经 `/api/media/` 显示。
 
 ## 配置
@@ -194,7 +196,7 @@ App 写入 agy 配置的内容只有它自己加的那几项（`mcp_config.json`
 |---|---|
 | `apk/` | 原生 APK（`build.py` 纯脚本构建，不依赖 Gradle）、源码、资源；`apk/assets/setup/` 是首次启动的进度页面 |
 | `brand/` | 图标源文件（`icon.svg`）和重新生成 PNG 图标的脚本 |
-| `app/server/` | Node 后端 `server.mjs`（HTTP/SSE、会话、权限）、`backends/`（Claude 和 agy 两个后端）、`agent_tools.mjs`（反问和浏览器工具）、`browser.mjs`（内置浏览器）、`sources.mjs`（来源提取） |
+| `app/server/` | Node 后端 `server.mjs`（HTTP/SSE、会话、权限）、`backends/`（Claude 和 agy 两个后端）、`agent_tools.mjs`（反问和浏览器工具）、`browser.mjs`（内置浏览器）、`sources.mjs`（来源提取）、`translate.mjs`（思考翻译） |
 | `app/web/` | PWA 前端（聊天界面、悬浮窗面板） |
 | `phone/debian` | 安卓侧启动器脚本（挂载 / chroot / 管理后端） |
 | `phone/overlay/` | 叠加进 rootfs 的内容：工具（ashell/droid/pdata/clip）、agent 的 `CLAUDE.md`、设备档案模板 |
